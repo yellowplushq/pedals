@@ -1,0 +1,6 @@
+.artifacts/
+.DS_Store
+*.xcodeproj
+node_modules/
+.build/
+DerivedData/

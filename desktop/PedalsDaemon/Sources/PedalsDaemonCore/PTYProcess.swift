@@ -1,0 +1,238 @@
+import Darwin
+import Foundation
+
+/// One shell process attached to a pseudo-terminal (PROTOCOL.md §6).
+///
+/// The child is spawned with `posix_spawn` in a new session (`POSIX_SPAWN_SETSID`);
+/// opening the slave device by path as fd 0 makes it the controlling terminal.
+/// Output and exit are delivered as callbacks on the queue passed to `init`.
+public final class PTYProcess: @unchecked Sendable {
+    public enum PTYError: Error, CustomStringConvertible {
+        case openptyFailed(errno: Int32)
+        case spawnFailed(errno: Int32)
+
+        public var description: String {
+            switch self {
+            case .openptyFailed(let e): "openpty failed: \(String(cString: strerror(e)))"
+            case .spawnFailed(let e): "posix_spawn failed: \(String(cString: strerror(e)))"
+            }
+        }
+    }
+
+    public let pid: pid_t
+    private let masterFD: Int32
+    private let queue: DispatchQueue
+    private let readSource: DispatchSourceRead
+    private let exitSource: DispatchSourceProcess
+    private var closed = false
+
+    /// Called on `queue` with each chunk of raw PTY output.
+    public var onOutput: (@Sendable (Data) -> Void)?
+    /// Called on `queue` exactly once when the child exits, with the exit code
+    /// (or 128+signal when terminated by a signal).
+    public var onExit: (@Sendable (Int32) -> Void)?
+
+    public init(
+        shell: String,
+        arguments: [String],
+        cwd: String,
+        cols: UInt16,
+        rows: UInt16,
+        extraEnvironment: [String: String] = [:],
+        queue: DispatchQueue
+    ) throws {
+        self.queue = queue
+
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        var size = winsize(ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0)
+        guard openpty(&master, &slave, nil, nil, &size) == 0 else {
+            throw PTYError.openptyFailed(errno: errno)
+        }
+        defer { close(slave) }
+
+        guard let slavePathPointer = ttyname(slave) else {
+            close(master)
+            throw PTYError.openptyFailed(errno: ENOTTY)
+        }
+        let slavePath = String(cString: slavePathPointer)
+
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        // Opening the tty by path (as a fresh session leader) acquires it as
+        // the controlling terminal; a dup2 of an inherited fd would not.
+        posix_spawn_file_actions_addopen(&fileActions, 0, slavePath, O_RDWR, 0)
+        posix_spawn_file_actions_adddup2(&fileActions, 0, 1)
+        posix_spawn_file_actions_adddup2(&fileActions, 0, 2)
+        posix_spawn_file_actions_addclose(&fileActions, master)
+        posix_spawn_file_actions_addclose(&fileActions, slave)
+        posix_spawn_file_actions_addchdir_np(&fileActions, cwd)
+
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        posix_spawnattr_setflags(
+            &attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        )
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["TERM"] = "xterm-256color"
+        environment["COLORTERM"] = "truecolor"
+        if environment["LANG"]?.isEmpty != false { environment["LANG"] = "en_US.UTF-8" }
+        environment["SHELL"] = shell
+        for (key, value) in extraEnvironment { environment[key] = value }
+
+        let argv = ([shell] + arguments).map { strdup($0) } + [nil]
+        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            argv.forEach { free($0) }
+            envp.forEach { free($0) }
+        }
+
+        var childPid: pid_t = 0
+        let rc = posix_spawn(&childPid, shell, &fileActions, &attributes, argv, envp)
+        guard rc == 0 else {
+            close(master)
+            throw PTYError.spawnFailed(errno: rc)
+        }
+
+        pid = childPid
+        masterFD = master
+
+        readSource = DispatchSource.makeReadSource(fileDescriptor: master, queue: queue)
+        exitSource = DispatchSource.makeProcessSource(
+            identifier: childPid, eventMask: .exit, queue: queue
+        )
+
+        readSource.setEventHandler { [weak self] in self?.drainOutput() }
+        // The fd may only be closed once the source is fully cancelled.
+        readSource.setCancelHandler { close(master) }
+        exitSource.setEventHandler { [weak self] in self?.reapChild() }
+        readSource.resume()
+        exitSource.resume()
+    }
+
+    deinit {
+        if !closed {
+            closed = true
+            readSource.cancel()
+        }
+        if !exitSource.isCancelled { exitSource.cancel() }
+    }
+
+    // MARK: - I/O (all on `queue`)
+
+    private func drainOutput() {
+        guard !closed else { return }
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        let n = read(masterFD, &buffer, buffer.count)
+        if n > 0 {
+            onOutput?(Data(buffer[0..<n]))
+        } else if n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR) {
+            // EOF / EIO: the child side is gone. Exit is reported by exitSource.
+            closeMaster()
+        }
+    }
+
+    private func reapChild() {
+        exitSource.cancel()
+        var status: Int32 = 0
+        waitpid(pid, &status, 0)
+        let code: Int32
+        if status & 0x7F == 0 {
+            code = (status >> 8) & 0xFF // WIFEXITED / WEXITSTATUS
+        } else {
+            code = 128 + (status & 0x7F) // terminated by signal
+        }
+        // Deliver any output still buffered in the kernel before reporting exit.
+        drainPendingOutputAfterExit()
+        closeMaster()
+        let onExit = self.onExit
+        self.onExit = nil
+        onExit?(code)
+    }
+
+    private func drainPendingOutputAfterExit() {
+        guard !closed else { return }
+        var flags = fcntl(masterFD, F_GETFL)
+        _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = read(masterFD, &buffer, buffer.count)
+            guard n > 0 else { break }
+            onOutput?(Data(buffer[0..<n]))
+        }
+        flags = fcntl(masterFD, F_GETFL)
+        _ = fcntl(masterFD, F_SETFL, flags & ~O_NONBLOCK)
+    }
+
+    private func closeMaster() {
+        guard !closed else { return }
+        closed = true
+        readSource.cancel() // the cancel handler closes masterFD
+    }
+
+    // MARK: - Thread-safe operations
+
+    public func write(_ data: Data) {
+        queue.async { [self] in
+            guard !closed else { return }
+            data.withUnsafeBytes { raw in
+                var offset = 0
+                while offset < raw.count {
+                    let n = Darwin.write(masterFD, raw.baseAddress! + offset, raw.count - offset)
+                    guard n > 0 else { return }
+                    offset += n
+                }
+            }
+        }
+    }
+
+    public func resize(cols: UInt16, rows: UInt16) {
+        queue.async { [self] in
+            guard !closed else { return }
+            var size = winsize(ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0)
+            _ = ioctl(masterFD, TIOCSWINSZ, &size)
+        }
+    }
+
+    /// Every process (pid + parent + `p_comm`) in the shell's process group.
+    ///
+    /// `tcgetpgrp` on the pty *master* fd is unreliable on macOS (returns -1),
+    /// so we query the group led by the shell pid directly. A CLI launched from
+    /// the interactive shell keeps the shell's own process group (verified:
+    /// `claude` runs with pgid == the shell's pid), so scanning that group
+    /// surfaces the agent alongside the shell. Parent pids let the caller pick
+    /// the top-most agent when agents nest. Must be called on the queue from
+    /// `init`.
+    public func foregroundProcesses() -> [ProcessEntry] {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !closed else { return [] }
+        let pgid = pid
+
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let count = size / MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+
+        return procs.prefix(size / MemoryLayout<kinfo_proc>.stride).compactMap { proc in
+            var proc = proc
+            let name = withUnsafeBytes(of: &proc.kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+            }
+            guard !name.isEmpty else { return nil }
+            return ProcessEntry(
+                pid: proc.kp_proc.p_pid, ppid: proc.kp_eproc.e_ppid, comm: name
+            )
+        }
+    }
+
+    public func terminate() {
+        // Kill the whole session (the shell and its children).
+        kill(-pid, SIGHUP)
+        kill(pid, SIGHUP)
+    }
+}

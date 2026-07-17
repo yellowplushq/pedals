@@ -1,0 +1,31 @@
+name: PedalsMenubar
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  PedalsMenubar:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    scheme:
+      testTargets: []
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Pedals
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSUIElement: true
+        LSMinimumSystemVersion: "14.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.yellowplus.pedals.menubar
+        PRODUCT_NAME: PedalsMenubar
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: false
+        COMBINE_HIDPI_IMAGES: true
+        GENERATE_INFOPLIST_FILE: false
