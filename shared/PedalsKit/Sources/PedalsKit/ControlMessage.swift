@@ -16,15 +16,9 @@ public struct SessionInfo: Codable, Equatable, Sendable {
     /// Unix epoch seconds.
     public var createdAt: Double
     public var alive: Bool
-    /// Detected agent id ("claude-code", "codex", "oh-my-pi", …), nil when the
-    /// session isn't running a known agent. Additive in protocol v1.
-    public var agent: String?
-    /// "idle" | "working" | "blocked" — only meaningful when `agent` != nil.
-    public var agentState: String?
 
     public init(id: Int, title: String, cwd: String, rows: Int, cols: Int,
-                createdAt: Double, alive: Bool,
-                agent: String? = nil, agentState: String? = nil) {
+                createdAt: Double, alive: Bool) {
         self.id = id
         self.title = title
         self.cwd = cwd
@@ -32,8 +26,6 @@ public struct SessionInfo: Codable, Equatable, Sendable {
         self.cols = cols
         self.createdAt = createdAt
         self.alive = alive
-        self.agent = agent
-        self.agentState = agentState
     }
 }
 

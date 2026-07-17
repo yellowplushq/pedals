@@ -197,16 +197,15 @@ public final class PTYProcess: @unchecked Sendable {
         }
     }
 
-    /// Every process (pid + parent + `p_comm`) in the shell's process group.
+    /// Every process' `p_comm` in the shell's process group, for the title
+    /// fallback (PROTOCOL.md §6).
     ///
     /// `tcgetpgrp` on the pty *master* fd is unreliable on macOS (returns -1),
-    /// so we query the group led by the shell pid directly. A CLI launched from
-    /// the interactive shell keeps the shell's own process group (verified:
-    /// `claude` runs with pgid == the shell's pid), so scanning that group
-    /// surfaces the agent alongside the shell. Parent pids let the caller pick
-    /// the top-most agent when agents nest. Must be called on the queue from
-    /// `init`.
-    public func foregroundProcesses() -> [ProcessEntry] {
+    /// so we query the group led by the shell pid directly. A command launched
+    /// from the interactive shell keeps the shell's own process group, so
+    /// scanning that group surfaces it alongside the shell. Must be called on
+    /// the queue passed to `init`.
+    public func foregroundProcessNames() -> [String] {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !closed else { return [] }
         let pgid = pid
@@ -223,10 +222,7 @@ public final class PTYProcess: @unchecked Sendable {
             let name = withUnsafeBytes(of: &proc.kp_proc.p_comm) { raw in
                 String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
             }
-            guard !name.isEmpty else { return nil }
-            return ProcessEntry(
-                pid: proc.kp_proc.p_pid, ppid: proc.kp_eproc.e_ppid, comm: name
-            )
+            return name.isEmpty ? nil : name
         }
     }
 

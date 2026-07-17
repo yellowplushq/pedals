@@ -88,12 +88,7 @@ struct Ls: ParsableCommand {
             let alive = session["alive"] as? Bool ?? false
             let cols = session["cols"] as? Int ?? 0
             let rows = session["rows"] as? Int ?? 0
-            var line = "[\(id)] \(alive ? "live " : "exited") \(cols)x\(rows)  \(title)  (\(cwd))"
-            if let agent = session["agent"] as? String {
-                let state = session["agentState"] as? String ?? "idle"
-                line += "  ⟨\(agent): \(state)⟩"
-            }
-            print(line)
+            print("[\(id)] \(alive ? "live " : "exited") \(cols)x\(rows)  \(title)  (\(cwd))")
         }
         print("client: \(client)   relay: \(relay)")
     }

@@ -80,12 +80,7 @@ All have `{"t": "<kind>", ...}`:
 
 - `{"t":"hello","who":"host"|"client","connEpoch":<random u32>,"ver":1}` — first frame
   after connect from each side.
-- `{"t":"sessions","list":[{"id":1,"title":"zsh — ~/dev","cwd":"/Users/x/dev","rows":40,"cols":120,"createdAt":..., "alive":true,"agent":"claude-code","agentState":"working"}]}` — host→client. Sent on hello, on any change (create/close/title/agent state).
-  `agent` (nullable): detected coding agent — "claude-code" | "codex" | "oh-my-pi" | …
-  `agentState` (nullable): "idle" | "working" | "blocked" (needs human input). Both
-  fields are additive; older peers ignore them. Detection is hook-free, daemon-side:
-  OSC title markers, ConEmu OSC 9;4 progress, foreground process name, and
-  bottom-screen text rules over the ANSI-stripped output tail.
+- `{"t":"sessions","list":[{"id":1,"title":"zsh — ~/dev","cwd":"/Users/x/dev","rows":40,"cols":120,"createdAt":..., "alive":true}]}` — host→client. Sent on hello, on any change (create/close/title).
 - `{"t":"create","cwd":null|"...","cols":120,"rows":40}` — client→host. Host replies with
   updated `sessions` and `{"t":"created","id":N}`.
 - `{"t":"close","id":N}` — client→host (also used by CLI locally).

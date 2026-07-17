@@ -236,12 +236,7 @@ final class MainViewController: UIViewController {
         setVisibleHost(activeId)
 
         tabStrip.update(
-            tabs: sessions.map {
-                .init(
-                    id: $0.id, title: $0.title, alive: $0.alive,
-                    agent: $0.agent, agentState: $0.agentState
-                )
-            },
+            tabs: sessions.map { .init(id: $0.id, title: $0.title, alive: $0.alive) },
             activeId: activeId
         )
         noSessionsView.isHidden =

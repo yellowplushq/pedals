@@ -10,9 +10,6 @@ final class TabStripView: UIView {
         let id: Int
         var title: String
         var alive: Bool
-        /// Detected agent id + state ("idle"/"working"/"blocked"), from the daemon.
-        var agent: String?
-        var agentState: String?
     }
 
     var onSelect: ((Int) -> Void)?
@@ -249,9 +246,6 @@ final class TabPillView: UIView {
     private let glyphLabel = UILabel()
     private let titleLabel = UILabel()
     private let closeButton = UIButton(type: .system)
-    /// Agent status: corner dot — blue while working, orange when blocked.
-    private let statusDot = UIView()
-    private var statusPulse = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -281,11 +275,6 @@ final class TabPillView: UIView {
         )
         glass.contentView.addSubview(closeButton)
 
-        statusDot.isHidden = true
-        statusDot.layer.borderWidth = 1.5
-        statusDot.layer.borderColor = UIColor.black.cgColor
-        addSubview(statusDot)
-
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(didTap)))
     }
 
@@ -298,33 +287,6 @@ final class TabPillView: UIView {
         glyphLabel.text = tab.alive ? glyph : "×"
         glyphLabel.textColor = tab.alive ? .secondaryLabel : .systemRed
         titleLabel.textColor = tab.alive ? .label : .secondaryLabel
-        applyStatus(state: tab.alive ? tab.agentState : nil)
-    }
-
-    private func applyStatus(state: String?) {
-        let color: UIColor? = switch state {
-        case "working": .systemBlue
-        case "blocked": .systemOrange
-        default: nil
-        }
-        statusDot.isHidden = color == nil
-        statusDot.backgroundColor = color
-
-        // Blocked pulses gently to catch the eye; working stays steady.
-        let shouldPulse = state == "blocked"
-        if shouldPulse != statusPulse {
-            statusPulse = shouldPulse
-            statusDot.layer.removeAnimation(forKey: "pulse")
-            if shouldPulse {
-                let pulse = CABasicAnimation(keyPath: "opacity")
-                pulse.fromValue = 1.0
-                pulse.toValue = 0.35
-                pulse.duration = 0.7
-                pulse.autoreverses = true
-                pulse.repeatCount = .infinity
-                statusDot.layer.add(pulse, forKey: "pulse")
-            }
-        }
     }
 
     /// 0 = collapsed icon pill, 1 = fully expanded active pill.
@@ -357,11 +319,5 @@ final class TabPillView: UIView {
             width: max(0, bounds.width - inset * 2),
             height: bounds.height
         )
-
-        let dot: CGFloat = 9
-        statusDot.frame = CGRect(
-            x: self.bounds.width - dot - 3, y: 3, width: dot, height: dot
-        )
-        statusDot.layer.cornerRadius = dot / 2
     }
 }

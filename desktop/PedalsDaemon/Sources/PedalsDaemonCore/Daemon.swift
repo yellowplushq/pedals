@@ -125,7 +125,7 @@ public final class Daemon: @unchecked Sendable {
     }
 
     private static func encode(session: SessionInfo) -> ControlValue {
-        var fields: [String: ControlValue] = [
+        .object([
             "id": .int(session.id),
             "title": .string(session.title),
             "cwd": .string(session.cwd),
@@ -133,13 +133,6 @@ public final class Daemon: @unchecked Sendable {
             "cols": .int(session.cols),
             "createdAt": .double(session.createdAt),
             "alive": .bool(session.alive),
-        ]
-        if let agent = session.agent {
-            fields["agent"] = .string(agent)
-        }
-        if let state = session.agentState {
-            fields["agentState"] = .string(state)
-        }
-        return .object(fields)
+        ])
     }
 }

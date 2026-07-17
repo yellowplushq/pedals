@@ -53,9 +53,6 @@ public final class SessionManager: @unchecked Sendable {
         var titleFromOSC = false
         var alive = true
         var exitCode: Int?
-        let agentTracker = AgentStateTracker()
-        var agentVerdict = AgentStateTracker.Verdict(agent: nil, state: .idle)
-        var lastAgentEval = Date.distantPast
 
         init(id: Int, cwd: String, pty: PTYProcess, cols: UInt16, rows: UInt16, title: String) {
             self.id = id
@@ -70,10 +67,7 @@ public final class SessionManager: @unchecked Sendable {
         var info: SessionInfo {
             SessionInfo(
                 id: id, title: title, cwd: cwd, rows: Int(rows), cols: Int(cols),
-                createdAt: createdAt.timeIntervalSince1970, alive: alive,
-                agent: agentVerdict.agent,
-                agentState: agentVerdict.agent == nil
-                    ? nil : agentVerdict.state.rawValue
+                createdAt: createdAt.timeIntervalSince1970, alive: alive
             )
         }
     }
@@ -171,7 +165,6 @@ public final class SessionManager: @unchecked Sendable {
             session.cols = cols
             session.rows = rows
             session.pty.resize(cols: cols, rows: rows)
-            session.agentTracker.noteResize(cols: Int(cols), rows: Int(rows))
             emitSessionsChangedLocked()
         }
     }
@@ -209,24 +202,8 @@ public final class SessionManager: @unchecked Sendable {
 
         if let title = session.oscParser.consume(data).last {
             session.titleFromOSC = true
-            session.agentTracker.noteTitle(title)
             setTitleLocked(session: session, title: title)
         }
-
-        session.agentTracker.noteOutput(data)
-        // Screen-rule evaluation costs an ANSI strip of the tail buffer;
-        // throttle it — the 2 s poll handles decay to idle regardless.
-        if Date().timeIntervalSince(session.lastAgentEval) > 0.25 {
-            reevaluateAgentLocked(session: session)
-        }
-    }
-
-    private func reevaluateAgentLocked(session: Session) {
-        session.lastAgentEval = Date()
-        let verdict = session.agentTracker.evaluate()
-        guard verdict != session.agentVerdict else { return }
-        session.agentVerdict = verdict
-        emitSessionsChangedLocked()
     }
 
     private func handleExit(id: Int, code: Int32) {
@@ -240,16 +217,11 @@ public final class SessionManager: @unchecked Sendable {
     // MARK: - Titles
 
     private func pollFallbackTitles() {
-        for session in sessions.values where session.alive {
-            let procs = session.pty.foregroundProcesses()
-            session.agentTracker.noteForegroundProcesses(procs)
-            reevaluateAgentLocked(session: session)
-
+        for session in sessions.values where session.alive && !session.titleFromOSC {
             // Title fallback: prefer a foreground process that isn't the shell
-            // (the agent/command the user is running), else the shell itself.
-            guard !session.titleFromOSC else { continue }
+            // (the command the user is running), else the shell itself.
+            let names = session.pty.foregroundProcessNames()
             let shellName = (options.shell as NSString).lastPathComponent
-            let names = procs.map(\.comm)
             guard let name = names.first(where: { $0 != shellName }) ?? names.first
             else { continue }
             setTitleLocked(
