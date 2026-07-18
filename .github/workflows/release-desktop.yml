@@ -82,18 +82,36 @@ jobs:
           set -euo pipefail
           app="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals.app"
           sparkle="$app/Contents/Frameworks/Sparkle.framework"
+          sparkle_contents="$sparkle/Versions/B"
           daemon="$app/Contents/Resources/pedals"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" \
+            "$sparkle_contents/XPCServices/Installer.xpc"
+          codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+            --sign "$PEDALS_SIGNING_IDENTITY" \
+            "$sparkle_contents/XPCServices/Downloader.xpc"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" \
+            "$sparkle_contents/Autoupdate"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" \
+            "$sparkle_contents/Updater.app"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$sparkle"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$daemon"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           signing_details="$(codesign -dv --verbose=4 "$app" 2>&1)"
-          sparkle_signing_details="$(codesign -dv --verbose=4 "$sparkle" 2>&1)"
           printf '%s\n' "$signing_details"
           grep -q 'TeamIdentifier=QDJ93ZUQ9B' <<< "$signing_details"
           grep -q 'flags=.*runtime' <<< "$signing_details"
-          grep -q 'TeamIdentifier=QDJ93ZUQ9B' <<< "$sparkle_signing_details"
-          grep -q 'flags=.*runtime' <<< "$sparkle_signing_details"
+          for component in \
+            "$sparkle_contents/XPCServices/Installer.xpc" \
+            "$sparkle_contents/XPCServices/Downloader.xpc" \
+            "$sparkle_contents/Autoupdate" \
+            "$sparkle_contents/Updater.app" \
+            "$sparkle"; do
+            component_details="$(codesign -dv --verbose=4 "$component" 2>&1)"
+            grep -q 'TeamIdentifier=QDJ93ZUQ9B' <<< "$component_details"
+            grep -q 'flags=.*runtime' <<< "$component_details"
+            grep -q '^Timestamp=' <<< "$component_details"
+          done
 
       - name: Package disk image
         run: ./scripts/package-desktop-dmg.sh
@@ -116,13 +134,26 @@ jobs:
           set -euo pipefail
           key="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
           dmg="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg"
+          result="$RUNNER_TEMP/pedals-notary-result.json"
           printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$key"
           chmod 600 "$key"
           xcrun notarytool submit "$dmg" \
             --key "$key" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait
+            --wait \
+            --output-format json > "$result"
+          cat "$result"
+          notary_status="$(plutil -extract status raw "$result")"
+          submission_id="$(plutil -extract id raw "$result")"
+          if [[ "$notary_status" != "Accepted" ]]; then
+            xcrun notarytool log "$submission_id" \
+              --key "$key" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" || true
+            echo "Apple notarization failed with status: $notary_status" >&2
+            exit 1
+          fi
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
           spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
