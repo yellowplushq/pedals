@@ -1,7 +1,7 @@
 {
 	"$schema": "./node_modules/wrangler/config-schema.json",
 	"name": "pedals-relay",
-	"account_id": "31241bd2e4538bd39421cb47d2b06041",
+	"account_id": "8bfe8b1e792b46613348bd7de669da65",
 	"main": "src/worker.mjs",
 	"vars": {
 		"DESKTOP_RELEASE_REPOSITORY": "yellowplushq/pedals"
@@ -25,7 +25,7 @@
 	},
 	"routes": [
 		{
-			"pattern": "pedals.eyhn.in",
+			"pattern": "pedals.air.build",
 			"custom_domain": true
 		}
 	],
@@ -46,7 +46,7 @@
 			"binding": "DB",
 			"database_name": "pedals",
 			"migrations_dir": "migrations",
-			"database_id": "3413da34-27b6-4ea8-9b80-760c8dcba6b5"
+			"database_id": "e3476f0a-22c8-4675-a041-09479795f63b"
 		}
 	],
 	"ratelimits": [

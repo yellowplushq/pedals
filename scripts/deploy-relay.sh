@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELAY_DIR="$REPO_ROOT/relay"
-URL="${RELAY_URL:-https://pedals.eyhn.in}"
+URL="${RELAY_URL:-https://pedals.air.build}"
 
 cd "$RELAY_DIR"
 npm ci

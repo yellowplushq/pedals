@@ -13,7 +13,7 @@ public final class Daemon: @unchecked Sendable {
             case .notRegistered:
                 """
                 no host identity and no service configured — run \
-                `pedals serve --service https://pedals.eyhn.in` once
+                `pedals serve --service https://pedals.air.build` once
                 """
             case .identityResetPending(let phase):
                 "identity reset is incomplete (\(phase.rawValue)); run `pedals pair --reset` to resume"

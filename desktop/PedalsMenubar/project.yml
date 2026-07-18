@@ -21,7 +21,7 @@ targets:
         LSMinimumSystemVersion: "14.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: in.eyhn.pedals.menubar
+        PRODUCT_BUNDLE_IDENTIFIER: air.build.pedals.menubar
         PRODUCT_NAME: Pedals
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"

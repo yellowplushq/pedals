@@ -3,7 +3,7 @@ import Foundation
 /// Typed v2 control-plane client shared by the desktop daemon and iOS app.
 /// Terminal frames never pass through this API.
 public final class PedalsServiceAPI: @unchecked Sendable {
-    public static let productionServiceURL = URL(string: "https://pedals.eyhn.in")!
+    public static let productionServiceURL = URL(string: "https://pedals.air.build")!
 
     public enum APIError: Error, LocalizedError, CustomStringConvertible, Equatable {
         case invalidResponse

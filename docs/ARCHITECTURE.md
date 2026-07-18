@@ -20,7 +20,7 @@ pedals/
 
 ## Cloudflare service
 
-The Worker at `https://pedals.eyhn.in` owns four distinct responsibilities:
+The Worker at `https://pedals.air.build` owns four distinct responsibilities:
 
 1. REST enrollment and explicit client-computer bindings in D1.
 2. Authenticated, hibernatable E2EE WebSocket routing through `RelayChannel`
@@ -55,9 +55,9 @@ per surface:
 
 | surface | push type | topic |
 |---|---|---|
-| iPhone Widget | `widgets` | `in.eyhn.pedals.push-type.widgets` |
-| watch Widget | `widgets` | `in.eyhn.pedals.watchapp.push-type.widgets` |
-| Live Activity | `liveactivity` | `in.eyhn.pedals.push-type.liveactivity` |
+| iPhone Widget | `widgets` | `air.build.pedals.push-type.widgets` |
+| watch Widget | `widgets` | `air.build.pedals.watchapp.push-type.widgets` |
+| Live Activity | `liveactivity` | `air.build.pedals.push-type.liveactivity` |
 
 Widget pushes trigger a fresh authenticated timeline request. Live Activity
 pushes carry the aggregate content state because ActivityKit renders it without
@@ -94,7 +94,7 @@ PedalsKit for transport and E2EE.
   status-surface lifecycle. It installs the client status credential in the app
   group, refreshes server state, updates Live Activity, reloads the Widget, and
   sends the latest context to Watch.
-- The app-group identifier is `group.in.eyhn.pedals`.
+- The app-group identifier is `group.air.build.pedals`.
 
 The app supports multiple bound computers, but only their aggregate alive TTY
 count leaves the encrypted terminal path.
@@ -138,12 +138,12 @@ APNs refresh does not depend on waking the iPhone.
 
 | target | bundle identifier |
 |---|---|
-| iPhone app | `in.eyhn.pedals` |
-| iPhone Widget / Live Activity | `in.eyhn.pedals.widgets` |
-| watch app | `in.eyhn.pedals.watchapp` |
-| watch Widget | `in.eyhn.pedals.watchapp.widgets` |
+| iPhone app | `air.build.pedals` |
+| iPhone Widget / Live Activity | `air.build.pedals.widgets` |
+| watch app | `air.build.pedals.watchapp` |
+| watch Widget | `air.build.pedals.watchapp.widgets` |
 
-All targets use team `5RWWZ7DDG9` and the shared App Group. The main app and
+All targets use team `QDJ93ZUQ9B` and the shared App Group. The main app and
 both Widget extensions have Push Notifications capability. Debug builds use
 sandbox APNs; Release builds use production APNs.
 

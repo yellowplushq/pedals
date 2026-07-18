@@ -74,7 +74,7 @@ public struct PedalsStatusCredential: Codable, Hashable, Sendable {
 }
 
 public enum PedalsStatusConstants {
-    public static let appGroup = "group.in.eyhn.pedals"
-    public static let phoneWidgetKind = "in.eyhn.pedals.tty-count"
-    public static let watchWidgetKind = "in.eyhn.pedals.watch.tty-count"
+    public static let appGroup = "group.air.build.pedals"
+    public static let phoneWidgetKind = "air.build.pedals.tty-count"
+    public static let watchWidgetKind = "air.build.pedals.watch.tty-count"
 }

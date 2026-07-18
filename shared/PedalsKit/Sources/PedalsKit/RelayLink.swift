@@ -31,7 +31,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     /// host role only: machine name announced in `hello`.
     private let hostName: String?
 
-    private let queue = DispatchQueue(label: "in.eyhn.pedals.relaylink")
+    private let queue = DispatchQueue(label: "air.build.pedals.relaylink")
     private let callbackQueue: DispatchQueue
 
     /// Every decrypted frame, including the peer's `hello` ctl.

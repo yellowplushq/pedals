@@ -6,7 +6,7 @@
 	<string>$(APS_ENVIRONMENT)</string>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.in.eyhn.pedals</string>
+		<string>group.air.build.pedals</string>
 	</array>
 </dict>
 </plist>

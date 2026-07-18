@@ -28,22 +28,22 @@ function decodeJwtPart(value) {
   return JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
 }
 
-test("uses only the in.eyhn APNs topics", () => {
+test("uses only the air.build APNs topics", () => {
   assert.equal(
     APNS_SURFACES["ios-widget"].topic,
-    "in.eyhn.pedals.push-type.widgets",
+    "air.build.pedals.push-type.widgets",
   );
   assert.equal(
     APNS_SURFACES["watch-widget"].topic,
-    "in.eyhn.pedals.watchapp.push-type.widgets",
+    "air.build.pedals.watchapp.push-type.widgets",
   );
   assert.equal(
     APNS_SURFACES["liveactivity-start"].topic,
-    "in.eyhn.pedals.push-type.liveactivity",
+    "air.build.pedals.push-type.liveactivity",
   );
   assert.equal(
     APNS_SURFACES["liveactivity-update"].topic,
-    "in.eyhn.pedals.push-type.liveactivity",
+    "air.build.pedals.push-type.liveactivity",
   );
 });
 

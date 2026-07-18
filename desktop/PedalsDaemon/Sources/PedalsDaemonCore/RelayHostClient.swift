@@ -13,7 +13,7 @@ public final class RelayHostClient: @unchecked Sendable {
         case connected
     }
 
-    private let queue = DispatchQueue(label: "in.eyhn.pedals.relay")
+    private let queue = DispatchQueue(label: "air.build.pedals.relay")
     private let sessions: SessionManager
     private let hostName: String
 

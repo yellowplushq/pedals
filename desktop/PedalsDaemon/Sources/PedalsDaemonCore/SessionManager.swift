@@ -83,7 +83,7 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     /// Serial queue on which all state mutation and event delivery happens.
-    private let queue = DispatchQueue(label: "in.eyhn.pedals.sessions")
+    private let queue = DispatchQueue(label: "air.build.pedals.sessions")
     private let options: Options
     private var sessions: [Int: Session] = [:]
     /// PTYs whose session was closed but whose child hasn't exited yet. Held so

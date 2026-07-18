@@ -20,22 +20,22 @@ const APPLE_REFERENCE_DATE_UNIX_SECONDS = 978_307_200;
 export const APNS_SURFACES = Object.freeze({
   "ios-widget": Object.freeze({
     pushType: "widgets",
-    topic: "in.eyhn.pedals.push-type.widgets",
+    topic: "air.build.pedals.push-type.widgets",
     priority: "10",
   }),
   "watch-widget": Object.freeze({
     pushType: "widgets",
-    topic: "in.eyhn.pedals.watchapp.push-type.widgets",
+    topic: "air.build.pedals.watchapp.push-type.widgets",
     priority: "10",
   }),
   "liveactivity-start": Object.freeze({
     pushType: "liveactivity",
-    topic: "in.eyhn.pedals.push-type.liveactivity",
+    topic: "air.build.pedals.push-type.liveactivity",
     priority: "10",
   }),
   "liveactivity-update": Object.freeze({
     pushType: "liveactivity",
-    topic: "in.eyhn.pedals.push-type.liveactivity",
+    topic: "air.build.pedals.push-type.liveactivity",
     priority: "5",
   }),
 });

@@ -11,18 +11,18 @@ scripts include the production safety checks that this project relies on.
 |---|---|
 | Product and on-device name | `Pedals` |
 | App Store Connect name | `Pedals - Remote Terminal` |
-| App Store Connect app ID | `6792224057` |
-| Apple team ID | `5RWWZ7DDG9` |
-| iOS app | `in.eyhn.pedals` |
-| iOS widget and Live Activity | `in.eyhn.pedals.widgets` |
-| watchOS app | `in.eyhn.pedals.watchapp` |
-| watchOS widgets | `in.eyhn.pedals.watchapp.widgets` |
-| macOS menu bar app | `in.eyhn.pedals.menubar` |
-| App Group | `group.in.eyhn.pedals` |
-| Production service | `https://pedals.eyhn.in` |
+| App Store Connect app ID | `6792312114` |
+| Apple team ID | `QDJ93ZUQ9B` |
+| iOS app | `air.build.pedals` |
+| iOS widget and Live Activity | `air.build.pedals.widgets` |
+| watchOS app | `air.build.pedals.watchapp` |
+| watchOS widgets | `air.build.pedals.watchapp.widgets` |
+| macOS menu bar app | `air.build.pedals.menubar` |
+| App Group | `group.air.build.pedals` |
+| Production service | `https://pedals.air.build` |
 | Cloudflare D1 database | `pedals` |
-| Internal TestFlight group | `5684b2b3-3261-4c40-8333-948191f584bf` |
-| External TestFlight group | `3d4ade72-9b3d-4093-86c7-60d57e30aa38` |
+| Internal TestFlight group | `a3f73f1d-e7a5-47d8-9b57-8ada4baad549` |
+| External TestFlight group | Create after the first valid build |
 
 - Do not add compatibility with protocol v1, the former Node relay, or the
   retired identifier namespace. There is one server implementation:
@@ -46,7 +46,7 @@ rg -n -uu --hidden \
   --glob '!.git/**' \
   --glob '!node_modules/**' \
   --glob '!AGENTS.md' \
-  'app\.yellowplus|group\.app\.yellowplus|Pedals TTY|PEDALS-20260718' .
+  'in\.eyhn\.pedals|group\.in\.eyhn\.pedals|app\.yellowplus\.pedals|group\.app\.yellowplus\.pedals|pedals\.(eyhn\.in|yellowplus\.app)|5RWWZ7DDG9|6792224057|Pedals TTY|PEDALS-20260718' .
 ```
 
 ## Toolchain
@@ -57,8 +57,8 @@ The supported development host is macOS with:
 - Swift 6
 - XcodeGen
 - Node.js 22 or newer and npm
-- Wrangler 4.x, authenticated to the Cloudflare account for `eyhn.in`
-- `asc` 3.x, authenticated to the `Kewei Hua` App Store Connect account
+- Wrangler 4.x, authenticated to the YellowPlus Cloudflare account for `air.build`
+- `asc` 3.x, authenticated to the `YellowPlus, Inc.` App Store Connect account
 - Baguette for headless simulator inspection and screenshots
 
 Useful authentication checks are read-only:
@@ -227,7 +227,7 @@ xcodebuild \
 baguette install \
   --udid "$PEDALS_IOS_UDID" \
   .artifacts/dd-ios/Build/Products/Debug-iphonesimulator/Pedals.app
-xcrun simctl launch "$PEDALS_IOS_UDID" in.eyhn.pedals
+xcrun simctl launch "$PEDALS_IOS_UDID" air.build.pedals
 ```
 
 For Watch testing, use a Watch simulator already paired to the selected iPhone,
@@ -245,7 +245,7 @@ xcodebuild \
 baguette install \
   --udid "$PEDALS_WATCH_UDID" \
   .artifacts/dd-watch/Build/Products/Debug-watchsimulator/PedalsWatch.app
-xcrun simctl launch "$PEDALS_WATCH_UDID" in.eyhn.pedals.watchapp
+xcrun simctl launch "$PEDALS_WATCH_UDID" air.build.pedals.watchapp
 ```
 
 Use Baguette for repeatable visual evidence and accessibility inspection:
@@ -259,7 +259,7 @@ baguette describe-ui \
   --output .artifacts/ios-smoke-ui.json
 baguette logs \
   --udid "$PEDALS_IOS_UDID" \
-  --bundle-id in.eyhn.pedals \
+  --bundle-id air.build.pedals \
   --level debug
 ```
 
@@ -314,9 +314,9 @@ Fixed APNs topics are part of the security boundary:
 
 | Surface | Topic |
 |---|---|
-| iPhone widget | `in.eyhn.pedals.push-type.widgets` |
-| Watch widget | `in.eyhn.pedals.watchapp.push-type.widgets` |
-| Live Activity start/update/end | `in.eyhn.pedals.push-type.liveactivity` |
+| iPhone widget | `air.build.pedals.push-type.widgets` |
+| Watch widget | `air.build.pedals.watchapp.push-type.widgets` |
+| Live Activity start/update/end | `air.build.pedals.push-type.liveactivity` |
 
 The client must never supply an APNs topic, push type, arbitrary header, or
 arbitrary payload. Debug builds register sandbox tokens; Release builds register
@@ -329,7 +329,7 @@ To configure a new team-wide APNs `.p8` after explicit authorization:
 node scripts/configure-relay-apns.mjs \
   --p8 /ABSOLUTE/PATH/AuthKey_KEY_ID.p8 \
   --key-id KEY_ID \
-  --team-id 5RWWZ7DDG9
+  --team-id QDJ93ZUQ9B
 ```
 
 The helper writes only Wrangler secrets and verifies their names. The `.p8`
@@ -364,7 +364,7 @@ cd relay
 npx wrangler deployments list --config wrangler.jsonc
 npx wrangler d1 migrations list pedals --remote --config wrangler.jsonc
 npm run test:contract
-curl -i https://pedals.eyhn.in/healthz
+curl -i https://pedals.air.build/healthz
 ```
 
 If the production contract fails after a deploy, inspect the immutable version
@@ -386,10 +386,10 @@ Release builds use manual signing. These profile names are referenced by
 
 | Bundle ID | Profile name |
 |---|---|
-| `in.eyhn.pedals` | `Pedals Eyhn App Store` |
-| `in.eyhn.pedals.widgets` | `Pedals Widgets Eyhn App Store` |
-| `in.eyhn.pedals.watchapp` | `Pedals Watch Eyhn App Store` |
-| `in.eyhn.pedals.watchapp.widgets` | `Pedals Watch Widgets Eyhn App Store` |
+| `air.build.pedals` | `Pedals YellowPlus App Store` |
+| `air.build.pedals.widgets` | `Pedals Widgets YellowPlus App Store` |
+| `air.build.pedals.watchapp` | `Pedals Watch YellowPlus App Store` |
+| `air.build.pedals.watchapp.widgets` | `Pedals Watch Widgets YellowPlus App Store` |
 
 Before archiving:
 
@@ -400,7 +400,7 @@ asc profiles list --output table
 ```
 
 Every profile must contain its exact application identifier,
-`group.in.eyhn.pedals`, `beta-reports-active=true`, and the production APNs
+`group.air.build.pedals`, `beta-reports-active=true`, and the production APNs
 entitlement where applicable. Do not recreate profiles merely because Xcode
 cannot see them; first download and install the existing active profiles. If
 profiles have actually expired, recreate all four against one active iOS
@@ -416,7 +416,7 @@ an explicit release request.
 Inspect existing builds and choose a build number that has never been uploaded:
 
 ```bash
-asc builds list --app 6792224057 --output table
+asc builds list --app 6792312114 --output table
 ```
 
 Update `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` for the app and all
@@ -435,18 +435,18 @@ Run the fast validation, the full iOS tests, `./scripts/e2e.sh`, and the legacy
 identifier audit from this guide. Also confirm:
 
 ```bash
-asc apps view --id 6792224057 --output table
-asc testflight groups list --app 6792224057 --output table
+asc apps view --id 6792312114 --output table
+asc testflight groups list --app 6792312114 --output table
 ```
 
-The app record must resolve to bundle ID `in.eyhn.pedals`. Do not upload an IPA
+The app record must resolve to bundle ID `air.build.pedals`. Do not upload an IPA
 created for another App Store Connect record.
 
 ### 3. Create ExportOptions.plist
 
 Create an ignored release directory below `.artifacts/` and put an
 `ExportOptions.plist` there. Use `method=app-store-connect`, `destination=export`,
-team `5RWWZ7DDG9`, manual signing, and this exact profile mapping:
+team `QDJ93ZUQ9B`, manual signing, and this exact profile mapping:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -458,14 +458,14 @@ team `5RWWZ7DDG9`, manual signing, and this exact profile mapping:
   <key>method</key><string>app-store-connect</string>
   <key>provisioningProfiles</key>
   <dict>
-    <key>in.eyhn.pedals</key><string>Pedals Eyhn App Store</string>
-    <key>in.eyhn.pedals.widgets</key><string>Pedals Widgets Eyhn App Store</string>
-    <key>in.eyhn.pedals.watchapp</key><string>Pedals Watch Eyhn App Store</string>
-    <key>in.eyhn.pedals.watchapp.widgets</key><string>Pedals Watch Widgets Eyhn App Store</string>
+    <key>air.build.pedals</key><string>Pedals YellowPlus App Store</string>
+    <key>air.build.pedals.widgets</key><string>Pedals Widgets YellowPlus App Store</string>
+    <key>air.build.pedals.watchapp</key><string>Pedals Watch YellowPlus App Store</string>
+    <key>air.build.pedals.watchapp.widgets</key><string>Pedals Watch Widgets YellowPlus App Store</string>
   </dict>
   <key>signingCertificate</key><string>iPhone Distribution</string>
   <key>signingStyle</key><string>manual</string>
-  <key>teamID</key><string>5RWWZ7DDG9</string>
+  <key>teamID</key><string>QDJ93ZUQ9B</string>
   <key>uploadSymbols</key><true/>
 </dict>
 </plist>
@@ -540,12 +540,12 @@ and enable tester notification:
 
 ```bash
 asc publish testflight \
-  --app 6792224057 \
+  --app 6792312114 \
   --ipa .artifacts/testflight-release/Pedals.ipa \
   --version "$PEDALS_RELEASE_VERSION" \
   --build-number "$PEDALS_RELEASE_BUILD" \
-  --group 5684b2b3-3261-4c40-8333-948191f584bf \
-  --test-notes 'Pair a Mac and verify TTY count synchronization across Pedals, iPhone widgets, Live Activity and Dynamic Island, and Apple Watch widgets, including background APNs updates.' \
+  --group a3f73f1d-e7a5-47d8-9b57-8ada4baad549 \
+  --test-notes 'Connect a computer and verify TTY count synchronization across Pedals, iPhone widgets, Live Activity and Dynamic Island, and Apple Watch widgets, including background APNs updates.' \
   --locale en-US \
   --wait \
   --timeout 45m \
@@ -565,13 +565,15 @@ when the user requested it and the Beta description, feedback email, review
 contact, and review notes are already present in App Store Connect. Keep review
 contact PII in App Store Connect, not in this repository.
 
-After the build is `VALID`, distribute the existing build ID:
+After the build is `VALID`, create an external group if one does not exist, set
+its identifier, and distribute the existing build ID:
 
 ```bash
+PEDALS_EXTERNAL_GROUP_ID=REPLACE_WITH_EXTERNAL_GROUP_ID
 asc publish testflight \
-  --app 6792224057 \
+  --app 6792312114 \
   --build BUILD_ID \
-  --group 3d4ade72-9b3d-4093-86c7-60d57e30aa38 \
+  --group "$PEDALS_EXTERNAL_GROUP_ID" \
   --wait \
   --notify \
   --submit \
@@ -580,21 +582,21 @@ asc publish testflight \
   --pretty
 ```
 
-The tester `osaka@eyhn.in` is already assigned to the external group. Do not
-create duplicate tester records. Apple sends its invitation only when the
-external build becomes installable after Beta Review.
+Apple sends invitations only when the external build becomes installable after
+Beta Review. Check existing tester records before adding anyone so duplicate
+records are not created.
 
 ### 8. Verify App Store Connect state
 
 ```bash
 asc builds info \
-  --app 6792224057 \
+  --app 6792312114 \
   --build-number "$PEDALS_RELEASE_BUILD" \
   --version "$PEDALS_RELEASE_VERSION" \
   --platform IOS \
   --output json \
   --pretty
-asc testflight testers list --app 6792224057 --output table
+asc testflight testers list --app 6792312114 --output table
 asc testflight review submissions list --build-id BUILD_ID --output table
 ```
 
@@ -606,7 +608,7 @@ internal group. External availability remains pending while Apple reports
 
 A release handoff should state:
 
-- the deployed Worker version ID and `https://pedals.eyhn.in` contract result;
+- the deployed Worker version ID and `https://pedals.air.build` contract result;
 - whether remote D1 has pending migrations;
 - that all three APNs secret names exist, without revealing values;
 - marketing version, build number, TestFlight build ID, and processing state;

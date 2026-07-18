@@ -222,10 +222,10 @@ struct PushMutationState: Codable, Equatable, Sendable {
 }
 
 public enum StatusSharedStore {
-    public static let didChange = Notification.Name("in.eyhn.pedals.status.did-change")
+    public static let didChange = Notification.Name("air.build.pedals.status.did-change")
 
     private static let logger = Logger(
-        subsystem: "in.eyhn.pedals",
+        subsystem: "air.build.pedals",
         category: "StatusSharedStore"
     )
 

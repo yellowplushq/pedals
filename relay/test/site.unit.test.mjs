@@ -8,7 +8,7 @@ import {
 } from "../src/site.mjs";
 
 function request(path, options = {}) {
-  return new Request(`https://pedals.eyhn.in${path}`, options);
+  return new Request(`https://pedals.air.build${path}`, options);
 }
 
 test("the stable download path redirects to the latest desktop release", async () => {

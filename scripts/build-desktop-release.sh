@@ -102,7 +102,7 @@ if [[ "$actual_version" != "$VERSION" || "$actual_build" != "$BUILD_NUMBER" ]]; 
   echo "Built version $actual_version ($actual_build) does not match $VERSION ($BUILD_NUMBER)." >&2
   exit 1
 fi
-if [[ "$actual_identifier" != "in.eyhn.pedals.menubar" ]]; then
+if [[ "$actual_identifier" != "air.build.pedals.menubar" ]]; then
   echo "Unexpected desktop bundle identifier: $actual_identifier" >&2
   exit 1
 fi

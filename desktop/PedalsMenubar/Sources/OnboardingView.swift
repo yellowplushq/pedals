@@ -70,7 +70,7 @@ struct DesktopOnboardingView: View {
                 OnboardingFact(
                     icon: "bolt.horizontal",
                     title: "Available away from home",
-                    detail: "Both devices connect outward to pedals.eyhn.in."
+                    detail: "Both devices connect outward to pedals.air.build."
                 )
             }
 
@@ -111,7 +111,7 @@ struct DesktopOnboardingView: View {
                 Text("Connecting this computer")
                     .font(PedalsTheme.emphasizedText)
                     .foregroundStyle(PedalsTheme.content)
-                Text("Registering with pedals.eyhn.in. Your pairing code will appear shortly.")
+                Text("Registering with pedals.air.build. Your pairing code will appear shortly.")
                     .foregroundStyle(PedalsTheme.secondaryContent)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
@@ -231,7 +231,7 @@ struct DesktopPairingPanel: View {
                 } else {
                     Label("Single-use · valid for 15 minutes", systemImage: "clock")
                 }
-                Label("Approved by pedals.eyhn.in", systemImage: "lock.shield")
+                Label("Approved by pedals.air.build", systemImage: "lock.shield")
             }
             .foregroundStyle(PedalsTheme.tertiaryContent)
         }

@@ -43,7 +43,7 @@ final class PairingStore {
     typealias StateReader = @MainActor () throws -> Data?
     typealias StateWriter = @MainActor (Data) throws -> Void
 
-    private static let service = "in.eyhn.pedals.v2"
+    private static let service = "air.build.pedals.v2"
     private static let stateAccount = "pairing-state"
 
     private let apiFactory: APIFactory

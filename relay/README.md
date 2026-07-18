@@ -5,7 +5,7 @@ relay, the device-to-computer binding registry, current TTY counts, and APNs
 delivery. Terminal frames remain end-to-end encrypted; D1 never stores the
 pairing encryption secret, terminal bytes, titles, or working directories.
 
-The public origin is `https://pedals.eyhn.in`. All API responses are JSON with
+The public origin is `https://pedals.air.build`. All API responses are JSON with
 `Cache-Control: no-store`. JSON request bodies are limited to 16 KiB. Errors use:
 
 ```json
@@ -256,10 +256,10 @@ surfaces and fixed APNs routing are:
 
 | surface | `apns-push-type` | topic |
 |---|---|---|
-| `ios-widget` | `widgets` | `in.eyhn.pedals.push-type.widgets` |
-| `watch-widget` | `widgets` | `in.eyhn.pedals.watchapp.push-type.widgets` |
-| `liveactivity-start` | `liveactivity` | `in.eyhn.pedals.push-type.liveactivity` |
-| `liveactivity-update` | `liveactivity` | `in.eyhn.pedals.push-type.liveactivity` |
+| `ios-widget` | `widgets` | `air.build.pedals.push-type.widgets` |
+| `watch-widget` | `widgets` | `air.build.pedals.watchapp.push-type.widgets` |
+| `liveactivity-start` | `liveactivity` | `air.build.pedals.push-type.liveactivity` |
+| `liveactivity-update` | `liveactivity` | `air.build.pedals.push-type.liveactivity` |
 
 The client cannot supply a topic, push type, header, or arbitrary payload.
 Widget pushes contain only `aps.content-changed=true`; the refreshed timeline
@@ -350,7 +350,7 @@ cd ..
 in D1, source control, a Wrangler `vars` entry, or logs. The deployment script
 runs the full relay tests, verifies all three secret names, applies pending D1
 migrations, and captures Wrangler's immutable `Current Version ID`. It waits
-until `https://pedals.eyhn.in/healthz` reports that exact version on three
+until `https://pedals.air.build/healthz` reports that exact version on three
 consecutive requests before executing the public contract, preventing an old
 edge deployment from satisfying the readiness check. The health response body
 remains `ok`; `X-Pedals-Worker-Version` identifies the serving version and all

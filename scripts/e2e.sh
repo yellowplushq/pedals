@@ -14,7 +14,7 @@ ARTIFACTS="$ROOT/.artifacts"
 RELAY_PORT="${RELAY_PORT:-8787}"
 SERVICE_URL="http://127.0.0.1:$RELAY_PORT"
 SIM_DEVICE="${SIM_DEVICE:-iPhone 17 Pro}"
-BUNDLE_ID="in.eyhn.pedals"
+BUNDLE_ID="air.build.pedals"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 mkdir -p "$ARTIFACTS"
@@ -190,10 +190,13 @@ NODE
   [[ -n "$point" ]] || fail "could not find visible control '$label'"
   read -r tap_x tap_y tap_width tap_height <<<"$point"
   baguette tap --udid "$SIM_UDID" --x "$tap_x" --y "$tap_y" \
-    --width "$tap_width" --height "$tap_height" >/dev/null
+    --width "$tap_width" --height "$tap_height" --duration 0.15 >/dev/null
 }
 
-sleep 1
+# The onboarding content has a deliberate entrance transition. Accessibility
+# publishes the button before it is fully hit-testable, so wait for that
+# transition before driving the first visible control.
+sleep 3
 tap_accessibility_label "pedals.onboarding.pair"
 sleep 1
 tap_accessibility_label "pedals.pairing.code"
