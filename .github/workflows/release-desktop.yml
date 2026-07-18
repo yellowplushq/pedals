@@ -93,6 +93,14 @@ jobs:
       - name: Package disk image
         run: ./scripts/package-desktop-dmg.sh
 
+      - name: Sign disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg"
+          codesign --force --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+
       - name: Notarize and staple
         shell: bash
         env:
