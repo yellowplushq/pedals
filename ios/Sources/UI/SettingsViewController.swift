@@ -1,18 +1,19 @@
 import Combine
 import UIKit
 
-/// Grouped inset settings: connection info, re-pair, font size, theme, about.
+/// Grouped inset settings: bound computers (status, unbind, add), font size,
+/// theme, about.
 @MainActor
 final class SettingsViewController: UITableViewController {
     private enum Section: Int, CaseIterable {
-        case connection
-        case pairing
+        case computers
         case appearance
         case about
     }
 
     private let services: AppServices
     private var cancellables: Set<AnyCancellable> = []
+    private var computerCancellables: Set<AnyCancellable> = []
 
     init(services: AppServices) {
         self.services = services
@@ -25,26 +26,41 @@ final class SettingsViewController: UITableViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Settings"
+        view.tintColor = PedalsTheme.uiContent
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             systemItem: .done,
             primaryAction: UIAction { [weak self] _ in self?.dismiss(animated: true) }
         )
 
-        let connection = services.connection
-        connection.$state
-            .combineLatest(connection.$hostOnline, connection.$roundTripTime)
+        services.terminals.$computers
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _, _, _ in
-                guard let self, isViewLoaded else { return }
-                tableView.reloadSections(
-                    IndexSet([Section.connection.rawValue, Section.pairing.rawValue]),
-                    with: .none
-                )
+            .sink { [weak self] computers in
+                guard let self else { return }
+                observe(computers: computers)
+                reloadComputers()
             }
             .store(in: &cancellables)
     }
 
-    private var isPaired: Bool { services.connection.pairing != nil }
+    /// Live per-computer state (name, link state, RTT) → refresh the section.
+    private func observe(computers: [ComputerConnection]) {
+        computerCancellables.removeAll()
+        for computer in computers {
+            computer.$linkState
+                .combineLatest(computer.$hostOnline, computer.$hostName)
+                .dropFirst()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _, _, _ in self?.reloadComputers() }
+                .store(in: &computerCancellables)
+        }
+    }
+
+    private func reloadComputers() {
+        guard isViewLoaded else { return }
+        tableView.reloadSections(IndexSet([Section.computers.rawValue]), with: .none)
+    }
+
+    private var computers: [ComputerConnection] { services.terminals.computers }
 
     // MARK: - Table structure
 
@@ -56,8 +72,7 @@ final class SettingsViewController: UITableViewController {
         _ tableView: UITableView, titleForHeaderInSection section: Int
     ) -> String? {
         switch Section(rawValue: section)! {
-        case .connection: "Connection"
-        case .pairing: "Pairing"
+        case .computers: "Computers"
         case .appearance: "Terminal"
         case .about: "About"
         }
@@ -65,8 +80,7 @@ final class SettingsViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
-        case .connection: isPaired ? 4 : 1
-        case .pairing: isPaired ? 2 : 1
+        case .computers: computers.count + 1 // + "Add Computer…"
         case .appearance: 3
         case .about: 1
         }
@@ -76,8 +90,7 @@ final class SettingsViewController: UITableViewController {
         _ tableView: UITableView, cellForRowAt indexPath: IndexPath
     ) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
-        case .connection: connectionCell(row: indexPath.row)
-        case .pairing: pairingCell(row: indexPath.row)
+        case .computers: computerCell(row: indexPath.row)
         case .appearance: appearanceCell(row: indexPath.row)
         case .about: aboutCell()
         }
@@ -95,46 +108,41 @@ final class SettingsViewController: UITableViewController {
         return cell
     }
 
-    private func connectionCell(row: Int) -> UITableViewCell {
-        guard let pairing = services.connection.pairing else {
-            return valueCell("Status", "Not paired")
+    private func computerCell(row: Int) -> UITableViewCell {
+        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+        var content = cell.defaultContentConfiguration()
+        if row == computers.count {
+            content.text = "Add Computer…"
+            content.textProperties.color = PedalsTheme.uiContent
+            content.image = UIImage(systemName: "number")
+            content.imageProperties.tintColor = PedalsTheme.uiContent
+            cell.contentConfiguration = content
+            return cell
         }
-        switch row {
-        case 0:
-            let status: String = switch services.connection.state {
-            case .unpaired: "Not paired"
-            case .connecting: "Connecting…"
-            case let .reconnecting(attempt): "Reconnecting (attempt \(attempt))…"
-            case .connected:
-                services.connection.hostOnline ? "Connected · E2EE" : "Waiting for host…"
-            }
-            return valueCell("Status", status)
-        case 1:
-            return valueCell("Relay", pairing.relay.host ?? pairing.relay.absoluteString)
-        case 2:
-            return valueCell("Room", String(pairing.roomId.prefix(8)) + "…")
-        default:
-            let rtt = services.connection.roundTripTime
-            return valueCell("Ping", rtt.map { "\(Int(($0 * 1000).rounded())) ms" } ?? "—")
-        }
+
+        let computer = computers[row]
+        content.text = computer.displayName
+        content.secondaryText = statusText(for: computer)
+        content.secondaryTextProperties.color = .secondaryLabel
+        content.image = UIImage(systemName: "desktopcomputer")
+        content.imageProperties.tintColor = computer.hostOnline
+            ? PedalsTheme.uiContent : .secondaryLabel
+        cell.contentConfiguration = content
+        cell.selectionStyle = .default
+        return cell
     }
 
-    private func pairingCell(row: Int) -> UITableViewCell {
-        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
-        var content = cell.defaultContentConfiguration()
-        if !isPaired || row == 0 {
-            content.text = isPaired ? "Re-pair…" : "Pair…"
-            content.textProperties.color = view.tintColor
-            content.image = UIImage(systemName: "qrcode.viewfinder")
-            content.imageProperties.tintColor = view.tintColor
-        } else {
-            content.text = "Forget Pairing"
-            content.textProperties.color = .systemRed
-            content.image = UIImage(systemName: "trash")
-            content.imageProperties.tintColor = .systemRed
+    private func statusText(for computer: ComputerConnection) -> String {
+        switch computer.linkState {
+        case .idle:
+            return "Disconnected"
+        case .connecting(let attempt):
+            return attempt == 0 ? "Connecting…" : "Reconnecting (attempt \(attempt))…"
+        case .connected:
+            guard computer.hostOnline else { return "Waiting for host…" }
+            let rtt = computer.roundTripTime.map { " · \(Int(($0 * 1000).rounded())) ms" } ?? ""
+            return "Connected · E2EE" + rtt
         }
-        cell.contentConfiguration = content
-        return cell
     }
 
     private func appearanceCell(row: Int) -> UITableViewCell {
@@ -147,6 +155,7 @@ final class SettingsViewController: UITableViewController {
             stepper.maximumValue = Double(TerminalPreferences.fontSizeRange.upperBound)
             stepper.stepValue = 1
             stepper.value = Double(services.preferences.fontSize)
+            stepper.tintColor = PedalsTheme.uiContent
             stepper.addAction(
                 UIAction { [weak self, weak stepper] _ in
                     guard let self, let stepper else { return }
@@ -197,11 +206,11 @@ final class SettingsViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         switch Section(rawValue: indexPath.section)! {
-        case .pairing:
-            if !isPaired || indexPath.row == 0 {
-                presentScanner()
+        case .computers:
+            if indexPath.row == computers.count {
+                presentPairingCode()
             } else {
-                confirmForgetPairing()
+                presentComputerActions(computers[indexPath.row])
             }
         case .appearance where indexPath.row == 1:
             navigationController?.pushViewController(
@@ -209,9 +218,93 @@ final class SettingsViewController: UITableViewController {
             )
         case .appearance where indexPath.row == 2:
             presentBackgroundOptions()
-        case .connection, .appearance, .about:
+        case .appearance, .about:
             break
         }
+    }
+
+    // MARK: - Computers
+
+    override func tableView(
+        _ tableView: UITableView,
+        commit editingStyle: UITableViewCell.EditingStyle,
+        forRowAt indexPath: IndexPath
+    ) {
+        guard editingStyle == .delete,
+              indexPath.section == Section.computers.rawValue,
+              indexPath.row < computers.count
+        else { return }
+        confirmUnbind(computers[indexPath.row])
+    }
+
+    override func tableView(
+        _ tableView: UITableView, canEditRowAt indexPath: IndexPath
+    ) -> Bool {
+        indexPath.section == Section.computers.rawValue && indexPath.row < computers.count
+    }
+
+    private func presentComputerActions(_ computer: ComputerConnection) {
+        // The destructive action sheet IS the confirmation — no second alert
+        // (swipe-to-delete keeps its own single confirm in confirmUnbind).
+        let sheet = UIAlertController(
+            title: computer.displayName,
+            message: """
+            \(statusText(for: computer))
+
+            Unbinding removes its terminals from this device and the stored \
+            key. Sessions keep running on the computer.
+            """,
+            preferredStyle: .actionSheet
+        )
+        sheet.addAction(UIAlertAction(title: "Unbind", style: .destructive) { [weak self] _ in
+            self?.unbind(computer)
+        })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(sheet, animated: true)
+    }
+
+    private func confirmUnbind(_ computer: ComputerConnection) {
+        let alert = UIAlertController(
+            title: "Unbind “\(computer.displayName)”?",
+            message: "Its terminals disappear from this device and the stored key is removed. Sessions keep running on the computer.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Unbind", style: .destructive) { [weak self] _ in
+            self?.unbind(computer)
+        })
+        present(alert, animated: true)
+    }
+
+    private func presentPairingCode() {
+        let controller = PairingCodeViewController()
+        let services = services
+        controller.onPair = { [weak self] code in
+            try await services.bind(code: code)
+            self?.tableView.reloadData()
+        }
+        controller.modalPresentationStyle = .fullScreen
+        present(controller, animated: true)
+    }
+
+    private func unbind(_ computer: ComputerConnection) {
+        Task { @MainActor [weak self] in
+            do {
+                try await self?.services.terminals.removeComputer(id: computer.id)
+            } catch {
+                self?.showBindingError(error)
+            }
+        }
+    }
+
+    private func showBindingError(_ error: Error) {
+        let alert = UIAlertController(
+            title: "Pedals Service Error",
+            message: error.localizedDescription,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 
     // MARK: - Terminal background
@@ -248,32 +341,6 @@ final class SettingsViewController: UITableViewController {
         tableView.reloadRows(
             at: [IndexPath(row: 2, section: Section.appearance.rawValue)], with: .none
         )
-    }
-
-    private func presentScanner() {
-        let scanner = PairingScanViewController()
-        scanner.onPaired = { [weak self] info in
-            self?.services.connection.pair(with: info)
-            self?.tableView.reloadData()
-        }
-        scanner.modalPresentationStyle = .fullScreen
-        present(scanner, animated: true)
-    }
-
-    // MARK: - Pairing
-
-    private func confirmForgetPairing() {
-        let alert = UIAlertController(
-            title: "Forget Pairing?",
-            message: "This disconnects from your Mac and removes the stored key.",
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Forget", style: .destructive) { [weak self] _ in
-            self?.services.connection.unpair()
-            self?.tableView.reloadData()
-        })
-        present(alert, animated: true)
     }
 }
 

@@ -1,0 +1,104 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "pedals-relay",
+	"account_id": "31241bd2e4538bd39421cb47d2b06041",
+	"main": "src/worker.mjs",
+	"vars": {
+		"DESKTOP_RELEASE_REPOSITORY": "yellowplushq/pedals"
+	},
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"run_worker_first": true
+	},
+	"version_metadata": {
+		"binding": "WORKER_VERSION"
+	},
+	"compatibility_date": "2026-07-17",
+	"workers_dev": false,
+	"secrets": {
+		"required": [
+			"APNS_PRIVATE_KEY_P8",
+			"APNS_KEY_ID",
+			"APNS_TEAM_ID"
+		]
+	},
+	"routes": [
+		{
+			"pattern": "pedals.eyhn.in",
+			"custom_domain": true
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "RELAY_CHANNELS",
+				"class_name": "RelayChannel"
+			},
+			{
+				"name": "PUSH_COORDINATOR",
+				"class_name": "PushCoordinator"
+			}
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "pedals",
+			"migrations_dir": "migrations",
+			"database_id": "3413da34-27b6-4ea8-9b80-760c8dcba6b5"
+		}
+	],
+	"ratelimits": [
+		{
+			"name": "REQUEST_LIMITER",
+			"namespace_id": "31000",
+			"simple": { "limit": 300, "period": 60 }
+		},
+		{
+			"name": "COMPUTER_REGISTRATION_LIMITER",
+			"namespace_id": "31001",
+			"simple": { "limit": 5, "period": 60 }
+		},
+		{
+			"name": "CLIENT_REGISTRATION_LIMITER",
+			"namespace_id": "31002",
+			"simple": { "limit": 10, "period": 60 }
+		},
+		{
+			"name": "INVITE_LIMITER",
+			"namespace_id": "31003",
+			"simple": { "limit": 10, "period": 60 }
+		},
+		{
+			"name": "MUTATION_LIMITER",
+			"namespace_id": "31004",
+			"simple": { "limit": 60, "period": 60 }
+		},
+		{
+			"name": "PUSH_MUTATION_LIMITER",
+			"namespace_id": "31005",
+			"simple": { "limit": 30, "period": 60 }
+		},
+		{
+			"name": "RELAY_UPGRADE_LIMITER",
+			"namespace_id": "31006",
+			"simple": { "limit": 120, "period": 60 }
+		}
+	],
+	"triggers": {
+		"crons": [
+			"* * * * *"
+		]
+	},
+	"exports": {
+		"RelayChannel": {
+			"type": "durable-object",
+			"storage": "sqlite"
+		},
+		"PushCoordinator": {
+			"type": "durable-object",
+			"storage": "sqlite"
+		}
+	}
+}

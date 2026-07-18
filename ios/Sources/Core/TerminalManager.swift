@@ -1,0 +1,412 @@
+import Combine
+import Foundation
+import PedalsKit
+
+/// One tab in the client-maintained cross-computer terminal list.
+struct Terminal: Equatable {
+    let id: TerminalID
+    var info: SessionInfo
+    var computerName: String
+    /// A `close` is in flight; the tab is frozen until the daemon's next
+    /// session list confirms removal.
+    var closing = false
+}
+
+/// The hub: owns every `ComputerConnection` (one per bound computer), merges
+/// their session lists into one ordered tab list, and pools the per-terminal
+/// data channels.
+///
+/// Ordering is maintained client-side (the daemon only knows sets):
+/// - a terminal this device created is inserted right after the active tab
+///   and switched to (correlated via the `req` echo in `created`);
+/// - terminals created elsewhere (other devices / CLI) are appended at the
+///   end and do NOT steal focus.
+///
+/// Channels connect lazily on first activation. At most `maxLiveChannels`
+/// stay open; beyond that the least recently activated terminal's socket is
+/// closed ("asleep") — the daemon keeps its PTY running, and reactivating
+/// reconnects + replays.
+@MainActor
+final class TerminalManager {
+    @Published private(set) var computers: [ComputerConnection] = []
+    /// Ordered tab list (the client-maintained order).
+    @Published private(set) var terminals: [Terminal] = []
+    @Published private(set) var activeID: TerminalID?
+    /// Data-channel phase per terminal; missing key = asleep / never opened.
+    @Published private(set) var phases: [TerminalID: TerminalChannel.Phase] = [:]
+
+    enum Output {
+        case replay(Data)
+        case stdout(Data)
+    }
+    let outputs = PassthroughSubject<(id: TerminalID, output: Output), Never>()
+    let exits = PassthroughSubject<(id: TerminalID, code: Int), Never>()
+    /// Daemon-reported failures of *our* requests (e.g. a create that failed),
+    /// for the UI to surface.
+    let errors = PassthroughSubject<String, Never>()
+
+    static let maxLiveChannels = 6
+    /// How long to hold an unidentified new session off the tab list while our
+    /// own `create` is in flight (`sessions` can arrive before `created`).
+    private static let placementGrace: TimeInterval = 2
+
+    private let pairingStore: PairingStore
+    private var channels: [TerminalID: TerminalChannel] = [:]
+    private var subscriptions: [String: Set<AnyCancellable>] = [:]
+    /// req → computerID of our in-flight creates.
+    private var pendingCreates: [UInt32: String] = [:]
+    /// `created` said these are ours but `sessions` hasn't listed them yet.
+    private var placeAsOwnWhenSeen: Set<TerminalID> = []
+    /// New ids held back during `placementGrace` (see above).
+    private var heldAppends: [TerminalID: SessionInfo] = [:]
+
+    init(pairingStore: PairingStore) {
+        self.pairingStore = pairingStore
+        let identity: ClientIdentity
+        let bindings: [ComputerBinding]
+        do {
+            guard let storedIdentity = try pairingStore.loadClientIdentity() else { return }
+            identity = storedIdentity
+            bindings = try pairingStore.loadAll()
+        } catch {
+            // A corrupt or inaccessible Keychain value is not empty state.
+            // Explicit pairing will surface the error without overwriting it.
+            return
+        }
+        for binding in bindings where binding.serviceURL == identity.serviceURL {
+            attach(ComputerConnection(
+                binding: binding,
+                clientID: identity.clientID,
+                clientToken: identity.clientToken
+            ))
+        }
+    }
+
+    // MARK: - Computers
+
+    func computer(id: String) -> ComputerConnection? {
+        computers.first { $0.id == id }
+    }
+
+    func addComputer(
+        code: PairingCode,
+        serviceURL: URL = PedalsServiceAPI.productionServiceURL
+    ) async throws {
+        let previousClientID = try pairingStore.loadClientIdentity()?.clientID
+        let (binding, identity) = try await pairingStore.bind(
+            code: code,
+            serviceURL: serviceURL
+        )
+        finishAdding(binding: binding, identity: identity, previousClientID: previousClientID)
+    }
+
+    private func finishAdding(
+        binding: ComputerBinding,
+        identity: ClientIdentity,
+        previousClientID: String?
+    ) {
+
+        if let previousClientID, previousClientID != identity.clientID {
+            // Every existing relay bearer belongs to the rejected identity.
+            // Tear down connections, channels, terminal tabs, and pending
+            // requests before attaching the replacement identity.
+            for connection in computers {
+                removeComputerLocally(connection)
+            }
+        } else if let existing = computer(id: binding.computerID) {
+            removeComputerLocally(existing)
+        }
+        attach(ComputerConnection(
+            binding: binding,
+            clientID: identity.clientID,
+            clientToken: identity.clientToken
+        ))
+    }
+
+    /// Unbind: forget the pairing and drop its terminals from the tab list.
+    func removeComputer(id: String) async throws {
+        try await pairingStore.unbind(computerID: id)
+        if let connection = computer(id: id) {
+            removeComputerLocally(connection)
+        }
+    }
+
+    private func attach(_ connection: ComputerConnection) {
+        computers.append(connection)
+        var cancellables: Set<AnyCancellable> = []
+        connection.$sessions
+            .sink { [weak self, weak connection] list in
+                guard let self, let connection else { return }
+                self.reconcile(computer: connection, list: list)
+            }
+            .store(in: &cancellables)
+        connection.events
+            .sink { [weak self, weak connection] event in
+                guard let self, let connection else { return }
+                self.handle(event: event, from: connection)
+            }
+            .store(in: &cancellables)
+        subscriptions[connection.id] = cancellables
+        connection.start()
+    }
+
+    private func removeComputerLocally(_ connection: ComputerConnection) {
+        subscriptions.removeValue(forKey: connection.id)
+        connection.stop()
+        computers.removeAll { $0.id == connection.id }
+        let removed = terminals.filter { $0.id.computerID == connection.id }.map(\.id)
+        for id in removed { dropTerminal(id) }
+        pendingCreates = pendingCreates.filter { $0.value != connection.id }
+        // Drop pending placements too, else a scheduled held-append flush (or a
+        // late `created`) would append a ghost tab for an unbound computer that
+        // can never open a channel or be closed.
+        heldAppends = heldAppends.filter { $0.key.computerID != connection.id }
+        placeAsOwnWhenSeen = placeAsOwnWhenSeen.filter { $0.computerID != connection.id }
+    }
+
+    // MARK: - Terminal accessors
+
+    func terminal(_ id: TerminalID) -> Terminal? {
+        terminals.first { $0.id == id }
+    }
+
+    // MARK: - Activation + connection pool
+
+    func activate(_ id: TerminalID) {
+        guard terminals.contains(where: { $0.id == id }) else { return }
+        activeID = id
+        ensureChannel(id)
+    }
+
+    private func ensureChannel(_ id: TerminalID) {
+        if let channel = channels[id] {
+            channel.touch()
+            return
+        }
+        guard let connection = computer(id: id.computerID) else { return }
+        let channel = TerminalChannel(
+            terminalID: id, link: connection.makeSessionLink(sid: id.sid)
+        )
+        channel.onReplay = { [weak self] data in
+            self?.outputs.send((id: id, output: .replay(data)))
+        }
+        channel.onStdout = { [weak self] data in
+            self?.outputs.send((id: id, output: .stdout(data)))
+        }
+        channel.onPhase = { [weak self] phase in
+            self?.phases[id] = phase
+        }
+        phases[id] = channel.phase
+        channels[id] = channel
+        evictBeyondPoolLimit()
+    }
+
+    /// Put the least recently activated channels to sleep. The active terminal
+    /// is never evicted.
+    private func evictBeyondPoolLimit() {
+        while channels.count > Self.maxLiveChannels {
+            let victim = channels.values
+                .filter { $0.terminalID != activeID }
+                .min { $0.lastActivated < $1.lastActivated }
+            guard let victim else { return }
+            victim.stop()
+            channels.removeValue(forKey: victim.terminalID)
+            phases.removeValue(forKey: victim.terminalID)
+        }
+    }
+
+    /// Reconnect everything immediately (app returned to foreground).
+    func kickAll() {
+        for computer in computers { computer.kick() }
+        for channel in channels.values { channel.kick() }
+    }
+
+    // MARK: - Create
+
+    /// Creates a terminal on `computerID`. If the active terminal lives on the
+    /// same computer the new one inherits its live cwd; otherwise home.
+    func createTerminal(on computerID: String, cols: Int, rows: Int) {
+        guard let connection = computer(id: computerID) else { return }
+        let cwd: String? = {
+            guard let activeID, activeID.computerID == computerID,
+                  let active = terminal(activeID)
+            else { return nil }
+            return active.info.cwd.isEmpty ? nil : active.info.cwd
+        }()
+        let req = UInt32.random(in: .min ... .max)
+        pendingCreates[req] = computerID
+        connection.createSession(cwd: cwd, cols: cols, rows: rows, req: req)
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            self?.pendingCreates.removeValue(forKey: req)
+        }
+    }
+
+    // MARK: - Close (async: frozen until the daemon confirms)
+
+    func closeTerminal(_ id: TerminalID) {
+        guard let index = terminals.firstIndex(where: { $0.id == id }),
+              !terminals[index].closing
+        else { return }
+        terminals[index].closing = true
+        computer(id: id.computerID)?.closeSession(id: id.sid)
+    }
+
+    // MARK: - Terminal I/O passthrough
+
+    func sendStdin(_ id: TerminalID, data: Data) {
+        guard terminal(id)?.closing != true else { return }
+        channels[id]?.sendStdin(data)
+    }
+
+    func sendResize(_ id: TerminalID, cols: UInt16, rows: UInt16) {
+        channels[id]?.sendResize(cols: cols, rows: rows)
+    }
+
+    /// Ask the host for a fresh replay snapshot (the UI missed one, e.g. the
+    /// page was built after the channel already went live).
+    func requestReplay(_ id: TerminalID) {
+        channels[id]?.requestReplay()
+    }
+
+    // MARK: - Reconciliation
+
+    private func handle(event: ComputerConnection.Event, from connection: ComputerConnection) {
+        switch event {
+        case .created(let sid, let req):
+            let id = TerminalID(computerID: connection.id, sid: sid)
+            let isOurs = req.map { pendingCreates.removeValue(forKey: $0) != nil } ?? false
+            if isOurs {
+                if let info = heldAppends.removeValue(forKey: id) {
+                    insertOwn(id: id, info: info, computerName: connection.displayName)
+                } else if terminals.contains(where: { $0.id == id }) {
+                    moveAfterActiveAndActivate(id)
+                } else {
+                    placeAsOwnWhenSeen.insert(id)
+                }
+            } else if let info = heldAppends.removeValue(forKey: id) {
+                append(id: id, info: info, computerName: connection.displayName)
+            }
+        case .exit(let sid, let code):
+            exits.send((id: TerminalID(computerID: connection.id, sid: sid), code: code))
+        case .error(let msg, let req):
+            // Only failures of requests *this* device made are ours to show.
+            guard let req, pendingCreates.removeValue(forKey: req) != nil else { break }
+            errors.send(msg)
+        }
+    }
+
+    private func reconcile(computer connection: ComputerConnection, list: [SessionInfo]) {
+        let cid = connection.id
+        let listed = Dictionary(uniqueKeysWithValues: list.map {
+            (TerminalID(computerID: cid, sid: $0.id), $0)
+        })
+
+        // Update / remove existing tabs of this computer.
+        for terminal in terminals where terminal.id.computerID == cid {
+            if let info = listed[terminal.id] {
+                update(terminal.id) { tab in
+                    tab.info = info
+                    tab.computerName = connection.displayName
+                }
+                // The close ctl can be lost while the host is away (the relay
+                // drops it, possibly with our control link never dropping). A
+                // still-listed closing tab means the daemon hasn't seen the
+                // close — re-issue it on each fresh list until it takes.
+                if terminal.closing {
+                    connection.closeSession(id: terminal.id.sid)
+                }
+            } else {
+                dropTerminal(terminal.id)
+            }
+        }
+        heldAppends = heldAppends.filter {
+            $0.key.computerID != cid || listed[$0.key] != nil
+        }
+
+        // Place new ids.
+        let known = Set(terminals.map(\.id))
+        let ourCreateInFlight = pendingCreates.values.contains(cid)
+        for info in list {
+            let id = TerminalID(computerID: cid, sid: info.id)
+            guard !known.contains(id), heldAppends[id] == nil else { continue }
+            if placeAsOwnWhenSeen.remove(id) != nil {
+                insertOwn(id: id, info: info, computerName: connection.displayName)
+            } else if ourCreateInFlight {
+                // Might be our own create whose `created` echo is still in
+                // flight; hold it briefly so it doesn't first appear at the
+                // end and then jump.
+                heldAppends[id] = info
+                scheduleHeldFlush(id: id, computerName: connection.displayName)
+            } else {
+                append(id: id, info: info, computerName: connection.displayName)
+            }
+        }
+
+        // Nothing was active yet (fresh launch): show the first tab.
+        if activeID == nil, let first = terminals.first {
+            activate(first.id)
+        }
+    }
+
+    private func scheduleHeldFlush(id: TerminalID, computerName: String) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.placementGrace))
+            guard let self, let info = self.heldAppends.removeValue(forKey: id) else { return }
+            self.append(id: id, info: info, computerName: computerName)
+        }
+    }
+
+    /// Remote-created terminals: appended at the end, focus untouched.
+    private func append(id: TerminalID, info: SessionInfo, computerName: String) {
+        guard !terminals.contains(where: { $0.id == id }) else { return }
+        terminals.append(Terminal(id: id, info: info, computerName: computerName))
+    }
+
+    /// Our own terminal: insert right after the active tab and switch to it.
+    private func insertOwn(id: TerminalID, info: SessionInfo, computerName: String) {
+        guard !terminals.contains(where: { $0.id == id }) else {
+            moveAfterActiveAndActivate(id)
+            return
+        }
+        let terminal = Terminal(id: id, info: info, computerName: computerName)
+        terminals.insert(terminal, at: insertionIndexAfterActive())
+        activate(id)
+    }
+
+    private func moveAfterActiveAndActivate(_ id: TerminalID) {
+        guard let from = terminals.firstIndex(where: { $0.id == id }) else { return }
+        let terminal = terminals.remove(at: from)
+        terminals.insert(terminal, at: insertionIndexAfterActive())
+        activate(id)
+    }
+
+    private func insertionIndexAfterActive() -> Int {
+        guard let activeID,
+              let index = terminals.firstIndex(where: { $0.id == activeID })
+        else { return terminals.count }
+        return index + 1
+    }
+
+    private func update(_ id: TerminalID, _ mutate: (inout Terminal) -> Void) {
+        guard let index = terminals.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&terminals[index])
+    }
+
+    private func dropTerminal(_ id: TerminalID) {
+        channels[id]?.stop()
+        channels.removeValue(forKey: id)
+        phases.removeValue(forKey: id)
+        placeAsOwnWhenSeen.remove(id)
+        heldAppends.removeValue(forKey: id)
+        guard let index = terminals.firstIndex(where: { $0.id == id }) else { return }
+        terminals.remove(at: index)
+        if activeID == id {
+            // Prefer the tab that took the closed one's slot, else the last.
+            let fallback = terminals.indices.contains(index)
+                ? terminals[index] : terminals.last
+            activeID = nil
+            if let fallback { activate(fallback.id) }
+        }
+    }
+}

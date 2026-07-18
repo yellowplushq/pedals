@@ -89,21 +89,41 @@ final class FrameCodecTests: XCTestCase {
     // MARK: ctl JSON messages
 
     func testControlMessageRoundTripAllKinds() throws {
+        let hostPrincipal = "0123456789abcdef0123456789abcdef"
+        let clientPrincipal = "fedcba9876543210fedcba9876543210"
+        let hostNonce = Data(repeating: 0xA1, count: 32)
+        let clientNonce = Data(repeating: 0xB2, count: 32)
         let session = SessionInfo(
             id: 1, title: "zsh — ~/dev", cwd: "/Users/x/dev",
             rows: 40, cols: 120, createdAt: 1_752_700_000, alive: true
         )
         let messages: [ControlMessage] = [
-            .hello(who: .host, connEpoch: 0xDEAD_BEEF, ver: 1),
-            .hello(who: .client, connEpoch: 0, ver: 1),
+            .hello(
+                who: .host,
+                principal: hostPrincipal,
+                connEpoch: 0xDEAD_BEEF,
+                nonce: hostNonce,
+                ver: 2,
+                host: "mac-studio"
+            ),
+            .hello(
+                who: .client,
+                principal: clientPrincipal,
+                connEpoch: 0,
+                nonce: clientNonce,
+                ver: 2,
+                host: nil
+            ),
+            .ready(who: .host, echoNonce: clientNonce),
+            .ready(who: .client, echoNonce: hostNonce),
+            .requestReplay,
             .sessions(list: [session]),
             .sessions(list: []),
-            .create(cwd: "/tmp", cols: 80, rows: 24),
-            .create(cwd: nil, cols: 120, rows: 40),
-            .created(id: 3),
+            .create(cwd: "/tmp", cols: 80, rows: 24, req: 0xCAFE),
+            .create(cwd: nil, cols: 120, rows: 40, req: nil),
+            .created(id: 3, req: 0xCAFE),
+            .created(id: 3, req: nil),
             .close(id: 2),
-            .attach(id: 1),
-            .detach(id: 1),
             .title(id: 4, title: "vim — notes.md"),
             .exit(id: 5, code: 130),
             .err(msg: "boom"),
@@ -118,19 +138,78 @@ final class FrameCodecTests: XCTestCase {
     }
 
     func testControlMessageWireShape() throws {
-        let data = try ControlMessage.attach(id: 9).jsonData()
+        let data = try ControlMessage.close(id: 9).jsonData()
         let object = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
-        XCTAssertEqual(object["t"] as? String, "attach")
+        XCTAssertEqual(object["t"] as? String, "close")
         XCTAssertEqual(object["id"] as? Int, 9)
         XCTAssertEqual(object.count, 2)
     }
 
+    func testHelloWireShapeOmitsNilHost() throws {
+        let nonce = Data(repeating: 0x5A, count: 32)
+        let data = try ControlMessage
+            .hello(
+                who: .client,
+                principal: "fedcba9876543210fedcba9876543210",
+                connEpoch: 7,
+                nonce: nonce,
+                ver: 2,
+                host: nil
+            ).jsonData()
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertNil(object["host"], "nil host must be omitted, not null")
+        XCTAssertEqual(object["t"] as? String, "hello")
+        XCTAssertEqual(object["who"] as? String, "client")
+        XCTAssertEqual(
+            object["principal"] as? String,
+            "fedcba9876543210fedcba9876543210"
+        )
+        XCTAssertEqual(object["connEpoch"] as? Int, 7)
+        XCTAssertEqual(object["nonce"] as? String, nonce.base64EncodedString())
+        XCTAssertEqual(object["ver"] as? Int, 2)
+    }
+
+    func testReadyAndRequestReplayControlMessagesRoundTrip() throws {
+        let nonce = Data((0..<32).map(UInt8.init))
+        let messages: [ControlMessage] = [
+            .ready(who: .client, echoNonce: nonce),
+            .requestReplay,
+        ]
+
+        for message in messages {
+            let encoded = try message.jsonData()
+            XCTAssertEqual(try ControlMessage(jsonData: encoded), message)
+            XCTAssertEqual(try Frame.control(message).controlMessage(), message)
+        }
+
+        let readyObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: messages[0].jsonData())
+                as? [String: Any]
+        )
+        XCTAssertEqual(readyObject["t"] as? String, "ready")
+        XCTAssertEqual(readyObject["who"] as? String, "client")
+        XCTAssertEqual(
+            readyObject["echoNonce"] as? String,
+            nonce.base64EncodedString()
+        )
+
+        let replayObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: messages[1].jsonData())
+                as? [String: Any]
+        )
+        XCTAssertEqual(replayObject["t"] as? String, "requestReplay")
+        XCTAssertEqual(replayObject.count, 1)
+    }
+
     func testCreateEncodesNilCwdAsJSONNull() throws {
-        let data = try ControlMessage.create(cwd: nil, cols: 120, rows: 40).jsonData()
+        let data = try ControlMessage.create(cwd: nil, cols: 120, rows: 40, req: nil).jsonData()
         let json = String(decoding: data, as: UTF8.self)
         XCTAssertTrue(json.contains("\"cwd\":null"), "got \(json)")
+        XCTAssertFalse(json.contains("\"req\""), "nil req must be omitted, got \(json)")
     }
 
     func testDecodesSpecExampleJSON() throws {

@@ -9,14 +9,14 @@ import { deriveKeys, open, seal, seqBytes, decodeFrame, FrameType } from "./cryp
 const SECRET = Buffer.alloc(32, 0x42);
 
 const KEY_H2C_HEX =
-  "f5f1ae11b574be72b8afa4068d3509bf2d8f8d469d1ed16651d41406f923e641";
+  "6972bc6da52c7ca19a55c1304c25846b032531a6142175312d54fdf09592ff40";
 const KEY_C2H_HEX =
-  "d4f715a850ee4d287fd5aba0d5dad7145fe93a9a4f22223a49bfa91b285ac333";
+  "92961f97fbed1c21af672ab1f143c8b13589b10b849b0afed483aaff6cc4b3b7";
 
 // seq(8, LE) || nonce("pedals-nonce") || ciphertext(10) || tag(16)
 const FULL_MESSAGE_HEX =
-  "0100000000000000706564616c732d6e6f6e63658b58f5073d8b010d6550" +
-  "5138d2966bdeed53ba46abe5967cb475";
+  "0100000000000000706564616c732d6e6f6e636594d3740a19c7dc465ace" +
+  "5279fe452d7a661383a99da076062944";
 const PLAINTEXT_FRAME_HEX = "000000000068656c6c6f"; // ctl, sid 0, "hello"
 
 test("HKDF-SHA256 direction keys match TESTVECTORS.md", () => {

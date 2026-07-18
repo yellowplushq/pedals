@@ -5,13 +5,19 @@ import PedalsKit
 /// socket. `pedals serve` constructs one and parks the main thread.
 public final class Daemon: @unchecked Sendable {
     public enum DaemonError: Error, CustomStringConvertible {
-        case notPaired
+        case notRegistered
+        case identityResetPending(HostIdentityResetState.Phase)
 
         public var description: String {
-            """
-            no pairing and no relay configured — run `pedals pair --reset` first, \
-            or write {"relay":"wss://..."} to config.json
-            """
+            switch self {
+            case .notRegistered:
+                """
+                no host identity and no service configured — run \
+                `pedals serve --service https://pedals.eyhn.in` once
+                """
+            case .identityResetPending(let phase):
+                "identity reset is incomplete (\(phase.rawValue)); run `pedals pair --reset` to resume"
+            }
         }
     }
 
@@ -19,38 +25,69 @@ public final class Daemon: @unchecked Sendable {
     private let sessions: SessionManager
     private let relay: RelayHostClient
     private var controlServer: ControlServer?
+    /// Held from identity load/registration until the control socket listens.
+    /// An offline CLI that lost the initial socket race blocks on this lock,
+    /// then observes the newly listening daemon before mutating identity state.
+    private var startupIdentityLock: IdentityFileLock?
     private let startedAt = Date()
-    /// Serializes pairing regeneration against status/pair reads.
+    /// Serializes identity rotation against status/pair reads.
+    private let identityLock = NSLock()
+    private var identity: HostIdentity
+    private let serviceActions: ServiceActions
     private let pairingLock = NSLock()
-    private var pairing: PairingInfo
+    private var pairingSession: HostPairingSession?
+    private var pairingTask: Task<Void, Never>?
 
-    /// Loads (or, when a relay URL is configured, generates) the pairing and
-    /// wires everything up. The control socket starts listening in `start()`.
-    public init(home: PedalsHome = PedalsHome(), sessionOptions: SessionManager.Options = .init()) throws {
+    /// Loads (or registers) the v2 host identity and wires everything up.
+    public init(
+        home: PedalsHome = PedalsHome(),
+        sessionOptions: SessionManager.Options = .init(),
+        serviceActions: ServiceActions = .live
+    ) throws {
         self.home = home
+        self.serviceActions = serviceActions
         try home.ensureDirectoryExists()
-
-        if let pairing = home.loadPairing() {
-            self.pairing = pairing
-        } else if let config = home.loadConfig(), let relayURL = URL(string: config.relay) {
-            let pairing = try PairingInfo.generate(relay: relayURL)
-            try home.save(pairing: pairing)
-            self.pairing = pairing
-        } else {
-            throw DaemonError.notPaired
+        let startupIdentityLock = try home.acquireIdentityLock()
+        var keepStartupLock = false
+        defer {
+            if !keepStartupLock { startupIdentityLock.unlock() }
         }
 
+        if let pending = try home.loadIdentityResetState() {
+            throw DaemonError.identityResetPending(pending.phase)
+        } else if let identity = try home.loadIdentity() {
+            self.identity = identity
+        } else if let config = home.loadConfig(), let serviceURL = URL(string: config.service) {
+            let identity = try registerHostIdentityLocked(
+                home: home, serviceURL: serviceURL, actions: serviceActions
+            )
+            self.identity = identity
+        } else {
+            throw DaemonError.notRegistered
+        }
+
+        var sessionOptions = sessionOptions
+        sessionOptions.firstSessionId = (home.loadSessionCounter() ?? 0) + 1
+        sessionOptions.onIdAllocated = { [home] id in
+            try home.save(sessionCounter: id)
+        }
         sessions = SessionManager(options: sessionOptions)
-        relay = RelayHostClient(pairing: pairing, sessions: sessions)
+        relay = RelayHostClient(identity: identity, sessions: sessions)
+        self.startupIdentityLock = startupIdentityLock
+        keepStartupLock = true
     }
 
-    public var pairingInfo: PairingInfo {
-        pairingLock.lock()
-        defer { pairingLock.unlock() }
-        return pairing
+    public var hostIdentity: HostIdentity {
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        return identity
     }
 
     public func start() throws {
+        defer {
+            startupIdentityLock?.unlock()
+            startupIdentityLock = nil
+        }
         controlServer = try ControlServer(path: home.socketPath) { [weak self] request in
             self?.handle(request) ?? .error("daemon shutting down")
         }
@@ -58,10 +95,17 @@ public final class Daemon: @unchecked Sendable {
     }
 
     public func shutdown() {
+        cancelCurrentPairingSession(revoke: true)
+        startupIdentityLock?.unlock()
+        startupIdentityLock = nil
         controlServer?.stop()
         controlServer = nil
         relay.stop()
         sessions.closeAll()
+    }
+
+    deinit {
+        startupIdentityLock?.unlock()
     }
 
     // MARK: - Control commands (PROTOCOL.md §5)
@@ -72,7 +116,7 @@ public final class Daemon: @unchecked Sendable {
             return .ok([
                 "sessions": .array(sessions.list().map(Self.encode(session:))),
                 "client": .string(relay.clientConnected ? "connected" : "none"),
-                "relay": .string(relay.relayURL.absoluteString),
+                "service": .string(relay.serviceURL.absoluteString),
             ])
 
         case "new":
@@ -90,20 +134,27 @@ public final class Daemon: @unchecked Sendable {
 
         case "pair":
             do {
-                let info = try currentOrRegeneratedPairing(reset: request.reset == true)
-                return .ok(["url": .string(info.url.absoluteString)])
+                let pairing = try createPairingSession(rotatingIdentity: request.reset == true)
+                return .ok([
+                    "code": .string(pairing.code.digits),
+                    "expiresAt": .double(Double(pairing.expiresAt)),
+                ])
             } catch {
                 return .error("pair failed: \(error)")
             }
 
+        case "cancelPair":
+            cancelCurrentPairingSession(revoke: true)
+            return .ok([:])
+
         case "status":
             let state = relay.state
             return .ok([
-                "relay": .string(relay.relayURL.absoluteString),
+                "service": .string(relay.serviceURL.absoluteString),
                 "state": .string(state == .connected ? "connected" : "connecting"),
                 "connected": .bool(state == .connected),
                 "client": .string(relay.clientConnected ? "connected" : "none"),
-                "room": .string(relay.roomId),
+                "computer": .string(relay.computerID),
                 "uptime": .double(Date().timeIntervalSince(startedAt).rounded()),
             ])
 
@@ -112,16 +163,78 @@ public final class Daemon: @unchecked Sendable {
         }
     }
 
-    private func currentOrRegeneratedPairing(reset: Bool) throws -> PairingInfo {
-        pairingLock.lock()
-        defer { pairingLock.unlock() }
-        guard reset else { return pairing }
-        let relayURL = home.loadConfig().flatMap { URL(string: $0.relay) } ?? pairing.relay
-        let fresh = try PairingInfo.generate(relay: relayURL)
-        try home.save(pairing: fresh)
-        pairing = fresh
-        relay.update(pairing: fresh)
-        return fresh
+    private func createPairingSession(rotatingIdentity reset: Bool) throws -> HostPairingSession {
+        cancelCurrentPairingSession(revoke: true)
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        if reset {
+            let pending = try home.loadIdentityResetState()
+            let serviceURL = pending?.replacementServiceURL
+                ?? home.loadConfig().flatMap { URL(string: $0.service) }
+                ?? identity.computer.serviceURL
+            let previous = pending?.previous ?? identity
+            let fresh = try resetHostIdentity(
+                home: home,
+                previous: previous,
+                replacementServiceURL: serviceURL,
+                actions: serviceActions,
+                onRevoked: { [relay = self.relay] in relay.stop() }
+            )
+            identity = fresh
+            relay.update(identity: fresh)
+            relay.start()
+        } else if let pending = try home.loadIdentityResetState() {
+            throw HostIdentityResetError.resetPending(pending.phase)
+        }
+
+        let pairing = try serviceActions.createPairingSession(identity)
+        pairingLock.withLock { pairingSession = pairing }
+        startPairingMonitor(pairing: pairing, identity: identity)
+        return pairing
+    }
+
+    private func startPairingMonitor(pairing: HostPairingSession, identity: HostIdentity) {
+        let actions = serviceActions
+        let task = Task.detached { [weak self] in
+            while !Task.isCancelled,
+                  Int64(Date().timeIntervalSince1970) < pairing.expiresAt
+            {
+                do {
+                    switch try actions.pairingSessionStatus(pairing, identity) {
+                    case .waiting:
+                        try await Task.sleep(for: .milliseconds(400))
+                    case .claimed(let clientPublicKey):
+                        try actions.completePairingSession(pairing, clientPublicKey, identity)
+                        return
+                    case .completed:
+                        return
+                    }
+                } catch {
+                    if Task.isCancelled { return }
+                    try? await Task.sleep(for: .milliseconds(700))
+                }
+            }
+            self?.pairingLock.withLock {
+                if self?.pairingSession?.sessionID == pairing.sessionID {
+                    self?.pairingSession = nil
+                    self?.pairingTask = nil
+                }
+            }
+        }
+        pairingLock.withLock { pairingTask = task }
+    }
+
+    private func cancelCurrentPairingSession(revoke: Bool) {
+        let current: HostPairingSession? = pairingLock.withLock {
+            pairingTask?.cancel()
+            pairingTask = nil
+            guard let pairingSession else { return nil }
+            self.pairingSession = nil
+            return pairingSession
+        }
+        if revoke, let current {
+            try? serviceActions.cancelPairingSession(current, hostIdentity)
+        }
     }
 
     private static func encode(session: SessionInfo) -> ControlValue {

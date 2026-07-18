@@ -1,7 +1,8 @@
+import Darwin
 import Foundation
 import PedalsKit
 
-/// `~/.pedals` — config, pairing, and control-socket paths (PROTOCOL.md §2/§5).
+/// `~/.pedals` — v2 service config, host identity, and control-socket paths.
 /// The directory can be overridden with the `PEDALS_HOME` environment variable
 /// (used by tests and by CI to avoid touching the real home directory).
 public struct PedalsHome: Sendable {
@@ -20,8 +21,10 @@ public struct PedalsHome: Sendable {
     }
 
     public var configURL: URL { directory.appendingPathComponent("config.json") }
-    public var pairingURL: URL { directory.appendingPathComponent("pairing.json") }
+    public var identityURL: URL { directory.appendingPathComponent("identity.json") }
+    public var identityLockURL: URL { directory.appendingPathComponent("identity.lock") }
     public var socketPath: String { directory.appendingPathComponent("pedals.sock").path }
+    public var sessionCounterURL: URL { directory.appendingPathComponent("session-counter") }
 
     public func ensureDirectoryExists() throws {
         try FileManager.default.createDirectory(
@@ -32,11 +35,11 @@ public struct PedalsHome: Sendable {
 
     // MARK: - config.json
 
-    /// `{"relay": "wss://..."}` — the relay endpoint used when generating pairings.
+    /// `{"service": "https://..."}` — REST and authenticated relay origin.
     public struct Config: Codable, Sendable {
-        public var relay: String
+        public var service: String
 
-        public init(relay: String) { self.relay = relay }
+        public init(service: String) { self.service = service }
     }
 
     public func loadConfig() -> Config? {
@@ -51,25 +54,113 @@ public struct PedalsHome: Sendable {
         try encoder.encode(config).write(to: configURL, options: .atomic)
     }
 
-    // MARK: - pairing.json (mode 0600 per PROTOCOL.md §2)
+    // MARK: - session-counter
 
-    private struct StoredPairing: Codable {
-        var url: String
-    }
-
-    public func loadPairing() -> PairingInfo? {
-        guard let data = try? Data(contentsOf: pairingURL),
-              let stored = try? JSONDecoder().decode(StoredPairing.self, from: data)
+    /// Highest session id ever allocated, persisted so a restarted daemon never
+    /// reuses a sid: session-channel keys are derived from (secret, sid), and a
+    /// reused sid would let a recording relay replay old ciphertext into a new
+    /// session (PROTOCOL.md §3).
+    public func loadSessionCounter() -> Int? {
+        guard let text = try? String(contentsOf: sessionCounterURL, encoding: .utf8)
         else { return nil }
-        return try? PairingInfo(urlString: stored.url)
+        return Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    public func save(pairing: PairingInfo) throws {
+    public func save(sessionCounter: Int) throws {
         try ensureDirectoryExists()
-        let data = try JSONEncoder().encode(StoredPairing(url: pairing.url.absoluteString))
-        try data.write(to: pairingURL, options: .atomic)
+        try Data("\(sessionCounter)\n".utf8).write(
+            to: sessionCounterURL, options: .atomic
+        )
         try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: pairingURL.path
+            [.posixPermissions: 0o600], ofItemAtPath: sessionCounterURL.path
         )
     }
+
+    // MARK: - identity.json (mode 0600)
+
+    /// Strict read. Only a genuinely absent file means "not registered";
+    /// corrupt or unreadable identity data must never be overwritten by a new
+    /// remote registration because that would strand the old credential.
+    public func loadIdentity() throws -> HostIdentity? {
+        do {
+            let data = try Data(contentsOf: identityURL)
+            let decoded = try JSONDecoder().decode(HostIdentity.self, from: data)
+            guard !decoded.hostToken.isEmpty,
+                  let computer = try? ComputerBinding(
+                      serviceURL: decoded.computer.serviceURL,
+                      computerID: decoded.computer.computerID,
+                      secret: decoded.computer.secret
+                  )
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: [], debugDescription: "invalid host identity")
+                )
+            }
+            return HostIdentity(computer: computer, hostToken: decoded.hostToken)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        }
+    }
+
+    public func save(identity: HostIdentity) throws {
+        try ensureDirectoryExists()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(identity).write(to: identityURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: identityURL.path
+        )
+    }
+
+    // MARK: - identity.lock
+
+    /// Acquires the cross-process identity mutation lock. Daemon startup keeps
+    /// this handle until its control socket is listening, closing the fallback
+    /// check-to-mutation race in `pedals pair`.
+    public func acquireIdentityLock() throws -> IdentityFileLock {
+        try ensureDirectoryExists()
+        let descriptor = open(identityLockURL.path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0 else { throw posixError() }
+        guard fchmod(descriptor, 0o600) == 0 else {
+            let error = posixError()
+            close(descriptor)
+            throw error
+        }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            let error = posixError()
+            close(descriptor)
+            throw error
+        }
+        return IdentityFileLock(descriptor: descriptor)
+    }
+
+    public func withIdentityLock<Value>(_ body: () throws -> Value) throws -> Value {
+        let lock = try acquireIdentityLock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}
+
+public final class IdentityFileLock: @unchecked Sendable {
+    private let stateLock = NSLock()
+    private var descriptor: Int32?
+
+    fileprivate init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    public func unlock() {
+        stateLock.withLock {
+            guard let descriptor else { return }
+            _ = flock(descriptor, LOCK_UN)
+            close(descriptor)
+            self.descriptor = nil
+        }
+    }
+
+    deinit { unlock() }
+}
+
+private func posixError() -> NSError {
+    NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
 }

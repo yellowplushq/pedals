@@ -3,6 +3,8 @@ import UIKit
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    lazy var services = AppServices()
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -11,6 +13,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             TerminalDebugLog.isEnabled = true
             TerminalDebugLog.categories = .all
         }
+        services.startSystemSurfaces()
         return true
     }
 

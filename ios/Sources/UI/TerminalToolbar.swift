@@ -15,9 +15,9 @@ final class TerminalToolbar: UIView {
     private var ctrlButton: UIButton!
     private(set) var ctrlArmed = false {
         didSet {
-            ctrlButton.tintColor = ctrlArmed ? .tintColor : .label
+            ctrlButton.tintColor = ctrlArmed ? PedalsTheme.uiContent : .label
             ctrlButton.backgroundColor = ctrlArmed
-                ? UIColor.tintColor.withAlphaComponent(0.22) : .clear
+                ? PedalsTheme.uiSelection : .clear
             onStickyCtrl?(ctrlArmed)
         }
     }

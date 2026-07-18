@@ -1,62 +1,84 @@
 import Foundation
 import PedalsKit
 
-/// Host end of the relay connection: WSS to `/v1/room/:roomId?role=host`, E2EE
-/// via `SecureChannel`, reconnect with exponential backoff, and translation
-/// between the client's ctl/stdin/resize frames and `SessionManager` calls.
-public final class RelayHostClient: NSObject, @unchecked Sendable {
+/// Host end of the relay: one `control` RelayLink (session list, create/close)
+/// plus one `session` RelayLink per listed session (replay + stdout out,
+/// stdin/resize in). Each link is its own encrypted WebSocket with reconnect
+/// (PROTOCOL.md §1); a client `hello` on a session link triggers a fresh
+/// `replay` broadcast.
+public final class RelayHostClient: @unchecked Sendable {
     public enum State: String, Sendable {
         case stopped
         case connecting
         case connected
     }
 
-    private let queue = DispatchQueue(label: "app.yellowplus.pedals.relay")
+    private let queue = DispatchQueue(label: "in.eyhn.pedals.relay")
     private let sessions: SessionManager
+    private let hostName: String
 
-    private var pairing: PairingInfo
-    private var urlSession: URLSession!
-    private var socket: URLSessionWebSocketTask?
-    private var channel: SecureChannel?
-    private var reconnectAttempt = 0
-    private var reconnectWork: DispatchWorkItem?
-    /// Bumped on every (re)connect; callbacks from stale sockets are ignored.
-    private var generation = 0
+    private var identity: HostIdentity
     private var started = false
+    private var control: RelayLink?
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var sessionLinks: [Int: RelayLink] = [:]
+    /// Output offset already covered by the last `replay` sent per session;
+    /// live stdout at or below it is not re-sent (bytes would double after the
+    /// splice, see PROTOCOL.md §4).
+    private var replayedThrough: [Int: UInt64] = [:]
+    private var lastReportedAliveCount: Int?
 
     private var _state: State = .stopped
-    private var _clientConnected = false
-    /// connEpoch of the client connection we last accepted a hello from.
-    private var clientConnEpoch: UInt32?
-    /// Sessions the current client attached to, with the output offset already
-    /// covered by the replay snapshot (bytes at or below it are not re-sent).
-    private var attached: [Int: UInt64] = [:]
+    /// A client hello arrived on the current control connection.
+    private var _clientSeen = false
 
     public var state: State { queue.sync { _state } }
-    public var clientConnected: Bool { queue.sync { _clientConnected } }
-    public var roomId: String { queue.sync { pairing.roomId } }
-    public var relayURL: URL { queue.sync { pairing.relay } }
+    public var clientConnected: Bool { queue.sync { _clientSeen } }
+    public var computerID: String { queue.sync { identity.computer.computerID } }
+    public var serviceURL: URL { queue.sync { identity.computer.serviceURL } }
 
-    public init(pairing: PairingInfo, sessions: SessionManager) {
-        self.pairing = pairing
+    public init(identity: HostIdentity, sessions: SessionManager) {
+        self.identity = identity
         self.sessions = sessions
-        super.init()
-        let configuration = URLSessionConfiguration.default
-        configuration.waitsForConnectivity = false
-        urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        self.hostName = Self.sanitizedHostName(
+            Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        )
+    }
+
+    private static func sanitizedHostName(_ value: String) -> String {
+        let cleaned = value.filter { character in
+            !character.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0)
+            })
+        }.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = cleaned.isEmpty ? "Mac" : cleaned
+        var result = ""
+        var utf16Count = 0
+        for character in candidate {
+            let width = String(character).utf16.count
+            guard utf16Count + width <= 128 else { break }
+            result.append(character)
+            utf16Count += width
+        }
+        return result.isEmpty ? "Mac" : result
     }
 
     // MARK: - Lifecycle
 
     public func start() {
         sessions.onEvent = { [weak self] event in
-            self?.queue.async { self?.handle(sessionEvent: event) }
+            self?.enqueue(sessionEvent: event)
         }
         queue.async { [self] in
             guard !started else { return }
             started = true
-            reconnectAttempt = 0
-            connectLocked()
+            connectAllLocked()
+        }
+    }
+
+    private func enqueue(sessionEvent: SessionEvent) {
+        queue.async { [weak self] in
+            self?.handle(sessionEvent: sessionEvent)
         }
     }
 
@@ -68,241 +90,208 @@ public final class RelayHostClient: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Re-pair: tear down and reconnect to a (possibly new) room.
-    public func update(pairing: PairingInfo) {
+    /// Rotates the computer identity, E2EE secret, and host credential.
+    public func update(identity: HostIdentity) {
         queue.async { [self] in
-            self.pairing = pairing
+            self.identity = identity
             guard started else { return }
             teardownLocked()
-            reconnectAttempt = 0
-            connectLocked()
+            connectAllLocked()
         }
     }
 
-    // MARK: - Connection (all on `queue`)
-
-    private func connectLocked() {
-        generation += 1
-        let generation = self.generation
-        _state = .connecting
-        _clientConnected = false
-        attached.removeAll()
-        channel = SecureChannel(secret: pairing.secret, role: .host)
-
-        var components = URLComponents(url: pairing.relay, resolvingAgainstBaseURL: false)!
-        var path = components.path
-        if path.hasSuffix("/") { path.removeLast() }
-        components.path = path + "/v1/room/\(pairing.roomId)"
-        components.queryItems = [URLQueryItem(name: "role", value: "host")]
-
-        let socket = urlSession.webSocketTask(with: components.url!)
-        self.socket = socket
-        socket.resume()
-        receiveNext(socket: socket, generation: generation)
-    }
-
-    private func receiveNext(socket: URLSessionWebSocketTask, generation: Int) {
-        socket.receive { [weak self] result in
-            guard let self else { return }
-            self.queue.async {
-                guard generation == self.generation else { return }
-                switch result {
-                case .success(let message):
-                    self.handle(message: message)
-                    self.receiveNext(socket: socket, generation: generation)
-                case .failure:
-                    self.scheduleReconnectLocked()
-                }
-            }
-        }
-    }
-
-    private func socketOpenedLocked(_ socket: URLSessionWebSocketTask) {
-        guard socket === self.socket else { return }
-        _state = .connected
-        reconnectAttempt = 0
-        sendControlLocked(.hello(
-            who: .host, connEpoch: UInt32.random(in: .min ... .max), ver: 1
-        ))
-        sendControlLocked(.sessions(list: sessions.list()))
-    }
+    // MARK: - Links (all on `queue`)
 
     private func teardownLocked() {
-        generation += 1
-        reconnectWork?.cancel()
-        reconnectWork = nil
-        socket?.cancel(with: .goingAway, reason: nil)
-        socket = nil
-        channel = nil
-        _clientConnected = false
-        attached.removeAll()
+        control?.stop()
+        control = nil
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
+        for link in sessionLinks.values { link.stop() }
+        sessionLinks.removeAll()
+        replayedThrough.removeAll()
+        lastReportedAliveCount = nil
+        _clientSeen = false
     }
 
-    private func scheduleReconnectLocked() {
-        teardownLocked()
-        guard started else { return }
+    private func connectAllLocked() {
         _state = .connecting
-        reconnectAttempt += 1
-        let delay = min(0.5 * pow(2, Double(reconnectAttempt - 1)), 15)
-            * Double.random(in: 0.8 ... 1.2)
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.started else { return }
-            self.connectLocked()
-        }
-        reconnectWork = work
-        queue.asyncAfter(deadline: .now() + delay, execute: work)
+        let link = RelayLink(
+            computer: identity.computer,
+            authorization: identity.hostToken,
+            role: .host,
+            principalID: identity.computer.computerID,
+            channel: .control,
+            hostName: hostName, callbackQueue: queue
+        )
+        link.onState = { [weak self] state in self?.controlStateChanged(state) }
+        link.onFrame = { [weak self] frame in self?.handleControl(frame: frame) }
+        control = link
+        link.start()
+        startHeartbeatLocked()
+        reconcileSessionLinksLocked(with: sessions.list())
     }
 
-    // MARK: - Receive (on `queue`)
+    private func controlStateChanged(_ state: RelayLink.State) {
+        switch state {
+        case .connected:
+            _state = .connected
+            control?.send(.sessions(list: sessions.list()))
+            reportHostStateLocked(force: true)
+        case .connecting:
+            _state = .connecting
+            _clientSeen = false
+        case .idle:
+            break
+        }
+    }
 
-    private func handle(message: URLSessionWebSocketTask.Message) {
-        guard case .data(let data) = message else { return } // text frames are ignored
-
-        let frame: Frame
-        do {
-            guard var channel else { return }
-            let plaintext = try channel.open(data)
-            self.channel = channel
-            frame = try Frame.decode(plaintext)
-        } catch SecureChannel.ChannelError.staleSequence {
-            // The relay replaces the client connection in place, so the peer's
-            // seq can restart at 1 while our channel persists. A hello bearing
-            // a new connEpoch announces that fresh connection (spec §3);
-            // anything else non-increasing is a replay and is dropped.
-            if let hello = acceptFreshClientHello(in: data) {
-                handle(control: hello)
+    /// One session link per listed session — dead ones included, so a client
+    /// switching to an exited terminal can still replay its final screen.
+    private func reconcileSessionLinksLocked(with list: [SessionInfo]) {
+        let ids = Set(list.map(\.id))
+        for (id, link) in sessionLinks where !ids.contains(id) {
+            link.stop()
+            sessionLinks.removeValue(forKey: id)
+            replayedThrough.removeValue(forKey: id)
+        }
+        for id in ids where sessionLinks[id] == nil {
+            let link = RelayLink(
+                computer: identity.computer,
+                authorization: identity.hostToken,
+                role: .host,
+                principalID: identity.computer.computerID,
+                channel: .session(sid: UInt32(id)),
+                hostName: hostName, callbackQueue: queue
+            )
+            link.onFrame = { [weak self] frame in
+                self?.handleSession(id: id, frame: frame)
             }
-            return
-        } catch {
-            // Decryption failure → close, retry from fresh connection (spec §3).
-            scheduleReconnectLocked()
+            sessionLinks[id] = link
+            link.start()
+        }
+    }
+
+    // MARK: - Control channel (on `queue`)
+
+    private func handleControl(frame: Frame) {
+        guard frame.type == .ctl, let message = try? frame.controlMessage() else {
+            if frame.type == .ctl { control?.send(.err(msg: "malformed ctl payload")) }
             return
         }
+        switch message {
+        case .hello(let who, _, _, _, _, _):
+            guard who == .client else { return }
+            _clientSeen = true
+            control?.send(.sessions(list: sessions.list()))
+        case .create(let cwd, let cols, let rows, let req):
+            do {
+                let id = try sessions.create(cwd: cwd, cols: cols, rows: rows)
+                // The `sessions` broadcast is emitted by the SessionManager event.
+                control?.send(.created(id: id, req: req))
+            } catch {
+                // Echo `req` so the requesting client can stop waiting and
+                // surface the failure instead of timing out silently.
+                control?.send(.err(msg: "create failed: \(error)", req: req))
+            }
+        case .close(let id):
+            if !sessions.close(id: id) {
+                control?.send(.err(msg: "no such session \(id)"))
+            }
+        case .sessions, .created, .title, .exit, .ready, .requestReplay:
+            break // host→client only; ignore if mirrored back
+        case .err(let msg, _):
+            FileHandle.standardError.write(Data("client error: \(msg)\n".utf8))
+        }
+    }
 
+    // MARK: - Session channels (on `queue`)
+
+    private func handleSession(id: Int, frame: Frame) {
+        // Defense in depth: per-channel keys already stop cross-channel
+        // ciphertext at decrypt, so a mismatched sid on a data frame can only
+        // be a bug — drop it rather than write to the wrong PTY.
+        if (frame.type == .stdin || frame.type == .resize), frame.sessionId != UInt32(id) {
+            return
+        }
         switch frame.type {
         case .ctl:
-            guard let control = try? frame.controlMessage() else {
-                sendControlLocked(.err(msg: "malformed ctl payload"))
-                return
+            guard let message = try? frame.controlMessage() else { return }
+            let requestsReplay: Bool
+            switch message {
+            case .hello(let who, _, _, _, _, _):
+                requestsReplay = who == .client
+            case .requestReplay:
+                requestsReplay = true
+            default:
+                requestsReplay = false
             }
-            handle(control: control)
+            guard requestsReplay,
+                  let link = sessionLinks[id],
+                  let snapshot = sessions.replaySnapshot(id: id)
+            else { return }
+            replayedThrough[id] = max(replayedThrough[id] ?? 0, snapshot.coversUpTo)
+            link.send(.replay(sessionId: UInt32(id), data: snapshot.data))
         case .stdin:
-            sessions.write(id: Int(frame.sessionId), data: frame.payload)
+            sessions.write(id: id, data: frame.payload)
         case .resize:
             guard let size = try? frame.resizeSize() else { return }
-            sessions.resize(id: Int(frame.sessionId), cols: size.cols, rows: size.rows)
+            sessions.resize(id: id, cols: size.cols, rows: size.rows)
         case .stdout, .replay:
             break // host→client only; ignore if mirrored back
         }
     }
 
-    private func handle(control message: ControlMessage) {
-        switch message {
-        case .hello(let who, let connEpoch, _):
-            guard who == .client else { return }
-            // Fresh client connection: attach state starts empty (spec §3).
-            clientConnEpoch = connEpoch
-            _clientConnected = true
-            attached.removeAll()
-            sendControlLocked(.sessions(list: sessions.list()))
-        case .create(let cwd, let cols, let rows):
-            do {
-                let id = try sessions.create(cwd: cwd, cols: cols, rows: rows)
-                // `sessions` ctl is emitted by the SessionManager event.
-                sendControlLocked(.created(id: id))
-            } catch {
-                sendControlLocked(.err(msg: "create failed: \(error)"))
-            }
-        case .close(let id):
-            if !sessions.close(id: id) {
-                sendControlLocked(.err(msg: "no such session \(id)"))
-            }
-        case .attach(let id):
-            guard let snapshot = sessions.replaySnapshot(id: id) else {
-                sendControlLocked(.err(msg: "no such session \(id)"))
-                return
-            }
-            attached[id] = snapshot.coversUpTo
-            sendLocked(frame: .replay(sessionId: UInt32(id), data: snapshot.data))
-        case .detach(let id):
-            attached.removeValue(forKey: id)
-        case .sessions, .created, .title, .exit:
-            break // host→client only; ignore if mirrored back
-        case .err(let msg):
-            FileHandle.standardError.write(Data("client error: \(msg)\n".utf8))
-        }
-    }
-
-    /// If `data` decrypts to a client `hello` with a connEpoch we have not
-    /// seen, resets the channel's receive counter to its seq and returns it.
-    private func acceptFreshClientHello(in data: Data) -> ControlMessage? {
-        guard var channel,
-              let (seq, plaintext) = try? channel.openIgnoringSequence(data),
-              let frame = try? Frame.decode(plaintext), frame.type == .ctl,
-              let control = try? frame.controlMessage(),
-              case .hello(let who, let connEpoch, _) = control,
-              who == .client, connEpoch != clientConnEpoch
-        else { return nil }
-        channel.resetReceiveSequence(to: seq)
-        self.channel = channel
-        return control
-    }
-
     // MARK: - Session events (on `queue`)
 
     private func handle(sessionEvent event: SessionEvent) {
+        guard started else { return }
         switch event {
         case .sessionsChanged(let list):
-            sendControlLocked(.sessions(list: list))
+            control?.send(.sessions(list: list))
+            reconcileSessionLinksLocked(with: list)
+            reportHostStateLocked(force: false, sessions: list)
         case .output(let id, let data, let offset):
-            guard let replayedThrough = attached[id] else { return }
+            guard let link = sessionLinks[id] else { return }
+            let covered = replayedThrough[id] ?? 0
             let end = offset + UInt64(data.count)
-            guard end > replayedThrough else { return } // fully covered by replay
-            let payload: Data
-            if offset >= replayedThrough {
-                payload = data
-            } else {
-                payload = data.suffix(Int(end - replayedThrough))
-            }
-            sendLocked(frame: .stdout(sessionId: UInt32(id), data: payload))
+            guard end > covered else { return } // fully inside the last replay
+            let payload = offset >= covered ? data : data.suffix(Int(end - covered))
+            link.send(.stdout(sessionId: UInt32(id), data: payload))
         case .title(let id, let title):
-            sendControlLocked(.title(id: id, title: title))
+            control?.send(.title(id: id, title: title))
         case .exit(let id, let code):
-            sendControlLocked(.exit(id: id, code: code))
+            control?.send(.exit(id: id, code: code))
         }
     }
 
-    // MARK: - Send (on `queue`)
+    // MARK: - Host state metadata (on `queue`)
 
-    private func sendControlLocked(_ message: ControlMessage) {
-        guard let frame = try? Frame.control(message) else { return }
-        sendLocked(frame: frame)
+    private struct HostState: Encodable {
+        let type = "host-state"
+        let aliveTTYCount: Int
+        let hostName: String
     }
 
-    private func sendLocked(frame: Frame) {
-        guard let socket, socket.state == .running, channel != nil else { return }
-        guard let sealed = try? channel!.seal(frame) else { return }
-        let generation = self.generation
-        socket.send(.data(sealed)) { [weak self] error in
-            guard error != nil, let self else { return }
-            self.queue.async {
-                guard generation == self.generation else { return }
-                self.scheduleReconnectLocked()
-            }
+    private func startHeartbeatLocked() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 45, repeating: 45)
+        timer.setEventHandler { [weak self] in
+            self?.reportHostStateLocked(force: true)
         }
+        timer.resume()
+        heartbeatTimer?.cancel()
+        heartbeatTimer = timer
     }
-}
 
-// MARK: - URLSessionWebSocketDelegate
-
-extension RelayHostClient: URLSessionWebSocketDelegate {
-    public func urlSession(
-        _ session: URLSession,
-        webSocketTask: URLSessionWebSocketTask,
-        didOpenWithProtocol protocol: String?
-    ) {
-        queue.async { [weak self] in
-            self?.socketOpenedLocked(webSocketTask)
-        }
+    private func reportHostStateLocked(force: Bool, sessions list: [SessionInfo]? = nil) {
+        let count = (list ?? sessions.list()).lazy.filter(\.alive).count
+        guard force || count != lastReportedAliveCount else { return }
+        guard let data = try? JSONEncoder().encode(
+            HostState(aliveTTYCount: count, hostName: hostName)
+        ), let text = String(data: data, encoding: .utf8)
+        else { return }
+        control?.sendRelayText(text)
+        lastReportedAliveCount = count
     }
 }

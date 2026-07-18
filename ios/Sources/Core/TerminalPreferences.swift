@@ -67,7 +67,7 @@ final class TerminalPreferences {
     /// The effective terminal canvas color, so app chrome can match it.
     var backgroundColor: UIColor {
         if let hex = backgroundHex, let color = UIColor(hex: hex) { return color }
-        return themeDefinition.flatMap { UIColor(hex: $0.background) } ?? .black
+        return themeDefinition.flatMap { UIColor(hex: $0.background) } ?? PedalsTheme.uiCanvas
     }
 
     func terminalConfiguration() -> TerminalConfiguration {

@@ -78,9 +78,4 @@ public enum ControlClient {
         else { throw ClientError.badResponse }
         return object
     }
-
-    /// True if a daemon is listening on the socket right now.
-    public static func daemonIsRunning(socketPath: String) -> Bool {
-        (try? roundTrip(socketPath: socketPath, request: ["cmd": "status"])) != nil
-    }
 }

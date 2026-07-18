@@ -32,6 +32,23 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(sessions[0].rows, 24)
     }
 
+    func testSessionIdsStartAtConfiguredHighWaterMark() throws {
+        // Session-channel keys are derived from (secret, sid); a restarted
+        // daemon must never hand out an old sid (PROTOCOL.md §3).
+        var options = testOptions()
+        options.firstSessionId = 7
+        let allocated = LockedBox<Int>()
+        options.onIdAllocated = { allocated.value = $0 }
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        XCTAssertEqual(id, 7)
+        XCTAssertEqual(allocated.value, 7)
+        XCTAssertEqual(try manager.create(cwd: nil, cols: 80, rows: 24), 8)
+        XCTAssertEqual(allocated.value, 8)
+    }
+
     func testReplaySnapshotContainsPastOutput() throws {
         let manager = SessionManager(options: testOptions())
         defer { manager.closeAll() }
@@ -49,6 +66,28 @@ final class SessionManagerTests: XCTestCase {
         let text = String(decoding: snapshot.data, as: UTF8.self)
         XCTAssertTrue(text.contains("replay-me"), "ring buffer must hold past output")
         XCTAssertEqual(snapshot.coversUpTo, UInt64(snapshot.data.count))
+    }
+
+    func testLiveCwdFollowsShellChdir() throws {
+        let manager = SessionManager(options: testOptions())
+        defer { manager.closeAll() }
+
+        let collected = OutputCollector()
+        manager.onEvent = { event in
+            if case .output(_, let data, _) = event { collected.append(data) }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        manager.write(id: id, data: Data("cd /private/var && printf 'moved-%s\\n' ok\n".utf8))
+        try collected.wait(for: "moved-ok", timeout: 10)
+
+        // The cwd poll runs every 2 s; give it two cycles.
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline {
+            if manager.list().first?.cwd == "/private/var" { return }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTFail("cwd never updated to /private/var, got \(manager.list().first?.cwd ?? "nil")")
     }
 
     func testExitReportsEventAndMarksDead() throws {

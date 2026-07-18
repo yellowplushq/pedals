@@ -3,22 +3,40 @@ import SwiftUI
 
 struct MenuView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showingQR = false
+    @State private var showingPairingCode = false
 
     var body: some View {
+        Group {
+            if model.hasCompletedOnboarding {
+                dashboard
+            } else {
+                DesktopOnboardingView()
+            }
+        }
+        .tint(PedalsTheme.content)
+        .task {
+            await model.pollWhileOpen()
+        }
+        .onDisappear {
+            showingPairingCode = false
+            model.clearPairingCode()
+        }
+    }
+
+    private var dashboard: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             sessionList
-            if showingQR {
+            if showingPairingCode {
                 Divider()
-                qrSection
+                pairingSection
             }
             if let error = model.lastError {
                 Divider()
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(PedalsTheme.critical)
                     .lineLimit(2)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -26,14 +44,7 @@ struct MenuView: View {
             Divider()
             footer
         }
-        .frame(width: 320)
-        .task {
-            await model.pollWhileOpen()
-        }
-        .onDisappear {
-            showingQR = false
-            model.clearPairingURL()
-        }
+        .frame(width: 360)
     }
 
     // MARK: Header
@@ -41,7 +52,7 @@ struct MenuView: View {
     private var header: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(model.relayState.color)
+                .fill(PedalsTheme.content.opacity(model.relayState.indicatorOpacity))
                 .frame(width: 9, height: 9)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Pedals")
@@ -93,14 +104,14 @@ struct MenuView: View {
                     Label("New Session", systemImage: "plus")
                 }
                 Button {
-                    showingQR.toggle()
-                    if showingQR {
-                        model.fetchPairingURL()
+                    showingPairingCode.toggle()
+                    if showingPairingCode {
+                        model.fetchPairingCode()
                     } else {
-                        model.clearPairingURL()
+                        model.clearPairingCode()
                     }
                 } label: {
-                    Label(showingQR ? "Hide Pairing QR" : "Pairing QR", systemImage: "qrcode")
+                    Label(showingPairingCode ? "Hide Connection Code" : "Connect iPhone", systemImage: "number")
                 }
                 Spacer()
             }
@@ -112,35 +123,16 @@ struct MenuView: View {
         }
     }
 
-    // MARK: Pairing QR
+    // MARK: Pairing
 
-    private var qrSection: some View {
-        VStack(spacing: 8) {
-            if let url = model.pairingURL {
-                if let image = QRCode.image(for: url, sidePixels: 480) {
-                    Image(nsImage: image)
-                        .interpolation(.none)
-                        .resizable()
-                        .frame(width: 200, height: 200)
-                        .padding(6)
-                        .background(.white, in: RoundedRectangle(cornerRadius: 8))
-                }
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url, forType: .string)
-                } label: {
-                    Label("Copy Pairing Link", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-            } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(.vertical, 20)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 12)
+    private var pairingSection: some View {
+        DesktopPairingPanel(
+            code: model.pairingCode,
+            expiresAt: model.pairingExpiresAt,
+            isLoading: model.isLoadingPairingCode,
+            onRefresh: model.fetchPairingCode
+        )
+        .padding(12)
     }
 
     // MARK: Footer

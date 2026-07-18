@@ -1,0 +1,139 @@
+name: Release desktop app
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, notarize, and publish
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      PEDALS_DESKTOP_OUTPUT_DIR: ${{ github.workspace }}/.artifacts/desktop-release
+      PEDALS_DESKTOP_BUILD_NUMBER: ${{ github.run_number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#desktop-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid desktop release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "PEDALS_DESKTOP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Test daemon
+        run: swift test --package-path desktop/PedalsDaemon
+
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/developer-id-application.p12"
+          keychain="$RUNNER_TEMP/pedals-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          if [[ -z "$identity" ]]; then
+            echo "No Developer ID Application identity was imported." >&2
+            exit 1
+          fi
+          echo "PEDALS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Build universal app
+        run: ./scripts/build-desktop-release.sh
+
+      - name: Sign app and embedded daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals.app"
+          daemon="$app/Contents/Resources/pedals"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$daemon"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signing_details="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          printf '%s\n' "$signing_details"
+          grep -q 'TeamIdentifier=5RWWZ7DDG9' <<< "$signing_details"
+          grep -q 'flags=.*runtime' <<< "$signing_details"
+
+      - name: Package disk image
+        run: ./scripts/package-desktop-dmg.sh
+
+      - name: Notarize and staple
+        shell: bash
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          dmg="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg"
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          xcrun notarytool submit "$dmg" \
+            --key "$key" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
+      - name: Create checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PEDALS_DESKTOP_OUTPUT_DIR"
+          shasum -a 256 Pedals-macOS.dmg > Pedals-macOS.dmg.sha256
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg"
+          checksum="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg.sha256"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$dmg" "$checksum" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$dmg" \
+              "$checksum" \
+              --verify-tag \
+              --title "Pedals $PEDALS_DESKTOP_VERSION" \
+              --generate-notes
+          fi

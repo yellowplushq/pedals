@@ -25,6 +25,14 @@ public final class SessionManager: @unchecked Sendable {
         public var extraEnvironment: [String: String]
         public var defaultCols: UInt16 = 120
         public var defaultRows: UInt16 = 40
+        /// First session id to allocate. Session-channel keys are derived from
+        /// (secret, sid), so ids must never be reused across daemon restarts
+        /// while the pairing persists — pass a persisted high-water mark + 1
+        /// (see PROTOCOL.md §3).
+        public var firstSessionId = 1
+        /// Called (on the manager's queue) with each allocated id, so the
+        /// caller can persist the high-water mark.
+        public var onIdAllocated: (@Sendable (Int) throws -> Void)?
 
         public init(
             shell: String? = nil,
@@ -40,7 +48,9 @@ public final class SessionManager: @unchecked Sendable {
 
     private final class Session {
         let id: Int
-        let cwd: String
+        /// Live working directory: seeded with the spawn cwd, refreshed by the
+        /// 2 s poll from the shell process (PROTOCOL.md §4).
+        var cwd: String
         let createdAt: Date
         let pty: PTYProcess
         var cols: UInt16
@@ -73,10 +83,14 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     /// Serial queue on which all state mutation and event delivery happens.
-    private let queue = DispatchQueue(label: "app.yellowplus.pedals.sessions")
+    private let queue = DispatchQueue(label: "in.eyhn.pedals.sessions")
     private let options: Options
     private var sessions: [Int: Session] = [:]
-    private var nextId = 1
+    /// PTYs whose session was closed but whose child hasn't exited yet. Held so
+    /// their `exitSource` stays alive to `waitpid` the child (else it lingers as
+    /// a zombie); dropped in the exit callback.
+    private var reaping: [ObjectIdentifier: PTYProcess] = [:]
+    private var nextId: Int
     private var titleTimer: DispatchSourceTimer?
 
     /// Delivered on the manager's serial queue. Handlers may call back into the
@@ -89,9 +103,13 @@ public final class SessionManager: @unchecked Sendable {
 
     public init(options: Options = Options()) {
         self.options = options
+        nextId = max(options.firstSessionId, 1)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 2, repeating: 2)
-        timer.setEventHandler { [weak self] in self?.pollFallbackTitles() }
+        timer.setEventHandler { [weak self] in
+            self?.pollLiveCwds()
+            self?.pollFallbackTitles()
+        }
         timer.resume()
         titleTimer = timer
     }
@@ -108,6 +126,11 @@ public final class SessionManager: @unchecked Sendable {
             let cols = UInt16(clamping: cols ?? Int(options.defaultCols))
             let rows = UInt16(clamping: rows ?? Int(options.defaultRows))
             let directory = Self.resolveCwd(cwd)
+            let id = nextId
+            // Persist before any PTY exists. A failed spawn burns an id, which
+            // is safe; a failed persistence prevents key/sid reuse entirely.
+            try options.onIdAllocated?(id)
+            nextId += 1
             let pty = try PTYProcess(
                 shell: options.shell,
                 arguments: options.shellArguments,
@@ -117,8 +140,6 @@ public final class SessionManager: @unchecked Sendable {
                 extraEnvironment: options.extraEnvironment,
                 queue: queue
             )
-            let id = nextId
-            nextId += 1
             let shellName = (options.shell as NSString).lastPathComponent
             let session = Session(
                 id: id, cwd: directory, pty: pty, cols: max(cols, 2), rows: max(rows, 2),
@@ -143,7 +164,7 @@ public final class SessionManager: @unchecked Sendable {
     public func close(id: Int) -> Bool {
         queue.sync {
             guard let session = sessions.removeValue(forKey: id) else { return false }
-            if session.alive { session.pty.terminate() }
+            if session.alive { terminateAndReapLocked(session.pty) }
             emitSessionsChangedLocked()
             return true
         }
@@ -184,10 +205,27 @@ public final class SessionManager: @unchecked Sendable {
     public func closeAll() {
         queue.sync {
             for session in sessions.values where session.alive {
-                session.pty.terminate()
+                terminateAndReapLocked(session.pty)
             }
             sessions.removeAll()
             emitSessionsChangedLocked()
+        }
+    }
+
+    /// SIGHUP the child but keep the PTYProcess alive until its exit fires, so
+    /// its `exitSource` runs `waitpid` and the child doesn't become a zombie.
+    private func terminateAndReapLocked(_ pty: PTYProcess) {
+        let key = ObjectIdentifier(pty)
+        reaping[key] = pty
+        pty.onExit = { [weak self] _ in
+            self?.finishReaping(key: key)
+        }
+        pty.terminate()
+    }
+
+    private func finishReaping(key: ObjectIdentifier) {
+        queue.async { [weak self] in
+            self?.reaping.removeValue(forKey: key)
         }
     }
 
@@ -212,6 +250,20 @@ public final class SessionManager: @unchecked Sendable {
         session.exitCode = Int(code)
         _onEvent?(.exit(id: id, code: Int(code)))
         emitSessionsChangedLocked()
+    }
+
+    // MARK: - Live cwd
+
+    private func pollLiveCwds() {
+        var changed = false
+        for session in sessions.values where session.alive {
+            guard let cwd = session.pty.currentWorkingDirectory(),
+                  cwd != session.cwd
+            else { continue }
+            session.cwd = cwd
+            changed = true
+        }
+        if changed { emitSessionsChangedLocked() }
     }
 
     // MARK: - Titles
