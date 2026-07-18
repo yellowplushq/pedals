@@ -89,6 +89,11 @@ public final class PTYProcess: @unchecked Sendable {
         if environment["LANG"]?.isEmpty != false { environment["LANG"] = "en_US.UTF-8" }
         environment["SHELL"] = shell
         for (key, value) in extraEnvironment { environment[key] = value }
+        // Pedals terminals advertise full color support. Do not let the
+        // desktop app's own launch environment disable color in child tools.
+        // Removing the key matters: many CLIs treat even an empty NO_COLOR as
+        // an explicit request to suppress ANSI colors.
+        environment.removeValue(forKey: "NO_COLOR")
         // zsh otherwise paints a reverse-video `%` whenever the preceding
         // output has no trailing newline. It is useful in a local terminal but
         // becomes visual noise after remote replay and resize redraws. Pedals
