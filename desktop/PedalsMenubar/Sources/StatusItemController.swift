@@ -32,10 +32,9 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSMenuDelegate {
 
     private func configureStatusItem() {
         guard let button = statusItem.button else { return }
-        button.image = NSImage(
-            systemSymbolName: "terminal",
-            accessibilityDescription: "Pedals"
-        )
+        button.image = NSImage(named: "StatusBarIcon")
+        button.image?.accessibilityDescription = "Pedals"
+        button.image?.size = NSSize(width: 18, height: 18)
         button.image?.isTemplate = true
         button.target = self
         button.action = #selector(statusItemClicked(_:))

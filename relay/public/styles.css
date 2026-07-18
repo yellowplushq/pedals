@@ -62,17 +62,10 @@ a { color: inherit; }
 .brand-mark {
   width: 36px;
   height: 36px;
-  display: grid;
-  place-items: center;
+  display: block;
   border-radius: 11px;
-  color: var(--canvas);
-  background: var(--ink);
+  object-fit: cover;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
-}
-
-.brand-mark span {
-  font: 800 12px/1 ui-monospace, "SFMono-Regular", Menlo, monospace;
-  letter-spacing: -0.08em;
 }
 
 .privacy-mark {

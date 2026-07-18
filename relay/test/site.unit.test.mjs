@@ -94,6 +94,8 @@ test("website assets receive defense-in-depth response headers", async () => {
 test("the one-screen homepage exposes the product promise and download CTA", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(html, /Your terminal\./);
+  assert.match(html, /href="\/favicon-32\.png"/);
+  assert.match(html, /src="\/brand-icon\.png"/);
   assert.match(html, /href="\/download\/macos"/);
   assert.match(html, /8-digit code/);
   assert.match(html, /Terminal bytes and encryption keys never live on the service/);

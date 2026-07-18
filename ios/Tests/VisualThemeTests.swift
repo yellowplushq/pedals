@@ -20,6 +20,10 @@ final class VisualThemeTests: XCTestCase {
         XCTAssertEqual(PedalsTheme.uiCritical, UIColor.systemRed)
     }
 
+    func testBrandMarkIsPackagedForOnboarding() {
+        XCTAssertNotNil(UIImage(named: "AppMark"))
+    }
+
     private func assertWhite(
         _ color: UIColor,
         component expectedComponent: CGFloat,

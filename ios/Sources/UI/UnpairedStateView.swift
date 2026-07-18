@@ -101,28 +101,16 @@ final class UnpairedStateView: UIView {
     }
 
     private func makeBrandHeader() -> UIView {
-        let mark = UIView()
-        mark.backgroundColor = PedalsTheme.uiContent
+        let mark = UIImageView(image: UIImage(named: "AppMark"))
+        mark.contentMode = .scaleAspectFit
         mark.layer.cornerRadius = 12
         mark.layer.cornerCurve = .continuous
+        mark.clipsToBounds = true
+        mark.isAccessibilityElement = false
         mark.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             mark.widthAnchor.constraint(equalToConstant: 38),
             mark.heightAnchor.constraint(equalToConstant: 38),
-        ])
-
-        let markImage = UIImageView(
-            image: UIImage(
-                systemName: "terminal",
-                withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)
-            )
-        )
-        markImage.tintColor = PedalsTheme.uiCanvas
-        markImage.translatesAutoresizingMaskIntoConstraints = false
-        mark.addSubview(markImage)
-        NSLayoutConstraint.activate([
-            markImage.centerXAnchor.constraint(equalTo: mark.centerXAnchor),
-            markImage.centerYAnchor.constraint(equalTo: mark.centerYAnchor),
         ])
 
         let title = makeLabel(

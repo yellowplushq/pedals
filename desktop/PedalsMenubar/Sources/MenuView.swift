@@ -46,14 +46,11 @@ struct MenuView: View {
 
     private var header: some View {
         HStack(spacing: 9) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(PedalsTheme.content)
-                Image(systemName: "terminal")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(PedalsTheme.canvas)
-            }
-            .frame(width: 28, height: 28)
+            Image("AppMark")
+                .resizable()
+                .interpolation(.high)
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Pedals")
