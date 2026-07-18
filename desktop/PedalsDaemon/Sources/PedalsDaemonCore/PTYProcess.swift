@@ -89,6 +89,11 @@ public final class PTYProcess: @unchecked Sendable {
         if environment["LANG"]?.isEmpty != false { environment["LANG"] = "en_US.UTF-8" }
         environment["SHELL"] = shell
         for (key, value) in extraEnvironment { environment[key] = value }
+        // zsh otherwise paints a reverse-video `%` whenever the preceding
+        // output has no trailing newline. It is useful in a local terminal but
+        // becomes visual noise after remote replay and resize redraws. Pedals
+        // deliberately owns this value so callers cannot re-enable the mark.
+        environment["PROMPT_EOL_MARK"] = ""
 
         let argv = ([shell] + arguments).map { strdup($0) } + [nil]
         let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]

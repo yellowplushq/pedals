@@ -32,6 +32,25 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(sessions[0].rows, 24)
     }
 
+    func testPromptEndMarkerIsAlwaysEmpty() throws {
+        var options = testOptions()
+        options.extraEnvironment["PROMPT_EOL_MARK"] = "visible"
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let collected = OutputCollector()
+        manager.onEvent = { event in
+            if case .output(_, let data, _) = event { collected.append(data) }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        manager.write(
+            id: id,
+            data: Data("printf 'prompt-eol-length=%s\\n' \"${#PROMPT_EOL_MARK}\"\n".utf8)
+        )
+        try collected.wait(for: "prompt-eol-length=0", timeout: 10)
+    }
+
     func testSessionIdsStartAtConfiguredHighWaterMark() throws {
         // Session-channel keys are derived from (secret, sid); a restarted
         // daemon must never hand out an old sid (PROTOCOL.md §3).
