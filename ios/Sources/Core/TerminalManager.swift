@@ -196,6 +196,9 @@ final class TerminalManager {
         channel.onPhase = { [weak self] phase in
             self?.phases[id] = phase
         }
+        channel.onHostUnavailable = { [weak self] in
+            self?.computer(id: id.computerID)?.requestSessions()
+        }
         phases[id] = channel.phase
         channels[id] = channel
         evictBeyondPoolLimit()

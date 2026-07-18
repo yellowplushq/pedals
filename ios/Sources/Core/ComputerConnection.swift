@@ -98,6 +98,13 @@ final class ComputerConnection {
         control.send(.close(id: id))
     }
 
+    /// Reconcile against the host after a per-session socket disappears.
+    /// Control and session channels are separate WebSockets, so their notices
+    /// can arrive in either order when a terminal is closed remotely.
+    func requestSessions() {
+        control.send(.requestSessions)
+    }
+
     /// A fresh (not yet started) data link for one of this computer's sessions.
     func makeSessionLink(sid: Int) -> RelayLink {
         RelayLink(
@@ -139,7 +146,7 @@ final class ComputerConnection {
             events.send(.exit(id: id, code: code))
         case .err(let msg, let req):
             events.send(.error(msg: msg, req: req))
-        case .create, .close, .ready, .requestReplay:
+        case .create, .close, .ready, .requestReplay, .requestSessions:
             break // client→host only; ignore if mirrored back
         }
     }

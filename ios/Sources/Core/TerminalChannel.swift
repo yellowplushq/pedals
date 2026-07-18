@@ -35,12 +35,16 @@ final class TerminalChannel {
     var onPhase: ((Phase) -> Void)?
     var onReplay: ((Data) -> Void)?
     var onStdout: ((Data) -> Void)?
+    /// The session's host socket disappeared. The owner should refresh the
+    /// authoritative session list before treating this as a network outage.
+    var onHostUnavailable: (() -> Void)?
 
     /// LRU stamp for the connection pool.
     private(set) var lastActivated = Date()
 
     private let link: RelayLink
     private var everLive = false
+    private var peerLossTask: Task<Void, Never>?
 
     init(terminalID: TerminalID, link: RelayLink) {
         self.terminalID = terminalID
@@ -62,6 +66,8 @@ final class TerminalChannel {
     }
 
     func stop() {
+        peerLossTask?.cancel()
+        peerLossTask = nil
         link.stop()
     }
 
@@ -89,6 +95,8 @@ final class TerminalChannel {
         case .connected:
             break // stays "connecting" until the host's replay lands
         case .connecting:
+            peerLossTask?.cancel()
+            peerLossTask = nil
             phase = everLive ? .reconnecting : .connecting
         case .idle:
             break
@@ -99,10 +107,25 @@ final class TerminalChannel {
     /// Our own link can be healthy while the host end is gone (daemon quit) —
     /// without this the terminal would freeze with no overlay.
     private func handle(hostPresent: Bool) {
-        if !hostPresent, phase == .live {
-            phase = .reconnecting
+        if hostPresent {
+            peerLossTask?.cancel()
+            peerLossTask = nil
+            return
         }
-        // Host back: its hello triggers our re-hello → replay → .live.
+        guard phase == .live, peerLossTask == nil else { return }
+
+        // A deliberate remote close stops this session socket immediately,
+        // while the authoritative list travels over a separate control socket.
+        // Ask for that list now and suppress the misleading reconnect overlay
+        // for a brief reconciliation window. A real outage still surfaces
+        // promptly when no list arrives.
+        onHostUnavailable?()
+        peerLossTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self, self.phase == .live else { return }
+            self.peerLossTask = nil
+            self.phase = .reconnecting
+        }
     }
 
     private func handle(frame: Frame) {
@@ -115,6 +138,8 @@ final class TerminalChannel {
         }
         switch frame.type {
         case .replay:
+            peerLossTask?.cancel()
+            peerLossTask = nil
             everLive = true
             phase = .live
             onReplay?(frame.payload)

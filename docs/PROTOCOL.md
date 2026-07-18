@@ -255,6 +255,7 @@ Handshake control frames use `sessionId = 0` on every WebSocket channel:
 After `ready` promotes the tag, the control channel accepts:
 
 - `sessions {list:[{id,title,cwd,rows,cols,createdAt,alive}]}`
+- `requestSessions {}` asks the host to resend that authoritative list
 - `create {cwd,cols,rows,req?}` / `created {id,req?}`
 - `close {id}`, `title {id,title}`, `exit {id,code}`
 - `err {msg,req?}`

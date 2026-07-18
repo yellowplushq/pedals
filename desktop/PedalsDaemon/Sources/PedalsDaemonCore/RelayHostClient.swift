@@ -184,6 +184,8 @@ public final class RelayHostClient: @unchecked Sendable {
             guard who == .client else { return }
             _clientSeen = true
             control?.send(.sessions(list: sessions.list()))
+        case .requestSessions:
+            control?.send(.sessions(list: sessions.list()))
         case .create(let cwd, let cols, let rows, let req):
             do {
                 let id = try sessions.create(cwd: cwd, cols: cols, rows: rows)
@@ -223,6 +225,8 @@ public final class RelayHostClient: @unchecked Sendable {
                 requestsReplay = who == .client
             case .requestReplay:
                 requestsReplay = true
+            case .requestSessions:
+                requestsReplay = false
             default:
                 requestsReplay = false
             }

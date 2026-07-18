@@ -52,6 +52,10 @@ public enum ControlMessage: Equatable, Sendable {
     case ready(who: PeerRole, echoNonce: Data)
     /// Client→host, session channels only: request a fresh replay snapshot.
     case requestReplay
+    /// Client→host, control channel only: request the authoritative session list.
+    /// Used when a session socket disappears before the cross-channel
+    /// `sessions` broadcast arrives.
+    case requestSessions
     /// host→client: full session list on hello and on any change.
     case sessions(list: [SessionInfo])
     /// client→host: create a session. `cwd` nil ⇒ JSON null (daemon: home).
@@ -83,6 +87,7 @@ extension ControlMessage: Codable {
         case .hello: "hello"
         case .ready: "ready"
         case .requestReplay: "requestReplay"
+        case .requestSessions: "requestSessions"
         case .sessions: "sessions"
         case .create: "create"
         case .created: "created"
@@ -107,7 +112,7 @@ extension ControlMessage: Codable {
         case let .ready(who, echoNonce):
             try container.encode(who, forKey: .who)
             try container.encode(echoNonce, forKey: .echoNonce)
-        case .requestReplay:
+        case .requestReplay, .requestSessions:
             break
         case let .sessions(list):
             try container.encode(list, forKey: .list)
@@ -153,6 +158,8 @@ extension ControlMessage: Codable {
             )
         case "requestReplay":
             self = .requestReplay
+        case "requestSessions":
+            self = .requestSessions
         case "sessions":
             self = .sessions(list: try container.decode([SessionInfo].self, forKey: .list))
         case "create":
