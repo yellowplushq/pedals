@@ -33,9 +33,6 @@ struct MenuView: View {
         .font(PedalsTheme.text)
         .background(PedalsTheme.canvas)
         .tint(PedalsTheme.content)
-        .task {
-            await model.pollWhileOpen()
-        }
         .onDisappear {
             showingPairingCode = false
             model.clearPairingCode()

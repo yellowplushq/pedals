@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
 
     private var service: PedalsService?
     private var startupTask: Task<Void, Never>?
+    private var monitoringTask: Task<Void, Never>?
     private var pairingTask: Task<Void, Never>?
     private var terminationObserver: (any NSObjectProtocol)?
 
@@ -58,6 +59,7 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.pairingTask?.cancel()
+                self?.monitoringTask?.cancel()
                 self?.startupTask?.cancel()
                 self?.service?.shutdown()
             }
@@ -98,8 +100,11 @@ final class AppModel: ObservableObject {
                 isStartingService = false
                 startupTask = nil
                 await refresh()
+                startMonitoring()
             } catch {
                 guard let self, !Task.isCancelled else { return }
+                monitoringTask?.cancel()
+                monitoringTask = nil
                 serviceRunning = false
                 isStartingService = false
                 relayState = .unavailable
@@ -111,10 +116,14 @@ final class AppModel: ObservableObject {
 
     // MARK: Polling
 
-    func pollWhileOpen() async {
-        while !Task.isCancelled {
-            await refresh()
-            try? await Task.sleep(for: .seconds(2))
+    private func startMonitoring() {
+        monitoringTask?.cancel()
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { return }
+                await refresh()
+            }
         }
     }
 
