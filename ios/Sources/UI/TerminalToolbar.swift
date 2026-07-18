@@ -1,82 +1,196 @@
 import UIKit
 
-/// Persistent bottom input bar (Safari-toolbar style): Esc · Ctrl (sticky) ·
-/// Tab · arrows · paste. Emits raw stdin bytes via `onBytes`; the sticky Ctrl
-/// transform is applied by TerminalHost on the next keyboard byte.
+/// Persistent Safari-style input bar. The high-frequency terminal keys stay at
+/// the front, while symbols and navigation keys continue in a horizontal
+/// scroller. The pinned keyboard button swaps the system keyboard for Pedals'
+/// expanded terminal keyboard without changing the surrounding layout.
 final class TerminalToolbar: UIView {
-    var onBytes: ((Data) -> Void)?
-    /// Toggled by the Ctrl key; MainViewController mirrors it into the host.
-    var onStickyCtrl: ((Bool) -> Void)?
+    var onKey: ((TerminalInputKey) -> Void)?
+    var onModifierToggle: ((TerminalModifier) -> Void)?
+    var onKeyboardToggle: (() -> Void)?
 
     static let height: CGFloat = 48
 
     private let glass = GlassView()
+    private let scrollView = UIScrollView()
     private let stack = UIStackView()
-    private var ctrlButton: UIButton!
-    private(set) var ctrlArmed = false {
-        didSet {
-            ctrlButton.tintColor = ctrlArmed ? PedalsTheme.uiContent : .label
-            ctrlButton.backgroundColor = ctrlArmed
-                ? PedalsTheme.uiSelection : .clear
-            onStickyCtrl?(ctrlArmed)
-        }
-    }
+    private let divider = UIView()
+    private let keyboardButton = TerminalToolbarButton()
+    private let ctrlButton = TerminalToolbarButton()
+    private let altButton = TerminalToolbarButton()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+
+        accessibilityIdentifier = "terminal-toolbar"
 
         glass.frame = bounds
         glass.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(glass)
 
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.alwaysBounceHorizontal = true
+        scrollView.isDirectionalLockEnabled = true
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.accessibilityIdentifier = "terminal-toolbar-scroll"
+        glass.contentView.addSubview(scrollView)
+
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .horizontal
-        stack.distribution = .fillEqually
         stack.alignment = .fill
-        glass.contentView.addSubview(stack)
+        stack.distribution = .fill
+        stack.spacing = 0
+        scrollView.addSubview(stack)
 
-        stack.addArrangedSubview(key(title: "esc", bytes: Data([0x1b])))
-        ctrlButton = key(title: "ctrl", bytes: nil)
-        ctrlButton.addAction(
-            UIAction { [weak self] _ in
-                guard let self else { return }
-                ctrlArmed.toggle()
-            }, for: .touchUpInside
-        )
-        stack.addArrangedSubview(ctrlButton)
-        stack.addArrangedSubview(key(title: "tab", bytes: Data([0x09])))
-        stack.addArrangedSubview(key(symbol: "arrow.left", bytes: Data([0x1b, 0x5b, 0x44])))
-        stack.addArrangedSubview(key(symbol: "arrow.up", bytes: Data([0x1b, 0x5b, 0x41])))
-        stack.addArrangedSubview(key(symbol: "arrow.down", bytes: Data([0x1b, 0x5b, 0x42])))
-        stack.addArrangedSubview(key(symbol: "arrow.right", bytes: Data([0x1b, 0x5b, 0x43])))
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.backgroundColor = PedalsTheme.uiSeparator
+        glass.contentView.addSubview(divider)
 
-        let paste = key(symbol: "doc.on.clipboard", bytes: nil)
-        paste.addAction(
-            UIAction { [weak self] _ in
-                guard let text = UIPasteboard.general.string else { return }
-                self?.onBytes?(Data(text.utf8))
-            }, for: .touchUpInside
-        )
-        stack.addArrangedSubview(paste)
+        configureKeyboardButton()
+        keyboardButton.translatesAutoresizingMaskIntoConstraints = false
+        glass.contentView.addSubview(keyboardButton)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: glass.contentView.leadingAnchor, constant: 6),
+            scrollView.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 4),
+            scrollView.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -4),
+            scrollView.trailingAnchor.constraint(equalTo: divider.leadingAnchor, constant: -3),
+
+            stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
+
+            divider.centerYAnchor.constraint(equalTo: glass.contentView.centerYAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 22),
+            divider.trailingAnchor.constraint(equalTo: keyboardButton.leadingAnchor, constant: -3),
+
+            keyboardButton.trailingAnchor.constraint(
+                equalTo: glass.contentView.trailingAnchor, constant: -4
+            ),
+            keyboardButton.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 4),
+            keyboardButton.bottomAnchor.constraint(
+                equalTo: glass.contentView.bottomAnchor, constant: -4
+            ),
+        ])
+
+        buildKeys()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        stack.frame = glass.contentView.bounds.insetBy(dx: 6, dy: 4)
+    func setModifierState(_ state: TerminalModifierState) {
+        ctrlButton.isSelected = state.ctrl
+        altButton.isSelected = state.alt
     }
 
-    /// The host consumed the armed Ctrl; reset the toggle UI.
-    func consumeStickyCtrl() {
-        if ctrlArmed { ctrlArmed = false }
+    func setTerminalKeyboardEnabled(_ enabled: Bool) {
+        keyboardButton.isSelected = enabled
+        keyboardButton.accessibilityLabel = enabled
+            ? "Show system keyboard"
+            : "Show terminal keyboard"
     }
 
-    private func key(title: String? = nil, symbol: String? = nil, bytes: Data?) -> UIButton {
-        let button = UIButton(type: .system)
+    private func buildKeys() {
+        appendKey(title: "esc", key: .escape, accessibilityLabel: "Escape")
+
+        configureModifierButton(ctrlButton, title: "ctrl", modifier: .ctrl)
+        stack.addArrangedSubview(ctrlButton)
+
+        configureModifierButton(altButton, title: "alt", modifier: .alt)
+        stack.addArrangedSubview(altButton)
+
+        appendKey(title: "tab", key: .tab, accessibilityLabel: "Tab")
+        appendKey(symbol: "arrow.left", key: .arrow(.left), accessibilityLabel: "Left")
+        appendKey(symbol: "arrow.up", key: .arrow(.up), accessibilityLabel: "Up")
+        appendKey(symbol: "arrow.down", key: .arrow(.down), accessibilityLabel: "Down")
+        appendKey(symbol: "arrow.right", key: .arrow(.right), accessibilityLabel: "Right")
+        appendKey(symbol: "doc.on.clipboard", key: .paste, accessibilityLabel: "Paste")
+
+        appendSpacer()
+
+        for symbol in ["|", "/", "~", "-", "_", "`", "'", "\""] {
+            appendKey(title: symbol, key: .text(symbol), accessibilityLabel: symbol)
+        }
+
+        appendSpacer()
+
+        appendKey(title: "home", key: .home, accessibilityLabel: "Home")
+        appendKey(title: "end", key: .end, accessibilityLabel: "End")
+        appendKey(title: "pg↑", key: .pageUp, accessibilityLabel: "Page Up")
+        appendKey(title: "pg↓", key: .pageDown, accessibilityLabel: "Page Down")
+        appendKey(title: "ins", key: .insert, accessibilityLabel: "Insert")
+        appendKey(title: "del", key: .deleteForward, accessibilityLabel: "Forward Delete")
+        appendKey(symbol: "delete.left", key: .backspace, accessibilityLabel: "Backspace")
+        appendKey(symbol: "return.left", key: .enter, accessibilityLabel: "Return")
+    }
+
+    private func configureKeyboardButton() {
+        configure(
+            keyboardButton,
+            symbol: "keyboard",
+            accessibilityLabel: "Show terminal keyboard"
+        )
+        keyboardButton.accessibilityIdentifier = "terminal-keyboard-toggle"
+        keyboardButton.addAction(
+            UIAction { [weak self] _ in self?.onKeyboardToggle?() },
+            for: .touchUpInside
+        )
+    }
+
+    private func configureModifierButton(
+        _ button: TerminalToolbarButton,
+        title: String,
+        modifier: TerminalModifier
+    ) {
+        configure(button, title: title, accessibilityLabel: title.capitalized)
+        button.addAction(
+            UIAction { [weak self] _ in self?.onModifierToggle?(modifier) },
+            for: .touchUpInside
+        )
+    }
+
+    private func appendKey(
+        title: String? = nil,
+        symbol: String? = nil,
+        key: TerminalInputKey,
+        accessibilityLabel: String
+    ) {
+        let button = TerminalToolbarButton()
+        configure(button, title: title, symbol: symbol, accessibilityLabel: accessibilityLabel)
+        button.addAction(
+            UIAction { [weak self] _ in self?.onKey?(key) },
+            for: .touchUpInside
+        )
+        stack.addArrangedSubview(button)
+    }
+
+    private func appendSpacer() {
+        let spacer = UIView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        stack.addArrangedSubview(spacer)
+    }
+
+    private func configure(
+        _ button: TerminalToolbarButton,
+        title: String? = nil,
+        symbol: String? = nil,
+        accessibilityLabel: String
+    ) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        button.accessibilityLabel = accessibilityLabel
+
         if let title {
             button.setTitle(title, for: .normal)
-            button.titleLabel?.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+            button.titleLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+            button.titleLabel?.adjustsFontSizeToFitWidth = true
+            button.titleLabel?.minimumScaleFactor = 0.72
         }
         if let symbol {
             button.setImage(
@@ -87,14 +201,37 @@ final class TerminalToolbar: UIView {
                 for: .normal
             )
         }
-        button.tintColor = .label
-        button.layer.cornerRadius = 8
-        button.layer.cornerCurve = .continuous
-        if let bytes {
-            button.addAction(
-                UIAction { [weak self] _ in self?.onBytes?(bytes) }, for: .touchUpInside
-            )
+    }
+}
+
+private final class TerminalToolbarButton: UIButton {
+    override var isHighlighted: Bool {
+        didSet { updateAppearance() }
+    }
+
+    override var isSelected: Bool {
+        didSet { updateAppearance() }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        tintColor = PedalsTheme.uiContent
+        setTitleColor(PedalsTheme.uiContent, for: .normal)
+        layer.cornerRadius = 8
+        layer.cornerCurve = .continuous
+        updateAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func updateAppearance() {
+        backgroundColor = if isSelected {
+            PedalsTheme.uiSelection
+        } else if isHighlighted {
+            PedalsTheme.uiSurface
+        } else {
+            .clear
         }
-        return button
     }
 }

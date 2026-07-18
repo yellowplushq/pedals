@@ -7,16 +7,14 @@ import UIKit
 /// and scrollback survives.
 @MainActor
 final class TerminalHost {
-    let view: TerminalView
+    let view: PedalsTerminalView
     /// Each host owns its controller — see AppServices.makeTerminalController.
     let controller: TerminalController
 
     /// Keyboard/accessory-bar input bytes, to be sent as `stdin` frames.
     var onInput: ((Data) -> Void)?
-    /// Armed by the toolbar's Ctrl key: the next keyboard byte is transformed
-    /// into its control code (a → ^A). Cleared after one use.
-    var stickyCtrl = false
-    var onStickyCtrlConsumed: (() -> Void)?
+    /// Mirrors libghostty's sticky Ctrl/Alt state into Pedals' custom toolbar.
+    var onModifierStateChange: ((TerminalModifierState) -> Void)?
     /// Grid size changes (view layout / font size), to be sent as `resize` frames.
     var onResize: ((_ cols: UInt16, _ rows: UInt16) -> Void)?
 
@@ -52,7 +50,7 @@ final class TerminalHost {
             }
         )
 
-        view = TerminalView(frame: .zero)
+        view = PedalsTerminalView(frame: .zero)
         view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
         view.controller = controller
         view.backgroundColor = .clear
@@ -62,6 +60,70 @@ final class TerminalHost {
         view.inputAccessoryItems = []
 
         relay.host = self
+        view.setStickyModifierChangeHandler { [weak self] in
+            guard let self else { return }
+            onModifierStateChange?(modifierState)
+        }
+    }
+
+    var modifierState: TerminalModifierState {
+        TerminalModifierState(
+            ctrl: view.stickyActivation(for: .ctrl) != .inactive,
+            alt: view.stickyActivation(for: .alt) != .inactive
+        )
+    }
+
+    func toggleModifier(_ modifier: TerminalModifier) {
+        switch modifier {
+        case .ctrl: view.toggleStickyModifier(.ctrl)
+        case .alt: view.toggleStickyModifier(.alt)
+        }
+    }
+
+    func sendToolbarKey(_ key: TerminalInputKey) {
+        switch key {
+        case .text(let text):
+            // Use libghostty's text path so sticky Ctrl/Alt and IME state are
+            // consumed by the same machinery as the system keyboard.
+            view.insertText(text)
+        case .paste:
+            if let text = UIPasteboard.general.string, !text.isEmpty {
+                onInput?(Data(text.utf8))
+            }
+            view.resetStickyModifiers()
+        case .dismissKeyboard:
+            // UIKit may immediately restore the responder while dispatching a
+            // control event from inside its inputView. End editing on the next
+            // run-loop turn, after the key tap has fully completed.
+            DispatchQueue.main.async { [weak view] in
+                view?.window?.endEditing(true)
+            }
+        default:
+            let modifiers = activeKeyModifiers
+            if let bytes = key.bytes(modifiers: modifiers) {
+                onInput?(bytes)
+            }
+            // Special keys bypass libghostty's text path, so consume the
+            // sticky state explicitly after encoding it into the sequence.
+            if !modifiers.isEmpty {
+                view.resetStickyModifiers()
+            }
+        }
+    }
+
+    func setReplacementInputView(_ inputView: UIView?) {
+        view.setReplacementInputView(inputView)
+        if view.isFirstResponder {
+            view.reloadInputViews()
+        }
+    }
+
+    private var activeKeyModifiers: TerminalKeyModifiers {
+        var modifiers: TerminalKeyModifiers = []
+        if view.stickyActivation(for: .ctrl) != .inactive { modifiers.insert(.ctrl) }
+        if view.stickyActivation(for: .alt) != .inactive { modifiers.insert(.alt) }
+        if view.stickyActivation(for: .command) != .inactive { modifiers.insert(.command) }
+        return modifiers
     }
 
     /// Feed live remote `stdout` bytes into the emulator.
@@ -116,14 +178,21 @@ final class TerminalHost {
                 muteInputUntil = nil
             }
         }
-        var data = data
-        if stickyCtrl, data.count == 1, let byte = data.first,
-           (0x3f ... 0x7e).contains(byte)
+        // Software-key input is consumed by libghostty's sticky path before it
+        // reaches this callback. A hardware keyboard, including Simulator's
+        // Mac keyboard bridge, bypasses `insertText` and arrives here as one
+        // unmodified byte while the sticky state is still armed. Cover that
+        // path without touching multi-byte text/paste or emulator replies.
+        if data.count == 1,
+           let byte = data.first,
+           !activeKeyModifiers.isEmpty,
+           let modified = activeKeyModifiers.applying(toUnmodifiedByte: byte)
         {
-            data = Data([byte & 0x1f])
-            stickyCtrl = false
-            onStickyCtrlConsumed?()
+            onInput?(modified)
+            view.resetStickyModifiers()
+            return
         }
+
         onInput?(data)
     }
 
@@ -152,5 +221,18 @@ final class TerminalHost {
         cols = viewport.columns
         rows = viewport.rows
         onResize?(viewport.columns, viewport.rows)
+    }
+}
+
+/// `UIResponder.inputView` is read-only by default. A terminal responder that
+/// wants an app-specific keyboard redeclares it through a mutable backing view,
+/// then asks UIKit to reload the responder's input views when the mode changes.
+final class PedalsTerminalView: TerminalView {
+    private var replacementInputView: UIView?
+
+    override var inputView: UIView? { replacementInputView }
+
+    func setReplacementInputView(_ inputView: UIView?) {
+        replacementInputView = inputView
     }
 }

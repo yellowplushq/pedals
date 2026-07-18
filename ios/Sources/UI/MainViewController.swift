@@ -19,6 +19,7 @@ final class MainViewController: UIViewController {
         let host: TerminalHost
         let container = UIView()
         let overlay = TerminalStatusOverlay()
+        var hasBeenFocused = false
 
         init(host: TerminalHost) {
             self.host = host
@@ -40,6 +41,10 @@ final class MainViewController: UIViewController {
 
     private let tabStrip = TabStripView()
     private let toolbar = TerminalToolbar()
+    private let terminalKeyboard = TerminalKeyboardView()
+    private var isTerminalKeyboardEnabled = false
+    private var pagesBottomToToolbarConstraint: NSLayoutConstraint!
+    private var pagesBottomToViewConstraint: NSLayoutConstraint!
 
     private let unpairedView = UnpairedStateView()
     private let noSessionsView = UIView()
@@ -88,15 +93,19 @@ final class MainViewController: UIViewController {
         view.addSubview(pagesContainer)
 
         toolbar.translatesAutoresizingMaskIntoConstraints = false
-        toolbar.onBytes = { [weak self] bytes in
-            guard let self, let id = visibleId else { return }
-            manager.sendStdin(id, data: bytes)
+        toolbar.onKey = { [weak self] key in
+            self?.sendToolbarKey(key)
         }
-        toolbar.onStickyCtrl = { [weak self] armed in
+        toolbar.onModifierToggle = { [weak self] modifier in
             guard let self, let id = visibleId else { return }
-            pages[id]?.host.stickyCtrl = armed
+            pages[id]?.host.toggleModifier(modifier)
         }
+        toolbar.onKeyboardToggle = { [weak self] in self?.toggleTerminalKeyboard() }
         view.addSubview(toolbar)
+
+        terminalKeyboard.onKey = { [weak self] key in
+            self?.sendToolbarKey(key)
+        }
 
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
         tabStrip.onSelect = { [weak self] id in self?.manager.activate(id) }
@@ -113,6 +122,13 @@ final class MainViewController: UIViewController {
         unpairedView.onEnterCode = { [weak self] in self?.presentPairingCode() }
         view.addSubview(unpairedView)
 
+        pagesBottomToToolbarConstraint = pagesContainer.bottomAnchor.constraint(
+            equalTo: toolbar.topAnchor, constant: -6
+        )
+        pagesBottomToViewConstraint = pagesContainer.bottomAnchor.constraint(
+            equalTo: view.bottomAnchor
+        )
+
         NSLayoutConstraint.activate([
             // libghostty has no asymmetric content inset, so the grid sits
             // strictly between the tab strip and the toolbar — nothing may
@@ -120,7 +136,7 @@ final class MainViewController: UIViewController {
             pagesContainer.topAnchor.constraint(equalTo: tabStrip.bottomAnchor, constant: 4),
             pagesContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             pagesContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            pagesContainer.bottomAnchor.constraint(equalTo: toolbar.topAnchor, constant: -6),
+            pagesBottomToToolbarConstraint,
 
             tabStrip.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             tabStrip.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
@@ -223,7 +239,6 @@ final class MainViewController: UIViewController {
                 let unpaired = count == 0
                 unpairedView.isHidden = !unpaired
                 tabStrip.isHidden = unpaired
-                toolbar.isHidden = unpaired
                 let menu = count > 1 ? makeCreateMenu() : nil
                 tabStrip.setCreateMenu(menu)
                 noSessionsCreateButton?.menu = menu
@@ -275,6 +290,9 @@ final class MainViewController: UIViewController {
         orderedIds = terminals.map(\.id)
 
         for (id, page) in pages where !ids.contains(id) {
+            if page.host.view.isFirstResponder {
+                page.host.view.resignFirstResponder()
+            }
             page.container.removeFromSuperview()
             pages.removeValue(forKey: id)
             if visibleId == id { visibleId = nil }
@@ -289,8 +307,9 @@ final class MainViewController: UIViewController {
             page.host.onResize = { [weak self] cols, rows in
                 self?.manager.sendResize(id, cols: cols, rows: rows)
             }
-            page.host.onStickyCtrlConsumed = { [weak self] in
-                self?.toolbar.consumeStickyCtrl()
+            page.host.onModifierStateChange = { [weak self] state in
+                guard let self, visibleId == id else { return }
+                toolbar.setModifierState(state)
             }
             pages[id] = page
 
@@ -323,25 +342,67 @@ final class MainViewController: UIViewController {
             activeId: activeId
         )
         noSessionsView.isHidden = !(terminals.isEmpty && computerCount > 0)
+        updateTerminalChromeVisibility(hasTerminals: !terminals.isEmpty)
     }
 
     /// Idempotent on purpose: activeID can update BEFORE the terminal list
     /// does (create flow), so the first call may record an id whose page
     /// doesn't exist yet — the re-run after page creation must still unhide it.
     private func setVisiblePage(_ id: TerminalID?) {
+        let previousVisibleId = visibleId
         visibleId = id
         for (pageId, page) in pages {
             page.container.isHidden = pageId != id
             page.container.frame = pagesContainer.bounds
         }
         if let id, let page = pages[id] {
-            page.host.stickyCtrl = toolbar.ctrlArmed
-            if !page.host.view.isFirstResponder {
+            page.host.setReplacementInputView(
+                isTerminalKeyboardEnabled ? terminalKeyboard : nil
+            )
+            toolbar.setModifierState(page.host.modifierState)
+            if (previousVisibleId != id || !page.hasBeenFocused)
+                && !page.host.view.isFirstResponder
+            {
                 page.host.view.becomeFirstResponder()
             }
+            page.hasBeenFocused = true
             // Unhiding does not fire didMoveToWindow, so nothing else
             // repaints output that arrived while the view was hidden.
             page.host.kickRender()
+        } else {
+            toolbar.setModifierState(TerminalModifierState())
+        }
+    }
+
+    private func sendToolbarKey(_ key: TerminalInputKey) {
+        guard let id = visibleId, let page = pages[id] else { return }
+        page.host.sendToolbarKey(key)
+    }
+
+    private func toggleTerminalKeyboard() {
+        guard let id = visibleId, let page = pages[id] else { return }
+        isTerminalKeyboardEnabled.toggle()
+        toolbar.setTerminalKeyboardEnabled(isTerminalKeyboardEnabled)
+        page.host.setReplacementInputView(
+            isTerminalKeyboardEnabled ? terminalKeyboard : nil
+        )
+        if !page.host.view.isFirstResponder {
+            page.host.view.becomeFirstResponder()
+        }
+    }
+
+    private func updateTerminalChromeVisibility(hasTerminals: Bool) {
+        let shouldShow = hasTerminals && computerCount > 0
+        toolbar.isHidden = !shouldShow
+
+        if shouldShow {
+            pagesBottomToViewConstraint.isActive = false
+            pagesBottomToToolbarConstraint.isActive = true
+        } else {
+            pagesBottomToToolbarConstraint.isActive = false
+            pagesBottomToViewConstraint.isActive = true
+            view.endEditing(true)
+            toolbar.setModifierState(TerminalModifierState())
         }
     }
 
