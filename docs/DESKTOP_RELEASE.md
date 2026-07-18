@@ -1,9 +1,8 @@
 # Desktop release
 
 Pedals desktop releases are universal, notarized macOS disk images. The menu
-bar app embeds the `pedals` daemon at `Contents/Resources/pedals`, so a release
-does not depend on a source checkout or a separately installed command-line
-tool.
+bar app links `PedalsDaemonCore` directly and is itself the long-running PTY and
+relay service process; it does not launch or embed a second daemon executable.
 
 ## GitHub configuration
 
@@ -32,9 +31,10 @@ git tag desktop-v1.0.0
 git push origin desktop-v1.0.0
 ```
 
-The workflow tests the daemon, builds both `arm64` and `x86_64` slices, embeds
-the daemon, signs with hardened runtime, creates a DMG, submits it to Apple's
-notary service, staples the ticket, and publishes these GitHub release assets:
+The workflow tests the shared desktop service core, builds the app for both
+`arm64` and `x86_64`, signs it with hardened runtime, creates a DMG, submits it
+to Apple's notary service, staples the ticket, and publishes these GitHub
+release assets:
 
 - `Pedals-macOS.dmg`
 - `Pedals-macOS.dmg.sha256`

@@ -3,7 +3,6 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var updaterModel: UpdaterModel
-    @AppStorage(AppModel.daemonPathKey) private var daemonPath = AppModel.defaultDaemonPath
     @State private var automaticallyChecksForUpdates = true
     @State private var automaticallyDownloadsUpdates = true
 
@@ -19,23 +18,15 @@ struct SettingsView: View {
                 .disabled(!updaterModel.canCheckForUpdates)
             }
 
-            Section {
-                TextField("Daemon binary", text: $daemonPath)
-                    .font(.body.monospaced())
-                HStack {
-                    Button("Choose…") { choose() }
-                    Button("Reset to Default") { daemonPath = AppModel.defaultDaemonPath }
-                        .disabled(daemonPath == AppModel.defaultDaemonPath)
-                }
-            } footer: {
-                Text("Used by “Start Daemon” to launch `pedals serve`.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Section("About") {
+                LabeledContent("Version", value: version)
+                Text("Pedals stays available while its menu bar icon is visible.")
+                    .foregroundStyle(PedalsTheme.secondaryContent)
             }
         }
         .formStyle(.grouped)
         .tint(PedalsTheme.content)
-        .frame(width: 480)
+        .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
@@ -50,14 +41,11 @@ struct SettingsView: View {
         }
     }
 
-    private func choose() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = URL(fileURLWithPath: daemonPath).deletingLastPathComponent()
-        if panel.runModal() == .OK, let url = panel.url {
-            daemonPath = url.path
-        }
+    private var version: String {
+        let marketing = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "—"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+            as? String ?? "—"
+        return "\(marketing) (\(build))"
     }
 }

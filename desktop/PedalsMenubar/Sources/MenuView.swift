@@ -1,4 +1,5 @@
 import AppKit
+import PedalsKit
 import SwiftUI
 
 struct MenuView: View {
@@ -7,13 +8,30 @@ struct MenuView: View {
     @State private var showingPairingCode = false
 
     var body: some View {
-        Group {
-            if model.hasCompletedOnboarding {
-                dashboard
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+
+            if model.hasPairedDevice {
+                sessionList
+                if showingPairingCode {
+                    Divider()
+                    pairingSection
+                }
+                if let error = model.lastError {
+                    Divider()
+                    ErrorBanner(message: error)
+                }
             } else {
-                DesktopOnboardingView()
+                DesktopPairingView()
             }
+
+            Divider()
+            footer
         }
+        .frame(width: 360)
+        .font(PedalsTheme.text)
+        .background(PedalsTheme.canvas)
         .tint(PedalsTheme.content)
         .task {
             await model.pollWhileOpen()
@@ -24,45 +42,28 @@ struct MenuView: View {
         }
     }
 
-    private var dashboard: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            sessionList
-            if showingPairingCode {
-                Divider()
-                pairingSection
-            }
-            if let error = model.lastError {
-                Divider()
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(PedalsTheme.critical)
-                    .lineLimit(2)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-            }
-            Divider()
-            footer
-        }
-        .frame(width: 360)
-    }
-
     // MARK: Header
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(PedalsTheme.content.opacity(model.relayState.indicatorOpacity))
-                .frame(width: 9, height: 9)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Pedals")
-                    .font(.headline)
-                Text(statusLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 9) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(PedalsTheme.content)
+                Image(systemName: "terminal")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(PedalsTheme.canvas)
             }
+            .frame(width: 28, height: 28)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Pedals")
+                    .font(PedalsTheme.emphasizedText)
+                Text(statusLine)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+            }
+
             Spacer()
+
             SettingsLink {
                 Image(systemName: "gearshape")
             }
@@ -74,10 +75,8 @@ struct MenuView: View {
     }
 
     private var statusLine: String {
-        guard model.daemonReachable else { return RelayState.daemonNotRunning.label }
-        var parts = [model.relayState.label]
-        if model.clientConnected { parts.append("client connected") }
-        return parts.joined(separator: " · ")
+        if model.clientConnected { return "iPhone connected" }
+        return model.relayState.label
     }
 
     // MARK: Sessions
@@ -85,25 +84,27 @@ struct MenuView: View {
     private var sessionList: some View {
         VStack(alignment: .leading, spacing: 0) {
             if model.sessions.isEmpty {
-                Text(model.daemonReachable ? "No sessions" : "Start the daemon to manage sessions")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(model.serviceRunning ? "No sessions" : "Starting Pedals…")
+                    .foregroundStyle(PedalsTheme.secondaryContent)
                     .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 14)
+                    .padding(.vertical, 16)
             } else {
-                ForEach(model.sessions) { session in
+                ForEach(model.sessions, id: \.id) { session in
                     SessionRow(session: session) {
                         model.closeSession(session.id)
                     }
                 }
             }
+
             Divider()
-            HStack(spacing: 12) {
+
+            HStack(spacing: 14) {
                 Button {
                     model.newSession()
                 } label: {
                     Label("New Session", systemImage: "plus")
                 }
+
                 Button {
                     showingPairingCode.toggle()
                     if showingPairingCode {
@@ -112,19 +113,18 @@ struct MenuView: View {
                         model.clearPairingCode()
                     }
                 } label: {
-                    Label(showingPairingCode ? "Hide Connection Code" : "Connect iPhone", systemImage: "number")
+                    Label(showingPairingCode ? "Hide Code" : "Connect iPhone", systemImage: "number")
                 }
+
                 Spacer()
             }
             .buttonStyle(.borderless)
             .controlSize(.small)
-            .disabled(!model.daemonReachable)
+            .disabled(!model.serviceRunning)
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 9)
         }
     }
-
-    // MARK: Pairing
 
     private var pairingSection: some View {
         DesktopPairingPanel(
@@ -139,26 +139,21 @@ struct MenuView: View {
     // MARK: Footer
 
     private var footer: some View {
-        HStack {
-            if model.managesDaemon {
-                Button("Stop Daemon") { model.stopDaemon() }
-            } else if !model.daemonReachable {
-                Button("Start Daemon") { model.startDaemon() }
-            } else {
-                Text("Daemon running")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+        HStack(spacing: 14) {
             Spacer()
-            Button("Check for Updates…") { updater.checkForUpdates() }
-                .disabled(!updater.canCheckForUpdates)
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .keyboardShortcut("q")
+            Button("Check for Updates…") {
+                updater.checkForUpdates()
+            }
+            .disabled(!updater.canCheckForUpdates)
+            Button("Quit") {
+                NSApplication.shared.terminate(nil)
+            }
+            .keyboardShortcut("q")
         }
         .buttonStyle(.borderless)
         .controlSize(.small)
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
     }
 }
 
@@ -170,15 +165,13 @@ private struct SessionRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "terminal")
-                .foregroundStyle(session.alive ? .primary : .tertiary)
+                .foregroundStyle(session.alive ? PedalsTheme.content : PedalsTheme.tertiaryContent)
                 .frame(width: 16)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(session.title)
-                    .font(.body)
                     .lineLimit(1)
                 Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
                     .lineLimit(1)
             }
             Spacer()
@@ -186,24 +179,37 @@ private struct SessionRow: View {
                 onClose()
             } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
             }
             .buttonStyle(.borderless)
             .opacity(hovering ? 1 : 0.35)
             .help("Close session")
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 5)
+        .padding(.vertical, 6)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
     }
 
     private var subtitle: String {
         var parts: [String] = []
-        if let cwd = session.cwd, !cwd.isEmpty {
-            parts.append((cwd as NSString).abbreviatingWithTildeInPath)
+        if !session.cwd.isEmpty {
+            parts.append((session.cwd as NSString).abbreviatingWithTildeInPath)
         }
         if !session.alive { parts.append("exited") }
         return parts.isEmpty ? "session \(session.id)" : parts.joined(separator: " · ")
+    }
+}
+
+private struct ErrorBanner: View {
+    let message: String
+
+    var body: some View {
+        Label(message, systemImage: "exclamationmark.triangle")
+            .foregroundStyle(PedalsTheme.critical)
+            .lineLimit(3)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
     }
 }

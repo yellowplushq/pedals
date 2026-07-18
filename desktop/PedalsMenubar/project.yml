@@ -4,6 +4,8 @@ options:
   deploymentTarget:
     macOS: "14.0"
 packages:
+  PedalsDaemon:
+    path: ../PedalsDaemon
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     exactVersion: 2.9.4
@@ -14,6 +16,8 @@ targets:
     sources:
       - Sources
     dependencies:
+      - package: PedalsDaemon
+        product: PedalsDaemonCore
       - package: Sparkle
     scheme:
       testTargets: []
@@ -36,7 +40,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: air.build.pedals.menubar
         PRODUCT_NAME: Pedals
-        MARKETING_VERSION: "1.1.0"
+        MARKETING_VERSION: "1.2.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Manual

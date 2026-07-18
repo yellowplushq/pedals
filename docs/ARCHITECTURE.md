@@ -7,8 +7,8 @@ status service for widgets, Dynamic Island, and Apple Watch.
 pedals/
 ├── relay/                    Cloudflare Worker, Durable Objects, D1, APNs
 ├── shared/PedalsKit/         Swift E2EE, v2 pairing, relay and REST clients
-├── desktop/PedalsDaemon/     PTY host, CLI, TTY count reporter
-├── desktop/PedalsMenubar/    macOS daemon controller
+├── desktop/PedalsDaemon/     Shared PTY/relay service core + headless CLI
+├── desktop/PedalsMenubar/    macOS service process and menu bar UI
 ├── ios/
 │   ├── Sources/              UIKit terminal app and binding lifecycle
 │   ├── SharedStatus/         app-group state, status API, ActivityKit bridge
@@ -63,16 +63,20 @@ Widget pushes trigger a fresh authenticated timeline request. Live Activity
 pushes carry the aggregate content state because ActivityKit renders it without
 running app networking code.
 
-## Desktop daemon
+## Desktop service
 
 `PedalsDaemonCore` owns the PTY processes, replay buffers, Unix control socket,
-and authenticated relay links. The executable exposes `serve`, `ls`, `new`,
-`kill`, `pair`, and `status` through Swift Argument Parser.
+and authenticated relay links. The menu bar app links this core directly and
+owns its lifecycle, so quitting Pedals also stops the service. It opens directly
+to pairing on an unpaired computer and never asks the user to configure or
+start a daemon. The optional headless `pedals` executable exposes `serve`, `ls`,
+`new`, `kill`, `pair`, and `status` through Swift Argument Parser for CLI use.
 
 First launch registers a computer with the configured HTTPS service and stores
-`~/.pedals/identity.json` (mode 0600). `pedals pair` requests a fresh 15-minute,
-eight-digit pairing code; `--reset` rotates the server identity, host bearer,
-and E2EE secret. Closing the pairing surface revokes its current code.
+`~/.pedals/identity.json` (mode 0600). Opening the app's pairing surface requests
+a fresh 15-minute, eight-digit pairing code; closing it revokes the current
+code. The headless CLI provides the same pairing behavior, and `--reset` rotates
+the server identity, host bearer, and E2EE secret.
 
 `RelayHostClient` publishes only `sessions.filter(\.alive).count` and the local
 host name as authenticated relay metadata. It reports on control-link connect,

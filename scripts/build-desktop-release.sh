@@ -9,7 +9,7 @@ VERSION="${PEDALS_DESKTOP_VERSION:-1.0.0}"
 BUILD_NUMBER="${PEDALS_DESKTOP_BUILD_NUMBER:-1}"
 ARCHITECTURES=(arm64 x86_64)
 
-for command in swift xcodebuild xcodegen lipo ditto; do
+for command in xcodebuild xcodegen lipo ditto; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command is unavailable: $command" >&2
     exit 1
@@ -38,33 +38,9 @@ esac
 
 BUILD_DIR="$OUTPUT_DIR/build"
 APP_PATH="$OUTPUT_DIR/Pedals.app"
-UNIVERSAL_DAEMON="$BUILD_DIR/pedals"
 
 rm -rf "$BUILD_DIR" "$APP_PATH"
-mkdir -p "$BUILD_DIR/daemon"
-
-DAEMON_SLICES=()
-for architecture in "${ARCHITECTURES[@]}"; do
-  scratch="$BUILD_DIR/daemon/$architecture"
-  swift build \
-    --package-path "$REPOSITORY_ROOT/desktop/PedalsDaemon" \
-    --scratch-path "$scratch" \
-    --configuration release \
-    --arch "$architecture"
-  binary_directory="$(swift build \
-    --package-path "$REPOSITORY_ROOT/desktop/PedalsDaemon" \
-    --scratch-path "$scratch" \
-    --configuration release \
-    --arch "$architecture" \
-    --show-bin-path)"
-  slice="$BUILD_DIR/pedals-$architecture"
-  ditto "$binary_directory/pedals" "$slice"
-  DAEMON_SLICES+=("$slice")
-done
-
-lipo -create "${DAEMON_SLICES[@]}" -output "$UNIVERSAL_DAEMON"
-chmod 755 "$UNIVERSAL_DAEMON"
-lipo "$UNIVERSAL_DAEMON" -verify_arch "${ARCHITECTURES[@]}"
+mkdir -p "$BUILD_DIR"
 
 pushd "$REPOSITORY_ROOT/desktop/PedalsMenubar" >/dev/null
 xcodegen generate
@@ -89,11 +65,8 @@ if [[ ! -d "$BUILT_APP" ]]; then
 fi
 
 ditto "$BUILT_APP" "$APP_PATH"
-mkdir -p "$APP_PATH/Contents/Resources"
-install -m 755 "$UNIVERSAL_DAEMON" "$APP_PATH/Contents/Resources/pedals"
 
 lipo "$APP_PATH/Contents/MacOS/Pedals" -verify_arch "${ARCHITECTURES[@]}"
-lipo "$APP_PATH/Contents/Resources/pedals" -verify_arch "${ARCHITECTURES[@]}"
 
 actual_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
 actual_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")"

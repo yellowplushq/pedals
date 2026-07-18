@@ -39,7 +39,7 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Test daemon
+      - name: Test desktop service core
         run: swift test --package-path desktop/PedalsDaemon
 
       - name: Import Developer ID certificate
@@ -76,14 +76,13 @@ jobs:
       - name: Build universal app
         run: ./scripts/build-desktop-release.sh
 
-      - name: Sign app and embedded daemon
+      - name: Sign app and update framework
         shell: bash
         run: |
           set -euo pipefail
           app="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals.app"
           sparkle="$app/Contents/Frameworks/Sparkle.framework"
           sparkle_contents="$sparkle/Versions/B"
-          daemon="$app/Contents/Resources/pedals"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" \
             "$sparkle_contents/XPCServices/Installer.xpc"
           codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
@@ -94,7 +93,6 @@ jobs:
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" \
             "$sparkle_contents/Updater.app"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$sparkle"
-          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$daemon"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           signing_details="$(codesign -dv --verbose=4 "$app" 2>&1)"

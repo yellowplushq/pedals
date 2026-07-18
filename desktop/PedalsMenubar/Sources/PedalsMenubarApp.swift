@@ -1,23 +1,26 @@
+import AppKit
 import SwiftUI
 
 @main
 struct PedalsMenubarApp: App {
-    @StateObject private var model = AppModel()
-    @StateObject private var updater = UpdaterModel()
+    @NSApplicationDelegateAdaptor(PedalsAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuView()
-                .environmentObject(model)
-                .environmentObject(updater)
-        } label: {
-            Image(systemName: "terminal")
-        }
-        .menuBarExtraStyle(.window)
-
         Settings {
             SettingsView()
-                .environmentObject(updater)
+                .environmentObject(appDelegate.updater)
         }
+    }
+}
+
+@MainActor
+final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel()
+    let updater = UpdaterModel()
+
+    private var statusItemController: StatusItemController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItemController = StatusItemController(model: model, updater: updater)
     }
 }

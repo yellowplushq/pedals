@@ -1,9 +1,36 @@
 import Foundation
 import PedalsKit
 
-/// The daemon: PTY session manager + relay host connection + unix control
-/// socket. `pedals serve` constructs one and parks the main thread.
+/// The desktop service: PTY session manager + relay host connection + optional
+/// Unix control socket for the command-line client. The menu bar app owns this
+/// object directly; `pedals serve` uses the same core for headless operation.
 public final class Daemon: @unchecked Sendable {
+    public struct Snapshot: Sendable {
+        public let sessions: [SessionInfo]
+        public let clientConnected: Bool
+        public let relayState: RelayHostClient.State
+
+        public init(
+            sessions: [SessionInfo],
+            clientConnected: Bool,
+            relayState: RelayHostClient.State
+        ) {
+            self.sessions = sessions
+            self.clientConnected = clientConnected
+            self.relayState = relayState
+        }
+    }
+
+    public struct PairingInvitation: Sendable {
+        public let code: PairingCode
+        public let expiresAt: Date
+
+        public init(code: PairingCode, expiresAt: Date) {
+            self.code = code
+            self.expiresAt = expiresAt
+        }
+    }
+
     public enum DaemonError: Error, CustomStringConvertible {
         case notRegistered
         case identityResetPending(HostIdentityResetState.Phase)
@@ -102,6 +129,38 @@ public final class Daemon: @unchecked Sendable {
         controlServer = nil
         relay.stop()
         sessions.closeAll()
+    }
+
+    // MARK: - In-process app API
+
+    public func snapshot() -> Snapshot {
+        Snapshot(
+            sessions: sessions.list(),
+            clientConnected: relay.clientConnected,
+            relayState: relay.state
+        )
+    }
+
+    @discardableResult
+    public func createSession() throws -> Int {
+        try sessions.create()
+    }
+
+    @discardableResult
+    public func closeSession(id: Int) -> Bool {
+        sessions.close(id: id)
+    }
+
+    public func createPairingInvitation() throws -> PairingInvitation {
+        let pairing = try createPairingSession(rotatingIdentity: false)
+        return PairingInvitation(
+            code: pairing.code,
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(pairing.expiresAt))
+        )
+    }
+
+    public func cancelPairingInvitation() {
+        cancelCurrentPairingSession(revoke: true)
     }
 
     deinit {
@@ -249,3 +308,7 @@ public final class Daemon: @unchecked Sendable {
         ])
     }
 }
+
+/// Product-facing name used by the menu bar app. `Daemon` remains the concrete
+/// type name for source compatibility with the headless CLI and existing tests.
+public typealias PedalsService = Daemon

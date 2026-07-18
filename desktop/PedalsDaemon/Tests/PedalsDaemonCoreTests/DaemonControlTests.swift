@@ -69,6 +69,25 @@ final class DaemonControlTests: XCTestCase {
         XCTAssertNotNil(reply["err"])
     }
 
+    func testInProcessServiceAPI() throws {
+        var snapshot = daemon.snapshot()
+        XCTAssertTrue(snapshot.sessions.isEmpty)
+        XCTAssertFalse(snapshot.clientConnected)
+
+        let id = try daemon.createSession()
+        snapshot = daemon.snapshot()
+        XCTAssertEqual(snapshot.sessions.map(\.id), [id])
+
+        XCTAssertTrue(daemon.closeSession(id: id))
+        XCTAssertFalse(daemon.closeSession(id: id))
+        XCTAssertTrue(daemon.snapshot().sessions.isEmpty)
+
+        let invitation = try daemon.createPairingInvitation()
+        XCTAssertEqual(invitation.code.digits.count, PairingCode.digitCount)
+        XCTAssertGreaterThan(invitation.expiresAt, Date())
+        daemon.cancelPairingInvitation()
+    }
+
     func testPairReturnsSingleUseCodesAndResetRotatesComputer() throws {
         let originalIdentity = try XCTUnwrap(home.loadIdentity())
         let first = try send(["cmd": "pair"])
