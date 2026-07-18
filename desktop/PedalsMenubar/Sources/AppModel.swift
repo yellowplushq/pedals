@@ -146,22 +146,6 @@ final class AppModel: ObservableObject {
 
     // MARK: Session actions
 
-    func newSession() {
-        guard let service else { return }
-        lastError = nil
-        Task {
-            do {
-                _ = try await Task.detached(priority: .userInitiated) {
-                    try service.createSession()
-                }.value
-                await refresh()
-                lastError = nil
-            } catch {
-                lastError = error.localizedDescription
-            }
-        }
-    }
-
     func closeSession(_ id: Int) {
         guard let service else { return }
         lastError = nil

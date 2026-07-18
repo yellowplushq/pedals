@@ -100,12 +100,6 @@ struct MenuView: View {
 
             HStack(spacing: 14) {
                 Button {
-                    model.newSession()
-                } label: {
-                    Label("New Session", systemImage: "plus")
-                }
-
-                Button {
                     showingPairingCode.toggle()
                     if showingPairingCode {
                         model.fetchPairingCode()
