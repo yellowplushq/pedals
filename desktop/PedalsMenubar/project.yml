@@ -3,12 +3,18 @@ options:
   createIntermediateGroups: true
   deploymentTarget:
     macOS: "14.0"
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.4
 targets:
   PedalsMenubar:
     type: application
     platform: macOS
     sources:
       - Sources
+    dependencies:
+      - package: Sparkle
     scheme:
       testTargets: []
     info:
@@ -19,11 +25,18 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
+        SUAutomaticallyUpdate: true
+        SUEnableAutomaticChecks: true
+        SUFeedURL: https://pedals.air.build/appcast.xml
+        SUPublicEDKey: fU6GOxOohmLiyQM7hTjHvWqfxSQLQ7Z3rQCX2RH34Ds=
+        SURequireSignedFeed: true
+        SUScheduledCheckInterval: 86400
+        SUVerifyUpdateBeforeExtraction: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: air.build.pedals.menubar
         PRODUCT_NAME: Pedals
-        MARKETING_VERSION: "1.0.0"
+        MARKETING_VERSION: "1.1.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Manual

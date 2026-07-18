@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  APPCAST_ASSET,
   handleDesktopDownload,
   handleWebsiteAsset,
   MACOS_ASSET,
@@ -15,16 +16,32 @@ test("the stable download path redirects to the latest desktop release", async (
   const req = request("/download/macos");
   const response = handleDesktopDownload(
     req,
-    { DESKTOP_RELEASE_REPOSITORY: "yellowplus/pedals" },
+    { DESKTOP_RELEASE_REPOSITORY: "yellowplushq/pedals" },
     new URL(req.url),
   );
 
   assert.equal(response.status, 302);
   assert.equal(
     response.headers.get("location"),
-    `https://github.com/yellowplus/pedals/releases/latest/download/${MACOS_ASSET}`,
+    `https://github.com/yellowplushq/pedals/releases/latest/download/${MACOS_ASSET}`,
   );
   assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
+test("the stable appcast path redirects to the latest signed update feed", () => {
+  const req = request("/appcast.xml", { method: "HEAD" });
+  const response = handleDesktopDownload(
+    req,
+    { DESKTOP_RELEASE_REPOSITORY: "yellowplushq/pedals" },
+    new URL(req.url),
+  );
+
+  assert.equal(response.status, 302);
+  assert.equal(
+    response.headers.get("location"),
+    `https://github.com/yellowplushq/pedals/releases/latest/download/${APPCAST_ASSET}`,
+  );
+  assert.equal(response.headers.get("content-length"), "0");
 });
 
 test("the short download path redirects to the canonical path", () => {

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var updater: UpdaterModel
     @State private var showingPairingCode = false
 
     var body: some View {
@@ -149,6 +150,8 @@ struct MenuView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button("Check for Updates…") { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .keyboardShortcut("q")
         }

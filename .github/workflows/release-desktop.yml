@@ -81,14 +81,19 @@ jobs:
         run: |
           set -euo pipefail
           app="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals.app"
+          sparkle="$app/Contents/Frameworks/Sparkle.framework"
           daemon="$app/Contents/Resources/pedals"
+          codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$sparkle"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$daemon"
           codesign --force --options runtime --timestamp --sign "$PEDALS_SIGNING_IDENTITY" "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           signing_details="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          sparkle_signing_details="$(codesign -dv --verbose=4 "$sparkle" 2>&1)"
           printf '%s\n' "$signing_details"
           grep -q 'TeamIdentifier=QDJ93ZUQ9B' <<< "$signing_details"
           grep -q 'flags=.*runtime' <<< "$signing_details"
+          grep -q 'TeamIdentifier=QDJ93ZUQ9B' <<< "$sparkle_signing_details"
+          grep -q 'flags=.*runtime' <<< "$sparkle_signing_details"
 
       - name: Package disk image
         run: ./scripts/package-desktop-dmg.sh
@@ -129,18 +134,41 @@ jobs:
           cd "$PEDALS_DESKTOP_OUTPUT_DIR"
           shasum -a 256 Pedals-macOS.dmg > Pedals-macOS.dmg.sha256
 
+      - name: Generate signed update feed
+        shell: bash
+        env:
+          SPARKLE_EDDSA_PRIVATE_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          appcast_tool="$PEDALS_DESKTOP_OUTPUT_DIR/build/derived-data/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_appcast"
+          if [[ ! -x "$appcast_tool" ]]; then
+            echo "Sparkle generate_appcast tool was not found at $appcast_tool" >&2
+            exit 1
+          fi
+          printf '%s' "$SPARKLE_EDDSA_PRIVATE_KEY" | "$appcast_tool" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/yellowplushq/pedals/releases/download/$GITHUB_REF_NAME/" \
+            --link "https://pedals.air.build" \
+            --maximum-versions 1 \
+            "$PEDALS_DESKTOP_OUTPUT_DIR"
+          test -s "$PEDALS_DESKTOP_OUTPUT_DIR/appcast.xml"
+          grep -q 'sparkle:edSignature=' "$PEDALS_DESKTOP_OUTPUT_DIR/appcast.xml"
+          grep -q 'sparkle-signatures:' "$PEDALS_DESKTOP_OUTPUT_DIR/appcast.xml"
+
       - name: Publish GitHub release
         shell: bash
         run: |
           set -euo pipefail
           dmg="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg"
           checksum="$PEDALS_DESKTOP_OUTPUT_DIR/Pedals-macOS.dmg.sha256"
+          appcast="$PEDALS_DESKTOP_OUTPUT_DIR/appcast.xml"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$dmg" "$checksum" --clobber
+            gh release upload "$GITHUB_REF_NAME" "$dmg" "$checksum" "$appcast" --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
               "$dmg" \
               "$checksum" \
+              "$appcast" \
               --verify-tag \
               --title "Pedals $PEDALS_DESKTOP_VERSION" \
               --generate-notes
