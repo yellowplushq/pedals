@@ -7,13 +7,13 @@ import UIKit
 /// interpolation so the strip follows the finger.
 final class TabStripView: UIView {
     struct Tab: Equatable {
-        let id: Int
+        let id: TerminalID
         var title: String
         var alive: Bool
     }
 
-    var onSelect: ((Int) -> Void)?
-    var onClose: ((Int) -> Void)?
+    var onSelect: ((TerminalID) -> Void)?
+    var onClose: ((TerminalID) -> Void)?
     var onSettings: (() -> Void)?
     var onCreate: (() -> Void)?
 
@@ -33,7 +33,7 @@ final class TabStripView: UIView {
 
     private(set) var tabs: [Tab] = []
     private var activeIndex: Int?
-    private var pills: [Int: TabPillView] = [:]
+    private var pills: [TerminalID: TabPillView] = [:]
 
     /// Non-nil while a pan drives the strip: (fromIndex, toIndex, progress).
     private var transition: (from: Int, to: Int, progress: CGFloat)?
@@ -80,12 +80,19 @@ final class TabStripView: UIView {
 
     // MARK: - Model
 
-    func update(tabs newTabs: [Tab], activeId: Int?) {
+    /// When non-nil, tapping + presents this menu (multi-computer choose-target);
+    /// when nil, tapping + fires `onCreate` directly (single computer).
+    func setCreateMenu(_ menu: UIMenu?) {
+        plusButton.menu = menu
+        plusButton.showsMenuAsPrimaryAction = menu != nil
+    }
+
+    func update(tabs newTabs: [Tab], activeId: TerminalID?) {
         let oldActive = activeIndex
         tabs = newTabs
         activeIndex = activeId.flatMap { id in tabs.firstIndex { $0.id == id } }
 
-        var seen = Set<Int>()
+        var seen = Set<TerminalID>()
         for tab in tabs {
             seen.insert(tab.id)
             if let pill = pills[tab.id] {
@@ -134,6 +141,28 @@ final class TabStripView: UIView {
             withDuration: 0.4, delay: 0,
             usingSpringWithDamping: 0.85, initialSpringVelocity: 0.3,
             options: [.allowUserInteraction]
+        ) {
+            self.layoutStrip()
+        }
+    }
+
+    /// Commit an in-flight gesture transition to `targetIndex`, settling the
+    /// pills to the target layout in one animation meant to run alongside the
+    /// content page animation (pass its spring params) — instead of freezing at
+    /// the release progress and snapping only after the page settles. The model
+    /// `update(tabs:activeId:)` that follows sees activeIndex already at target
+    /// and re-animates nothing.
+    func commitSwitch(
+        to targetIndex: Int,
+        duration: TimeInterval, damping: CGFloat, initialVelocity: CGFloat
+    ) {
+        guard tabs.indices.contains(targetIndex) else { return }
+        transition = nil
+        activeIndex = targetIndex
+        UIView.animate(
+            withDuration: duration, delay: 0,
+            usingSpringWithDamping: damping, initialSpringVelocity: initialVelocity,
+            options: [.allowUserInteraction, .beginFromCurrentState]
         ) {
             self.layoutStrip()
         }
@@ -285,7 +314,7 @@ final class TabPillView: UIView {
         titleLabel.text = tab.title
         let glyph = tab.title.first.map { String($0).lowercased() } ?? ">"
         glyphLabel.text = tab.alive ? glyph : "×"
-        glyphLabel.textColor = tab.alive ? .secondaryLabel : .systemRed
+        glyphLabel.textColor = tab.alive ? .secondaryLabel : PedalsTheme.uiCritical
         titleLabel.textColor = tab.alive ? .label : .secondaryLabel
     }
 

@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# Pedals end-to-end test (ARCHITECTURE.md "Testing").
+# Pedals v2 end-to-end test.
 #
-#   local relay :8787  →  `pedals serve`  →  headless Node client pairs,
-#   creates a session, runs printf, asserts the marker arrives decrypted.
-#   Then the iOS simulator: build, install, `simctl openurl` the pairing
-#   URL, and screenshot the rendered terminal to .artifacts/ios-terminal.png.
+# Local Worker + D1 -> desktop pairing code -> durable client binding ->
+# server-authoritative TTY aggregation -> iOS code entry -> encrypted
+# relay handshake -> simulator screenshot.
 #
-# Requires: Xcode (iPhone 17 Pro simulator), xcodegen, node >= 22.
-# Exits 0 only if every stage passes.
+# Requires: Xcode, xcodegen, Node.js >= 22, Swift 6, and an available iPhone
+# simulator. The script creates only temporary state below /tmp and .artifacts.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACTS="$ROOT/.artifacts"
 RELAY_PORT="${RELAY_PORT:-8787}"
+SERVICE_URL="http://127.0.0.1:$RELAY_PORT"
 SIM_DEVICE="${SIM_DEVICE:-iPhone 17 Pro}"
-BUNDLE_ID="app.yellowplus.pedals"
-MARKER="pedals-e2e-$$"
+BUNDLE_ID="in.eyhn.pedals"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 mkdir -p "$ARTIFACTS"
-PEDALS_HOME="$(mktemp -d /tmp/pedals-e2e.XXXXXX)"
-export PEDALS_HOME
+PEDALS_E2E_HOME="$(mktemp -d /tmp/pedals-e2e.XXXXXX)"
+PEDALS_E2E_D1="$(mktemp -d /tmp/pedals-e2e-d1.XXXXXX)"
+STATUS_CREDENTIAL="$PEDALS_E2E_HOME/status-client.json"
+export PEDALS_HOME="$PEDALS_E2E_HOME"
 
 log() { printf '\033[1;36m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -28,111 +29,190 @@ fail() { printf '\033[1;31m[e2e] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 RELAY_PID=""
 DAEMON_PID=""
 cleanup() {
-  [[ -n "$DAEMON_PID" ]] && kill "$DAEMON_PID" 2>/dev/null || true
-  [[ -n "$RELAY_PID" ]] && kill "$RELAY_PID" 2>/dev/null || true
-  rm -rf "$PEDALS_HOME"
+  if [[ -n "$DAEMON_PID" ]]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$RELAY_PID" ]]; then
+    kill "$RELAY_PID" 2>/dev/null || true
+  fi
+  # Wait for both processes to release their Unix socket and D1 files before
+  # removing the isolated directories. Without the wait, repeat runs race a
+  # still-shutting-down wrangler process and print "Directory not empty".
+  if [[ -n "$DAEMON_PID" ]]; then
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$RELAY_PID" ]]; then
+    wait "$RELAY_PID" 2>/dev/null || true
+  fi
+  rm -rf "$PEDALS_E2E_HOME" "$PEDALS_E2E_D1"
 }
 trap cleanup EXIT
 
-# ---- 1. local relay ------------------------------------------------------
+# ---- 1. local Cloudflare service ----------------------------------------
 
-log "installing relay deps"
-(cd "$ROOT/relay" && npm install --no-audit --no-fund --silent)
+log "installing and testing Worker dependencies"
+(cd "$ROOT/relay" && npm ci --no-audit --no-fund --silent && npm test)
 
-log "starting relay on :$RELAY_PORT"
-PORT="$RELAY_PORT" node "$ROOT/relay/server.mjs" &
+log "applying the v2 schema to an isolated local D1"
+(
+  cd "$ROOT/relay"
+  WRANGLER_LOG_PATH="$ARTIFACTS/wrangler-e2e.log" \
+    CI=1 npx wrangler d1 migrations apply pedals --local --persist-to "$PEDALS_E2E_D1"
+)
+
+log "starting the Cloudflare Worker on :$RELAY_PORT"
+(
+  cd "$ROOT/relay"
+  WRANGLER_LOG_PATH="$ARTIFACTS/wrangler-e2e.log" \
+    npx wrangler dev --local --ip 127.0.0.1 --port "$RELAY_PORT" \
+      --persist-to "$PEDALS_E2E_D1"
+) >"$ARTIFACTS/relay-e2e.log" 2>&1 &
 RELAY_PID=$!
-for _ in $(seq 1 50); do
-  curl -fsS "http://127.0.0.1:$RELAY_PORT/healthz" >/dev/null 2>&1 && break
-  kill -0 "$RELAY_PID" 2>/dev/null || fail "relay exited during startup"
-  sleep 0.2
+for _ in $(seq 1 80); do
+  curl -fsS "$SERVICE_URL/healthz" >/dev/null 2>&1 && break
+  kill -0 "$RELAY_PID" 2>/dev/null || fail "Worker exited during startup"
+  sleep 0.25
 done
-curl -fsS "http://127.0.0.1:$RELAY_PORT/healthz" >/dev/null || fail "relay /healthz not responding"
-log "relay is up"
+curl -fsS "$SERVICE_URL/healthz" >/dev/null || fail "Worker /healthz not responding"
 
-# ---- 2. desktop daemon ---------------------------------------------------
+# ---- 2. desktop registration and binding graph -------------------------
 
-log "building pedals daemon (swift build)"
+log "building and starting the desktop daemon"
 swift build --package-path "$ROOT/desktop/PedalsDaemon" >/dev/null
 PEDALS_BIN="$(swift build --package-path "$ROOT/desktop/PedalsDaemon" --show-bin-path)/pedals"
 [[ -x "$PEDALS_BIN" ]] || fail "daemon binary not found at $PEDALS_BIN"
 
-log "starting pedals serve (PEDALS_HOME=$PEDALS_HOME)"
-"$PEDALS_BIN" serve --relay "ws://127.0.0.1:$RELAY_PORT" &
+"$PEDALS_BIN" serve --service "$SERVICE_URL" \
+  >"$ARTIFACTS/daemon-e2e.log" 2>&1 &
 DAEMON_PID=$!
-for _ in $(seq 1 50); do
-  [[ -S "$PEDALS_HOME/pedals.sock" && -f "$PEDALS_HOME/pairing.json" ]] && break
+for _ in $(seq 1 80); do
+  [[ -S "$PEDALS_E2E_HOME/pedals.sock" && -f "$PEDALS_E2E_HOME/identity.json" ]] && break
   kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited during startup"
-  sleep 0.2
+  sleep 0.25
 done
-[[ -S "$PEDALS_HOME/pedals.sock" ]] || fail "daemon control socket never appeared"
+[[ -S "$PEDALS_E2E_HOME/pedals.sock" ]] || fail "daemon control socket never appeared"
 
-PAIR_URL="$(node -e '
-  const fs = require("node:fs");
-  process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).url);
-' "$PEDALS_HOME/pairing.json")"
-[[ "$PAIR_URL" == pedals://pair?* ]] || fail "unexpected pairing URL: $PAIR_URL"
-log "pairing URL: $PAIR_URL"
+PAIR_CODE="$("$PEDALS_BIN" pair | sed -n 's/^Pairing code: //p' | tr -d ' ')"
+[[ "$PAIR_CODE" =~ ^[0-9]{8}$ ]] || fail "daemon did not emit an 8-digit pairing code"
+node "$ROOT/scripts/e2e-status-client.mjs" bind \
+  "$SERVICE_URL" "$PAIR_CODE" "$STATUS_CREDENTIAL"
 
-# ---- 3. headless protocol client -----------------------------------------
+log "checking server-authoritative TTY aggregation"
+node "$ROOT/scripts/e2e-status-client.mjs" wait "$STATUS_CREDENTIAL" 0
+SESSION_ID="$("$PEDALS_BIN" new | sed -n 's/^created session //p')"
+[[ "$SESSION_ID" =~ ^[0-9]+$ ]] || fail "could not parse created session id"
+node "$ROOT/scripts/e2e-status-client.mjs" wait "$STATUS_CREDENTIAL" 1
+"$PEDALS_BIN" kill "$SESSION_ID" >/dev/null
+node "$ROOT/scripts/e2e-status-client.mjs" wait "$STATUS_CREDENTIAL" 0
 
-log "running headless client (marker: $MARKER)"
-node "$ROOT/relay/test/client.mjs" --pair "$PAIR_URL" --expect "$MARKER" --keep --timeout 30 \
-  || fail "headless client did not receive the marker decrypted end-to-end"
-log "headless E2E passed: marker arrived decrypted"
+# ---- 3. iOS pairing and encrypted relay handshake ----------------------
 
-# ---- 4. iOS simulator ----------------------------------------------------
-
-log "generating Xcode project (xcodegen)"
+log "generating and building the iOS, Widget, Live Activity, and Watch targets"
 (cd "$ROOT/ios" && xcodegen generate --quiet)
 
-log "resolving simulator '$SIM_DEVICE'"
 SIM_UDID="$(xcrun simctl list devices available --json | node -e '
   const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
   const all = Object.values(data.devices).flat();
-  const match = all.find((d) => d.name === process.argv[1]);
+  const match = all.find((device) => device.name === process.argv[1]);
   if (!match) process.exit(1);
   process.stdout.write(match.udid);
 ' "$SIM_DEVICE")" || fail "no available simulator named '$SIM_DEVICE'"
-
 xcrun simctl bootstatus "$SIM_UDID" -b >/dev/null
-log "simulator booted ($SIM_UDID)"
 
-log "building iOS app (xcodebuild)"
 xcodebuild \
   -project "$ROOT/ios/Pedals.xcodeproj" \
   -scheme Pedals \
   -destination "platform=iOS Simulator,id=$SIM_UDID" \
   -derivedDataPath "$ARTIFACTS/dd-ios" \
-  -quiet \
-  build \
-  || fail "iOS build failed"
+  -quiet build || fail "iOS build failed"
 
 APP_PATH="$ARTIFACTS/dd-ios/Build/Products/Debug-iphonesimulator/Pedals.app"
 [[ -d "$APP_PATH" ]] || fail "built app not found at $APP_PATH"
-
-log "installing and pairing the app"
 xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl uninstall "$SIM_UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl install "$SIM_UDID" "$APP_PATH"
-xcrun simctl openurl "$SIM_UDID" "$PAIR_URL"
 
-# Poll the daemon until the iOS client is connected over the relay, then give
-# the terminal a moment to replay + render before taking the screenshot.
-log "waiting for the iOS client to connect"
+IOS_PAIR_CODE="$("$PEDALS_BIN" pair | sed -n 's/^Pairing code: //p' | tr -d ' ')"
+[[ "$IOS_PAIR_CODE" =~ ^[0-9]{8}$ ]] || fail "no fresh iOS pairing code"
+SIMCTL_CHILD_PEDALS_SERVICE_URL="$SERVICE_URL" \
+SIMCTL_CHILD_PEDALS_RESET_PAIRING=1 \
+  xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" >/dev/null
+
+# Drive the same visible controls a user sees. Baguette uses accessibility
+# labels to locate each control, so this stays independent of device size.
+tap_accessibility_label() {
+  local label="$1"
+  local ui_json="$PEDALS_E2E_HOME/ui.json"
+  local point=""
+  for _ in $(seq 1 40); do
+    baguette describe-ui --udid "$SIM_UDID" --output "$ui_json" >/dev/null 2>&1
+    if point="$(node - "$ui_json" "$label" <<'NODE'
+const fs = require("node:fs");
+const root = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const wanted = process.argv[3];
+function visit(value) {
+  if (!value || typeof value !== "object") return null;
+  if (value.label === wanted || value.identifier === wanted) {
+    const frame = value.frame || value.rect || value.bounds;
+    if (frame) {
+      const x = frame.x ?? frame.origin?.x;
+      const y = frame.y ?? frame.origin?.y;
+      const width = frame.width ?? frame.size?.width;
+      const height = frame.height ?? frame.size?.height;
+      if ([x, y, width, height].every(Number.isFinite)) {
+        return `${x + width / 2} ${y + height / 2}`;
+      }
+    }
+  }
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        const found = visit(item);
+        if (found) return found;
+      }
+    } else {
+      const found = visit(child);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+const point = visit(root);
+if (!point) process.exit(1);
+process.stdout.write(`${point} ${root.frame.width} ${root.frame.height}`);
+NODE
+)"; then
+      break
+    fi
+    point=""
+    sleep 0.25
+  done
+  [[ -n "$point" ]] || fail "could not find visible control '$label'"
+  read -r tap_x tap_y tap_width tap_height <<<"$point"
+  baguette tap --udid "$SIM_UDID" --x "$tap_x" --y "$tap_y" \
+    --width "$tap_width" --height "$tap_height" >/dev/null
+}
+
+sleep 1
+tap_accessibility_label "pedals.onboarding.pair"
+sleep 1
+tap_accessibility_label "pedals.pairing.code"
+baguette type --udid "$SIM_UDID" --text "$IOS_PAIR_CODE" >/dev/null
+tap_accessibility_label "pedals.pairing.submit"
+
+log "waiting for the iOS client to prove the E2EE relay handshake"
 CLIENT_STATE="none"
-for _ in $(seq 1 60); do
+for _ in $(seq 1 80); do
   CLIENT_STATE="$("$PEDALS_BIN" status | sed -n 's/^client: //p')"
   [[ "$CLIENT_STATE" == "connected" ]] && break
   sleep 0.5
 done
-[[ "$CLIENT_STATE" == "connected" ]] || fail "iOS client never connected to the daemon"
-log "iOS client connected; waiting for terminal render"
-sleep 5
+[[ "$CLIENT_STATE" == "connected" ]] || fail "iOS client never completed the relay handshake"
 
+"$PEDALS_BIN" new >/dev/null
+sleep 3
 SCREENSHOT="$ARTIFACTS/ios-terminal.png"
 xcrun simctl io "$SIM_UDID" screenshot "$SCREENSHOT" >/dev/null
-[[ -s "$SCREENSHOT" ]] || fail "screenshot is empty"
-log "screenshot written to $SCREENSHOT"
+[[ -s "$SCREENSHOT" ]] || fail "simulator screenshot is empty"
 
-log "E2E passed"
+log "v2 E2E passed; screenshot: $SCREENSHOT"

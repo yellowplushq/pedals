@@ -12,12 +12,12 @@ implementation (`relay/test/crypto-ref.mjs`). All values are lowercase hex unles
 
 ## HKDF-SHA256 direction keys (PROTOCOL.md §2)
 
-`salt = "pedals-v1"` (UTF-8, 9 bytes), output length 32 bytes.
+`salt = "pedals-v2"` (UTF-8, 9 bytes), output length 32 bytes.
 
 | key | info | value |
 |-----|------|-------|
-| key_h2c | `host->client` | `f5f1ae11b574be72b8afa4068d3509bf2d8f8d469d1ed16651d41406f923e641` |
-| key_c2h | `client->host` | `d4f715a850ee4d287fd5aba0d5dad7145fe93a9a4f22223a49bfa91b285ac333` |
+| key_h2c | `host->client` | `6972bc6da52c7ca19a55c1304c25846b032531a6142175312d54fdf09592ff40` |
+| key_c2h | `client->host` | `92961f97fbed1c21af672ab1f143c8b13589b10b849b0afed483aaff6cc4b3b7` |
 
 Node reproduction:
 
@@ -25,7 +25,7 @@ Node reproduction:
 const crypto = require('node:crypto');
 const secret = Buffer.alloc(32, 0x42);
 const key = Buffer.from(
-  crypto.hkdfSync('sha256', secret, Buffer.from('pedals-v1'), Buffer.from('host->client'), 32));
+  crypto.hkdfSync('sha256', secret, Buffer.from('pedals-v2'), Buffer.from('host->client'), 32));
 ```
 
 ## Sealed message (PROTOCOL.md §3, direction host→client, key_h2c)
@@ -40,10 +40,10 @@ exact same blob; tests must *decrypt* this embedded message, never re-seal and c
 | seq | 1 |
 | AAD (seq u64 LE) | `0100000000000000` |
 | nonce | `706564616c732d6e6f6e6365` (`pedals-nonce`) |
-| ciphertext (10 bytes) | `8b58f5073d8b010d6550` |
-| Poly1305 tag (16 bytes) | `5138d2966bdeed53ba46abe5967cb475` |
-| combined (nonce ‖ ct ‖ tag) | `706564616c732d6e6f6e63658b58f5073d8b010d65505138d2966bdeed53ba46abe5967cb475` |
-| **full WebSocket message** (seq ‖ combined) | `0100000000000000706564616c732d6e6f6e63658b58f5073d8b010d65505138d2966bdeed53ba46abe5967cb475` |
+| ciphertext (10 bytes) | `94d3740a19c7dc465ace` |
+| Poly1305 tag (16 bytes) | `5279fe452d7a661383a99da076062944` |
+| combined (nonce ‖ ct ‖ tag) | `706564616c732d6e6f6e636594d3740a19c7dc465ace5279fe452d7a661383a99da076062944` |
+| **full WebSocket message** (seq ‖ combined) | `0100000000000000706564616c732d6e6f6e636594d3740a19c7dc465ace5279fe452d7a661383a99da076062944` |
 
 Expected assertions in both suites:
 

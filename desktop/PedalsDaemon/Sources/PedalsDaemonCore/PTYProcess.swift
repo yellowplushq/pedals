@@ -26,6 +26,13 @@ public final class PTYProcess: @unchecked Sendable {
     private let exitSource: DispatchSourceProcess
     private var closed = false
 
+    /// Stdin the tty input queue would not accept yet (the child stopped
+    /// reading). Flushed by `writeSource` when the master becomes writable.
+    private var pendingStdin = Data()
+    /// Only exists while `pendingStdin` is non-empty.
+    private var writeSource: DispatchSourceWrite?
+    private static let maxPendingStdin = 1 << 20 // 1 MiB
+
     /// Called on `queue` with each chunk of raw PTY output.
     public var onOutput: (@Sendable (Data) -> Void)?
     /// Called on `queue` exactly once when the child exits, with the exit code
@@ -100,6 +107,12 @@ public final class PTYProcess: @unchecked Sendable {
         pid = childPid
         masterFD = master
 
+        // The master stays O_NONBLOCK for its whole life: a blocking write
+        // would stall the (shared) queue whenever the child stops reading
+        // stdin. Overflow goes to `pendingStdin` instead.
+        let flags = fcntl(master, F_GETFL)
+        _ = fcntl(master, F_SETFL, flags | O_NONBLOCK)
+
         readSource = DispatchSource.makeReadSource(fileDescriptor: master, queue: queue)
         exitSource = DispatchSource.makeProcessSource(
             identifier: childPid, eventMask: .exit, queue: queue
@@ -116,6 +129,7 @@ public final class PTYProcess: @unchecked Sendable {
     deinit {
         if !closed {
             closed = true
+            writeSource?.cancel()
             readSource.cancel()
         }
         if !exitSource.isCancelled { exitSource.cancel() }
@@ -155,21 +169,24 @@ public final class PTYProcess: @unchecked Sendable {
 
     private func drainPendingOutputAfterExit() {
         guard !closed else { return }
-        var flags = fcntl(masterFD, F_GETFL)
-        _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
+        // The master is O_NONBLOCK for life (set at spawn), so the reads
+        // below stop at EAGAIN instead of blocking.
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             let n = read(masterFD, &buffer, buffer.count)
             guard n > 0 else { break }
             onOutput?(Data(buffer[0..<n]))
         }
-        flags = fcntl(masterFD, F_GETFL)
-        _ = fcntl(masterFD, F_SETFL, flags & ~O_NONBLOCK)
     }
 
     private func closeMaster() {
         guard !closed else { return }
         closed = true
+        pendingStdin.removeAll()
+        // Cancelled first so it is off the fd before readSource's cancel
+        // handler (queued after it on this serial queue) closes masterFD.
+        writeSource?.cancel()
+        writeSource = nil
         readSource.cancel() // the cancel handler closes masterFD
     }
 
@@ -177,15 +194,58 @@ public final class PTYProcess: @unchecked Sendable {
 
     public func write(_ data: Data) {
         queue.async { [self] in
-            guard !closed else { return }
-            data.withUnsafeBytes { raw in
-                var offset = 0
-                while offset < raw.count {
-                    let n = Darwin.write(masterFD, raw.baseAddress! + offset, raw.count - offset)
-                    guard n > 0 else { return }
-                    offset += n
-                }
+            guard !closed, !data.isEmpty else { return }
+            guard pendingStdin.isEmpty else {
+                // Earlier stdin is still queued; append behind it to keep order.
+                bufferPendingStdin(data)
+                return
             }
+            let n = writeAvailable(data)
+            guard n >= 0 else { return }
+            if n < data.count { bufferPendingStdin(data.dropFirst(n)) }
+        }
+    }
+
+    /// Writes as much as the tty accepts without blocking (the master is
+    /// O_NONBLOCK). Returns the number of bytes consumed, or -1 on a hard
+    /// error (child side gone; exit is reported by exitSource). On `queue`.
+    private func writeAvailable(_ data: Data) -> Int {
+        data.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let n = Darwin.write(masterFD, raw.baseAddress! + offset, raw.count - offset)
+                if n > 0 { offset += n; continue }
+                if n < 0 && errno == EINTR { continue }
+                if n < 0 && errno == EAGAIN { break }
+                return -1
+            }
+            return offset
+        }
+    }
+
+    /// Queues stdin the tty would not accept and arms `writeSource`. Beyond
+    /// the cap the *newest* bytes are dropped: already-buffered bytes must
+    /// keep flowing unbroken, or the child would read a stream with a hole
+    /// spliced into its middle. On `queue`.
+    private func bufferPendingStdin(_ data: Data) {
+        let room = Self.maxPendingStdin - pendingStdin.count
+        guard room > 0 else { return }
+        pendingStdin.append(data.prefix(room))
+        guard writeSource == nil else { return }
+        let source = DispatchSource.makeWriteSource(fileDescriptor: masterFD, queue: queue)
+        source.setEventHandler { [weak self] in self?.flushPendingStdin() }
+        source.resume()
+        writeSource = source
+    }
+
+    private func flushPendingStdin() {
+        guard !closed, !pendingStdin.isEmpty else { return }
+        let n = writeAvailable(pendingStdin)
+        if n > 0 { pendingStdin.removeFirst(n) }
+        if n < 0 { pendingStdin.removeAll() }
+        if pendingStdin.isEmpty {
+            writeSource?.cancel()
+            writeSource = nil
         }
     }
 
@@ -224,6 +284,24 @@ public final class PTYProcess: @unchecked Sendable {
             }
             return name.isEmpty ? nil : name
         }
+    }
+
+    /// The shell's live working directory via `proc_pidinfo` (PROTOCOL.md §4:
+    /// `cwd` in the sessions list is live). `cd` in the interactive shell moves
+    /// it; nil when the process is gone or the query fails. Must be called on
+    /// the queue passed to `init`.
+    public func currentWorkingDirectory() -> String? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !closed else { return nil }
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else {
+            return nil
+        }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw in
+            String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+        return path.isEmpty ? nil : path
     }
 
     public func terminate() {

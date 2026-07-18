@@ -25,16 +25,16 @@ struct Serve: ParsableCommand {
         abstract: "Run the daemon in the foreground (PTY host + relay connection)."
     )
 
-    @Option(help: "Relay WebSocket URL; written to config.json for future runs.")
-    var relay: String?
+    @Option(help: "Pedals HTTPS service origin; written to config.json for future runs.")
+    var service: String?
 
     func run() throws {
         let home = PedalsHome()
-        if let relay {
-            guard let url = URL(string: relay),
-                  url.scheme == "ws" || url.scheme == "wss"
-            else { fail("--relay must be a ws:// or wss:// URL") }
-            try home.save(config: .init(relay: url.absoluteString))
+        if let service {
+            guard let url = validServiceURL(service) else {
+                fail("--service must be an https:// URL")
+            }
+            try home.save(config: .init(service: url.absoluteString))
         }
 
         let daemon: Daemon
@@ -47,8 +47,8 @@ struct Serve: ParsableCommand {
 
         print("pedals daemon started")
         print("  socket:  \(home.socketPath)")
-        print("  relay:   \(daemon.pairingInfo.relay.absoluteString)")
-        print("  room:    \(daemon.pairingInfo.roomId)")
+        print("  service:  \(daemon.hostIdentity.computer.serviceURL.absoluteString)")
+        print("  computer: \(daemon.hostIdentity.computer.computerID)")
         print("pair from iOS with: pedals pair")
 
         // Park the main thread; SIGINT/SIGTERM shut down cleanly.
@@ -77,7 +77,7 @@ struct Ls: ParsableCommand {
         let reply = try roundTripOrFail(["cmd": "ls"])
         let sessions = reply["sessions"] as? [[String: Any]] ?? []
         let client = reply["client"] as? String ?? "none"
-        let relay = reply["relay"] as? String ?? "?"
+        let service = reply["service"] as? String ?? "?"
         if sessions.isEmpty {
             print("no sessions")
         }
@@ -90,7 +90,7 @@ struct Ls: ParsableCommand {
             let rows = session["rows"] as? Int ?? 0
             print("[\(id)] \(alive ? "live " : "exited") \(cols)x\(rows)  \(title)  (\(cwd))")
         }
-        print("client: \(client)   relay: \(relay)")
+        print("client: \(client)   service: \(service)")
     }
 }
 
@@ -120,8 +120,8 @@ struct Status: ParsableCommand {
 
     func run() throws {
         let reply = try roundTripOrFail(["cmd": "status"])
-        print("relay:  \(reply["relay"] as? String ?? "?") (\(reply["state"] as? String ?? "?"))")
-        print("room:   \(reply["room"] as? String ?? "?")")
+        print("service:  \(reply["service"] as? String ?? "?") (\(reply["state"] as? String ?? "?"))")
+        print("computer: \(reply["computer"] as? String ?? "?")")
         print("client: \(reply["client"] as? String ?? "none")")
         print("uptime: \(Int(reply["uptime"] as? Double ?? 0))s")
     }
@@ -129,53 +129,52 @@ struct Status: ParsableCommand {
 
 struct Pair: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show the pairing QR code and pedals:// URL."
+        abstract: "Create a 15-minute iPhone pairing code."
     )
 
-    @Flag(help: "Generate a fresh room and secret (invalidates the old pairing).")
+    @Flag(help: "Register a fresh computer identity and E2EE secret.")
     var reset = false
 
-    @Option(help: "Relay WebSocket URL; written to config.json for future runs.")
-    var relay: String?
+    @Option(help: "Pedals HTTPS service origin; written to config.json for future runs.")
+    var service: String?
 
     func run() throws {
         let home = PedalsHome()
-        if let relay {
-            guard let url = URL(string: relay),
-                  url.scheme == "ws" || url.scheme == "wss"
-            else { fail("--relay must be a ws:// or wss:// URL") }
-            try home.save(config: .init(relay: url.absoluteString))
+        if let service {
+            guard let url = validServiceURL(service) else {
+                fail("--service must be an https:// URL")
+            }
+            try home.save(config: .init(service: url.absoluteString))
         }
 
-        // Prefer the running daemon (it reconnects to the new room on reset);
-        // fall back to operating on ~/.pedals directly when it is not running.
-        let url: String
-        if let reply = try? ControlClient.roundTrip(
-            socketPath: home.socketPath, request: ["cmd": "pair", "reset": reset]
-        ), reply["ok"] as? Bool == true, let replyURL = reply["url"] as? String {
-            url = replyURL
-        } else {
-            url = try localPairingURL(home: home)
-        }
+        let code = try PairCommandResolver.resolve(
+            socketPath: home.socketPath,
+            reset: reset,
+            offline: {
+                throw ValidationError(
+                    "The Pedals daemon must be running while a pairing code is active. "
+                        + "Start it with `pedals serve`, then run this command again."
+                )
+            }
+        )
 
-        print(try QRRenderer.ansi(text: url))
-        print("Scan the QR from the Pedals iOS app, or open this URL on the device:")
-        print(url)
+        let pairingCode = try PairingCode(code)
+        print("Pairing code: \(pairingCode.formatted)")
+        print("Expires in 15 minutes. Keep the pairing page open until the iPhone connects.")
     }
+}
 
-    private func localPairingURL(home: PedalsHome) throws -> String {
-        if !reset, let existing = home.loadPairing() {
-            return existing.url.absoluteString
-        }
-        let relayURL = home.loadConfig().flatMap { URL(string: $0.relay) }
-            ?? home.loadPairing()?.relay
-        guard let relayURL else {
-            fail("no relay configured — pass --relay wss://<host> once, or edit \(home.configURL.path)")
-        }
-        let pairing = try PairingInfo.generate(relay: relayURL)
-        try home.save(pairing: pairing)
-        return pairing.url.absoluteString
-    }
+private func validServiceURL(_ value: String) -> URL? {
+    guard let url = URL(string: value),
+          url.host != nil, url.user == nil, url.password == nil,
+          url.query == nil, url.fragment == nil
+    else { return nil }
+    let scheme = url.scheme?.lowercased()
+    let host = url.host!.lowercased()
+    guard scheme == "https"
+        || (scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host))
+    else { return nil }
+    return url
 }
 
 // MARK: - helpers

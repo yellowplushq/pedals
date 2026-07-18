@@ -10,6 +10,8 @@ public enum PeerRole: String, Codable, Sendable {
 public struct SessionInfo: Codable, Equatable, Sendable {
     public var id: Int
     public var title: String
+    /// The session's live working directory (daemon polls the foreground
+    /// process cwd; used to open a new terminal in the same directory).
     public var cwd: String
     public var rows: Int
     public var cols: Int
@@ -30,43 +32,61 @@ public struct SessionInfo: Codable, Equatable, Sendable {
 }
 
 /// ctl JSON messages (PROTOCOL.md §4). Wire form is `{"t":"<kind>", ...}`.
+///
+/// ctl only flows on the control channel. Data channels (one WebSocket per
+/// attached session) carry stdin/stdout/resize/replay; connecting a data
+/// channel is itself the "attach", so there is no attach/detach ctl.
 public enum ControlMessage: Equatable, Sendable {
-    /// First frame after connect, from each side.
-    case hello(who: PeerRole, connEpoch: UInt32, ver: Int)
+    /// First frame after connect, from each side. `host` is the daemon's
+    /// machine name, sent by the host so clients can label the computer.
+    case hello(
+        who: PeerRole,
+        principal: String,
+        connEpoch: UInt32,
+        nonce: Data,
+        ver: Int,
+        host: String?
+    )
+    /// First connection-bound frame. It proves the sender derived keys from
+    /// both fresh nonces before application traffic is accepted.
+    case ready(who: PeerRole, echoNonce: Data)
+    /// Client→host, session channels only: request a fresh replay snapshot.
+    case requestReplay
     /// host→client: full session list on hello and on any change.
     case sessions(list: [SessionInfo])
-    /// client→host: create a session. `cwd` nil ⇒ JSON null.
-    case create(cwd: String?, cols: Int, rows: Int)
-    /// host→client: reply to `create`.
-    case created(id: Int)
+    /// client→host: create a session. `cwd` nil ⇒ JSON null (daemon: home).
+    /// `req` is a client-chosen random tag echoed back in `created`.
+    case create(cwd: String?, cols: Int, rows: Int, req: UInt32?)
+    /// host→client: reply to `create`, broadcast to every control client.
+    /// `req` echoes the tag from `create` so the requesting client can tell
+    /// its own terminal apart from ones created by other devices.
+    case created(id: Int, req: UInt32?)
     /// client→host: close a session.
     case close(id: Int)
-    /// client→host: subscribe to a session's stdout (host sends replay then live stdout).
-    case attach(id: Int)
-    /// client→host: stop streaming a session.
-    case detach(id: Int)
     /// host→client: session title changed.
     case title(id: Int, title: String)
     /// host→client: session process exited.
     case exit(id: Int, code: Int)
-    /// either direction: non-fatal error report.
-    case err(msg: String)
+    /// either direction: non-fatal error report. `req` echoes the tag of the
+    /// `create` that failed (nil for errors not tied to a request), so the
+    /// requesting client can stop waiting and surface the message.
+    case err(msg: String, req: UInt32? = nil)
 }
 
 extension ControlMessage: Codable {
     private enum CodingKeys: String, CodingKey {
-        case t, who, connEpoch, ver, list, cwd, cols, rows, id, title, code, msg
+        case t, who, principal, connEpoch, nonce, ver, host, echoNonce, list, cwd, cols, rows, id, title, code, msg, req
     }
 
     private var kind: String {
         switch self {
         case .hello: "hello"
+        case .ready: "ready"
+        case .requestReplay: "requestReplay"
         case .sessions: "sessions"
         case .create: "create"
         case .created: "created"
         case .close: "close"
-        case .attach: "attach"
-        case .detach: "detach"
         case .title: "title"
         case .exit: "exit"
         case .err: "err"
@@ -77,17 +97,29 @@ extension ControlMessage: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kind, forKey: .t)
         switch self {
-        case let .hello(who, connEpoch, ver):
+        case let .hello(who, principal, connEpoch, nonce, ver, host):
             try container.encode(who, forKey: .who)
+            try container.encode(principal, forKey: .principal)
             try container.encode(connEpoch, forKey: .connEpoch)
+            try container.encode(nonce, forKey: .nonce)
             try container.encode(ver, forKey: .ver)
+            try container.encodeIfPresent(host, forKey: .host)
+        case let .ready(who, echoNonce):
+            try container.encode(who, forKey: .who)
+            try container.encode(echoNonce, forKey: .echoNonce)
+        case .requestReplay:
+            break
         case let .sessions(list):
             try container.encode(list, forKey: .list)
-        case let .create(cwd, cols, rows):
+        case let .create(cwd, cols, rows, req):
             try container.encode(cwd, forKey: .cwd) // nil encodes as JSON null per spec
             try container.encode(cols, forKey: .cols)
             try container.encode(rows, forKey: .rows)
-        case let .created(id), let .close(id), let .attach(id), let .detach(id):
+            try container.encodeIfPresent(req, forKey: .req)
+        case let .created(id, req):
+            try container.encode(id, forKey: .id)
+            try container.encodeIfPresent(req, forKey: .req)
+        case let .close(id):
             try container.encode(id, forKey: .id)
         case let .title(id, title):
             try container.encode(id, forKey: .id)
@@ -95,8 +127,9 @@ extension ControlMessage: Codable {
         case let .exit(id, code):
             try container.encode(id, forKey: .id)
             try container.encode(code, forKey: .code)
-        case let .err(msg):
+        case let .err(msg, req):
             try container.encode(msg, forKey: .msg)
+            try container.encodeIfPresent(req, forKey: .req)
         }
     }
 
@@ -107,25 +140,35 @@ extension ControlMessage: Codable {
         case "hello":
             self = .hello(
                 who: try container.decode(PeerRole.self, forKey: .who),
+                principal: try container.decode(String.self, forKey: .principal),
                 connEpoch: try container.decode(UInt32.self, forKey: .connEpoch),
-                ver: try container.decode(Int.self, forKey: .ver)
+                nonce: try container.decode(Data.self, forKey: .nonce),
+                ver: try container.decode(Int.self, forKey: .ver),
+                host: try container.decodeIfPresent(String.self, forKey: .host)
             )
+        case "ready":
+            self = .ready(
+                who: try container.decode(PeerRole.self, forKey: .who),
+                echoNonce: try container.decode(Data.self, forKey: .echoNonce)
+            )
+        case "requestReplay":
+            self = .requestReplay
         case "sessions":
             self = .sessions(list: try container.decode([SessionInfo].self, forKey: .list))
         case "create":
             self = .create(
                 cwd: try container.decodeIfPresent(String.self, forKey: .cwd),
                 cols: try container.decode(Int.self, forKey: .cols),
-                rows: try container.decode(Int.self, forKey: .rows)
+                rows: try container.decode(Int.self, forKey: .rows),
+                req: try container.decodeIfPresent(UInt32.self, forKey: .req)
             )
         case "created":
-            self = .created(id: try container.decode(Int.self, forKey: .id))
+            self = .created(
+                id: try container.decode(Int.self, forKey: .id),
+                req: try container.decodeIfPresent(UInt32.self, forKey: .req)
+            )
         case "close":
             self = .close(id: try container.decode(Int.self, forKey: .id))
-        case "attach":
-            self = .attach(id: try container.decode(Int.self, forKey: .id))
-        case "detach":
-            self = .detach(id: try container.decode(Int.self, forKey: .id))
         case "title":
             self = .title(
                 id: try container.decode(Int.self, forKey: .id),
@@ -137,7 +180,10 @@ extension ControlMessage: Codable {
                 code: try container.decode(Int.self, forKey: .code)
             )
         case "err":
-            self = .err(msg: try container.decode(String.self, forKey: .msg))
+            self = .err(
+                msg: try container.decode(String.self, forKey: .msg),
+                req: try container.decodeIfPresent(UInt32.self, forKey: .req)
+            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .t, in: container,

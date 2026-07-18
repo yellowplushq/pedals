@@ -2,17 +2,27 @@
   "name": "pedals-relay",
   "version": "1.0.0",
   "private": true,
-  "description": "Pedals zero-knowledge WebSocket relay (protocol v1, section 1)",
+  "description": "Pedals authenticated relay, binding state, and APNs provider",
   "type": "module",
-  "main": "server.mjs",
+  "main": "src/worker.mjs",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "start": "wrangler dev --local",
+    "dev": "wrangler dev --local",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "db:migrate:local": "wrangler d1 migrations apply pedals --local",
+    "db:migrate:remote": "wrangler d1 migrations apply pedals --remote",
+    "test": "npm run test:node && npm run test:worker",
+    "test:node": "node --test test/vectors.test.mjs test/apns.unit.test.mjs test/deploy-output.unit.test.mjs test/site.unit.test.mjs",
+    "test:worker": "vitest run --max-workers=1 --no-isolate",
+    "test:contract": "node test/contract.mjs"
   },
-  "dependencies": {
-    "ws": "^8.18.0"
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.6",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.112.0"
   }
 }

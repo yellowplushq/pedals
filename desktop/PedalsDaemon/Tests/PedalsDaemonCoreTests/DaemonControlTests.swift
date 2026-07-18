@@ -5,11 +5,12 @@ import XCTest
 @testable import PedalsDaemonCore
 
 /// Full daemon against its unix control socket (PROTOCOL.md §5): ls / new /
-/// kill / pair / status. The relay URL points at a closed port; the relay
+/// kill / pair / status. The service points at a closed port; the relay
 /// client just keeps retrying, which the control plane must not depend on.
 final class DaemonControlTests: XCTestCase {
     private var home: PedalsHome!
     private var daemon: Daemon!
+    private var factory: IdentityFactory!
 
     override func setUpWithError() throws {
         // sockaddr_un.sun_path caps unix socket paths at 104 bytes, so the
@@ -19,10 +20,12 @@ final class DaemonControlTests: XCTestCase {
                 "pedals-t-\(UUID().uuidString.prefix(8))", isDirectory: true
             )
         home = PedalsHome(directory: directory)
-        try home.save(config: .init(relay: "ws://127.0.0.1:1"))
+        try home.save(config: .init(service: "https://127.0.0.1:1"))
+        factory = IdentityFactory()
         daemon = try Daemon(
             home: home,
-            sessionOptions: SessionManager.Options(shell: "/bin/sh", shellArguments: [])
+            sessionOptions: SessionManager.Options(shell: "/bin/sh", shellArguments: []),
+            serviceActions: factory.actions
         )
         try daemon.start()
     }
@@ -41,7 +44,7 @@ final class DaemonControlTests: XCTestCase {
         XCTAssertEqual(reply["ok"] as? Bool, true)
         XCTAssertEqual((reply["sessions"] as? [Any])?.count, 0)
         XCTAssertEqual(reply["client"] as? String, "none")
-        XCTAssertEqual(reply["relay"] as? String, "ws://127.0.0.1:1")
+        XCTAssertEqual(reply["service"] as? String, "https://127.0.0.1:1")
 
         reply = try send(["cmd": "new"])
         XCTAssertEqual(reply["ok"] as? Bool, true)
@@ -66,29 +69,96 @@ final class DaemonControlTests: XCTestCase {
         XCTAssertNotNil(reply["err"])
     }
 
-    func testPairReturnsURLAndResetRotatesRoom() throws {
+    func testPairReturnsSingleUseCodesAndResetRotatesComputer() throws {
+        let originalIdentity = try XCTUnwrap(home.loadIdentity())
         let first = try send(["cmd": "pair"])
         XCTAssertEqual(first["ok"] as? Bool, true)
-        let firstInfo = try PairingInfo(urlString: try XCTUnwrap(first["url"] as? String))
+        let firstCode = try PairingCode(try XCTUnwrap(first["code"] as? String))
+        XCTAssertNotNil(first["expiresAt"] as? Int64)
 
-        let unchanged = try send(["cmd": "pair"])
-        XCTAssertEqual(unchanged["url"] as? String, first["url"] as? String)
+        let next = try send(["cmd": "pair"])
+        let nextCode = try PairingCode(try XCTUnwrap(next["code"] as? String))
+        XCTAssertNotEqual(nextCode, firstCode)
+
+        factory.clearEvents()
+        let reset = try send(["cmd": "pair", "reset": true])
+        _ = try PairingCode(try XCTUnwrap(reset["code"] as? String))
+        let resetIdentity = try XCTUnwrap(home.loadIdentity())
+        XCTAssertNotEqual(resetIdentity.computer.computerID, originalIdentity.computer.computerID)
+        XCTAssertNotEqual(resetIdentity.computer.secret, originalIdentity.computer.secret)
+
+        let resetEvents = factory.events
+        XCTAssertEqual(resetEvents.count, 3)
+        XCTAssertTrue(resetEvents[0].hasPrefix("delete:"))
+        XCTAssertEqual(resetEvents[1], "create")
+        XCTAssertTrue(resetEvents[2].hasPrefix("pairing:"))
+    }
+
+    func testResetRevocationFailurePreservesOldIdentityWithoutFallbackRegistration() throws {
+        let previous = try XCTUnwrap(home.loadIdentity())
+        factory.clearEvents()
+        factory.failDelete = true
 
         let reset = try send(["cmd": "pair", "reset": true])
-        let resetInfo = try PairingInfo(urlString: try XCTUnwrap(reset["url"] as? String))
-        XCTAssertNotEqual(resetInfo.roomId, firstInfo.roomId)
-        XCTAssertNotEqual(resetInfo.secret, firstInfo.secret)
 
-        // The rotated pairing must be persisted for the next daemon start.
-        XCTAssertEqual(home.loadPairing()?.roomId, resetInfo.roomId)
+        XCTAssertEqual(reset["ok"] as? Bool, false)
+        XCTAssertTrue((reset["err"] as? String)?.contains("revocation failed") == true)
+        XCTAssertEqual(try home.loadIdentity(), previous)
+        XCTAssertNil(try home.loadIdentityResetState())
+        XCTAssertEqual(factory.events, ["delete:\(previous.computer.computerID)"])
+
+        factory.failDelete = false
+        let ordinaryPair = try send(["cmd": "pair"])
+        XCTAssertEqual(ordinaryPair["ok"] as? Bool, true)
+        XCTAssertEqual(try home.loadIdentity(), previous)
+    }
+
+    func testResetCreateFailureLeavesFailClosedJournalAndResumesWithoutRedeleting() throws {
+        let previous = try XCTUnwrap(home.loadIdentity())
+        factory.clearEvents()
+        factory.failNextCreate = true
+
+        let failed = try send(["cmd": "pair", "reset": true])
+
+        XCTAssertEqual(failed["ok"] as? Bool, false)
+        XCTAssertTrue((failed["err"] as? String)?.contains("replacement registration failed") == true)
+        XCTAssertEqual(try home.loadIdentity(), previous)
+        XCTAssertEqual(try home.loadIdentityResetState()?.phase, .revoked)
+        XCTAssertEqual(
+            factory.events,
+            ["delete:\(previous.computer.computerID)", "create"]
+        )
+
+        let unsafePair = try send(["cmd": "pair"])
+        XCTAssertEqual(unsafePair["ok"] as? Bool, false)
+        XCTAssertTrue((unsafePair["err"] as? String)?.contains("reset is incomplete") == true)
+        XCTAssertThrowsError(
+            try Daemon(
+                home: home,
+                sessionOptions: SessionManager.Options(shell: "/bin/sh", shellArguments: []),
+                serviceActions: factory.actions
+            )
+        ) { error in
+            guard case Daemon.DaemonError.identityResetPending(.revoked) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        factory.clearEvents()
+        let resumed = try send(["cmd": "pair", "reset": true])
+        XCTAssertEqual(resumed["ok"] as? Bool, true)
+        XCTAssertEqual(factory.events.first, "create")
+        XCTAssertFalse(factory.events.contains { $0.hasPrefix("delete:") })
+        XCTAssertNil(try home.loadIdentityResetState())
+        XCTAssertNotEqual(try home.loadIdentity(), previous)
     }
 
     func testStatusShape() throws {
         let reply = try send(["cmd": "status"])
         XCTAssertEqual(reply["ok"] as? Bool, true)
-        XCTAssertEqual(reply["relay"] as? String, "ws://127.0.0.1:1")
+        XCTAssertEqual(reply["service"] as? String, "https://127.0.0.1:1")
         XCTAssertEqual(reply["client"] as? String, "none")
-        XCTAssertEqual((reply["room"] as? String)?.count, 32)
+        XCTAssertEqual((reply["computer"] as? String)?.count, 32)
         XCTAssertNotNil(reply["uptime"])
         XCTAssertTrue(["connected", "connecting"].contains(reply["state"] as? String ?? ""))
     }
@@ -99,5 +169,80 @@ final class DaemonControlTests: XCTestCase {
 
         let missingId = try send(["cmd": "kill"])
         XCTAssertEqual(missingId["ok"] as? Bool, false)
+    }
+}
+
+private final class IdentityFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var computerCounter = 0
+    private var inviteCounter = 0
+    private var recordedEvents: [String] = []
+    private var shouldFailDelete = false
+    private var shouldFailNextCreate = false
+
+    private enum FactoryError: Error {
+        case requestedCreateFailure
+        case requestedDeleteFailure
+    }
+
+    var events: [String] { lock.withLock { recordedEvents } }
+
+    var failDelete: Bool {
+        get { lock.withLock { shouldFailDelete } }
+        set { lock.withLock { shouldFailDelete = newValue } }
+    }
+
+    var failNextCreate: Bool {
+        get { lock.withLock { shouldFailNextCreate } }
+        set { lock.withLock { shouldFailNextCreate = newValue } }
+    }
+
+    func clearEvents() {
+        lock.withLock { recordedEvents.removeAll() }
+    }
+
+    var actions: ServiceActions {
+        ServiceActions(
+            createComputer: { [self] serviceURL in
+                try lock.withLock {
+                    recordedEvents.append("create")
+                    if shouldFailNextCreate {
+                        shouldFailNextCreate = false
+                        throw FactoryError.requestedCreateFailure
+                    }
+                    computerCounter += 1
+                    let hex = String(format: "%032x", computerCounter)
+                    let binding = try ComputerBinding(
+                        serviceURL: serviceURL,
+                        computerID: hex,
+                        secret: Data(repeating: UInt8(computerCounter), count: 32)
+                    )
+                    return HostIdentity(computer: binding, hostToken: "host-\(hex)")
+                }
+            },
+            deleteComputer: { [self] identity in
+                try lock.withLock {
+                    recordedEvents.append("delete:\(identity.computer.computerID)")
+                    if shouldFailDelete {
+                        throw FactoryError.requestedDeleteFailure
+                    }
+                }
+            },
+            createPairingSession: { [self] identity in
+                try lock.withLock {
+                    recordedEvents.append("pairing:\(identity.computer.computerID)")
+                    inviteCounter += 1
+                    return HostPairingSession(
+                        sessionID: String(format: "%032x", inviteCounter),
+                        code: try PairingCode(String(format: "%08d", inviteCounter)),
+                        expiresAt: Int64(Date().timeIntervalSince1970) + 900,
+                        privateKey: Data(repeating: UInt8(inviteCounter), count: 32)
+                    )
+                }
+            },
+            pairingSessionStatus: { _, _ in .waiting },
+            completePairingSession: { _, _, _ in },
+            cancelPairingSession: { _, _ in }
+        )
     }
 }

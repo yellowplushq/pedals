@@ -21,6 +21,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .tint(PedalsTheme.content)
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {

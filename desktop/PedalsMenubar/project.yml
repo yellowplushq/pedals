@@ -15,17 +15,19 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: Pedals
-        CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.yellowplus.pedals.menubar
-        PRODUCT_NAME: PedalsMenubar
+        PRODUCT_BUNDLE_IDENTIFIER: in.eyhn.pedals.menubar
+        PRODUCT_NAME: Pedals
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
-        ENABLE_HARDENED_RUNTIME: false
+        ENABLE_HARDENED_RUNTIME: true
         COMBINE_HIDPI_IMAGES: true
         GENERATE_INFOPLIST_FILE: false

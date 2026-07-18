@@ -24,6 +24,7 @@ final class ThemePickerViewController: UITableViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Theme"
+        view.tintColor = PedalsTheme.uiContent
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "theme")
     }
 

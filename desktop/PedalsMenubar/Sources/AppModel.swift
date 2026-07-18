@@ -7,11 +7,11 @@ enum RelayState: Equatable {
     case connecting
     case connected
 
-    var color: Color {
+    var indicatorOpacity: Double {
         switch self {
-        case .daemonNotRunning: .gray
-        case .connecting: .orange
-        case .connected: .green
+        case .daemonNotRunning: 0.28
+        case .connecting: 0.58
+        case .connected: 1
         }
     }
 
@@ -27,22 +27,47 @@ enum RelayState: Equatable {
 @MainActor
 final class AppModel: ObservableObject {
     static let daemonPathKey = "daemonBinaryPath"
-    static let defaultDaemonPath =
-        "/Users/eyhn/Projects/yellowplus/pedals/desktop/PedalsDaemon/.build/debug/pedals"
+    static let onboardingCompletionKey = "completedDesktopOnboardingV2"
+    static var defaultDaemonPath: String {
+        if let bundledDaemon = Bundle.main.url(
+            forResource: "pedals",
+            withExtension: nil,
+            subdirectory: nil
+        ) {
+            return bundledDaemon.path
+        }
+
+        // Xcode development builds do not embed the daemon. Keep the source-tree
+        // fallback so the menu app remains convenient to run during development.
+        return URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("PedalsDaemon/.build/debug/pedals")
+            .path
+    }
 
     @Published private(set) var daemonReachable = false
     @Published private(set) var sessions: [SessionInfo] = []
     @Published private(set) var clientConnected = false
     @Published private(set) var relayState: RelayState = .daemonNotRunning
-    @Published private(set) var pairingURL: String?
+    @Published private(set) var pairingCode: String?
+    @Published private(set) var pairingExpiresAt: Date?
+    @Published private(set) var isLoadingPairingCode = false
+    @Published private(set) var isStartingDaemon = false
+    @Published private(set) var hasCompletedOnboarding: Bool
     @Published private(set) var managesDaemon = false
     @Published var lastError: String?
 
     private let client = DaemonClient()
     private var daemonProcess: Process?
+    private var pairingTask: Task<Void, Never>?
     private var terminationObserver: (any NSObjectProtocol)?
 
     init() {
+        hasCompletedOnboarding = UserDefaults.standard.bool(
+            forKey: Self.onboardingCompletionKey
+        )
         // A spawned daemon is a child of this app; take it down when we quit.
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
@@ -75,7 +100,8 @@ final class AppModel: ObservableObject {
             sessions = []
             clientConnected = false
             relayState = .daemonNotRunning
-            pairingURL = nil
+            pairingCode = nil
+            pairingExpiresAt = nil
             if case DaemonClientError.socketUnavailable = error {
                 lastError = nil // expected when the daemon is stopped
             } else {
@@ -130,20 +156,47 @@ final class AppModel: ObservableObject {
 
     // MARK: Pairing
 
-    func fetchPairingURL() {
-        Task {
+    func fetchPairingCode() {
+        pairingTask?.cancel()
+        pairingCode = nil
+        pairingExpiresAt = nil
+        isLoadingPairingCode = true
+        pairingTask = Task { [weak self] in
+            guard let self else { return }
             do {
-                pairingURL = try await client.pair()["url"]?.stringValue
-                if pairingURL == nil { lastError = "Daemon returned no pairing URL" }
+                let response = try await client.pair()
+                let code = response["code"]?.stringValue
+                let expiresAt = response["expiresAt"]?.doubleValue
+                guard !Task.isCancelled else { return }
+                pairingCode = code
+                pairingExpiresAt = expiresAt.map { Date(timeIntervalSince1970: $0) }
+                if code == nil { lastError = "Daemon returned no pairing code" }
             } catch {
-                pairingURL = nil
+                guard !Task.isCancelled else { return }
+                pairingCode = nil
+                pairingExpiresAt = nil
                 lastError = error.localizedDescription
             }
+            isLoadingPairingCode = false
         }
     }
 
-    func clearPairingURL() {
-        pairingURL = nil
+    func clearPairingCode() {
+        pairingTask?.cancel()
+        pairingTask = nil
+        let shouldRevoke = pairingCode != nil || isLoadingPairingCode
+        pairingCode = nil
+        pairingExpiresAt = nil
+        isLoadingPairingCode = false
+        if shouldRevoke {
+            Task { [client] in _ = try? await client.cancelPair() }
+        }
+    }
+
+    func completeOnboarding() {
+        UserDefaults.standard.set(true, forKey: Self.onboardingCompletionKey)
+        hasCompletedOnboarding = true
+        clearPairingCode()
     }
 
     // MARK: Daemon lifecycle
@@ -154,6 +207,7 @@ final class AppModel: ObservableObject {
 
     func startDaemon() {
         guard daemonProcess == nil, !daemonReachable else { return }
+        isStartingDaemon = true
         let process = Process()
         process.executableURL = URL(fileURLWithPath: daemonBinaryPath)
         process.arguments = ["serve"]
@@ -172,9 +226,14 @@ final class AppModel: ObservableObject {
             managesDaemon = true
             lastError = nil
         } catch {
+            isStartingDaemon = false
             lastError = "Could not start daemon: \(error.localizedDescription)"
         }
-        Task { await refresh() }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            await self?.refresh()
+            self?.isStartingDaemon = false
+        }
     }
 
     func stopDaemon() {

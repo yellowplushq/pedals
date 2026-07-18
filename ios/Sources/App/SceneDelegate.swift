@@ -11,29 +11,24 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     ) {
         guard let windowScene = scene as? UIWindowScene else { return }
 
-        let services = AppServices()
+        guard let appDelegate = UIApplication.shared.delegate as? AppDelegate else { return }
+        let services = appDelegate.services
         self.services = services
 
         let window = UIWindow(windowScene: windowScene)
-        // Dark-first: the terminal canvas is dark regardless of system setting,
-        // so the chrome (rail, drawer, sheets) must match.
+        // Pedals has a fixed black-and-white shell. Terminal ANSI colors stay
+        // inside the terminal canvas and never become application chrome.
         window.overrideUserInterfaceStyle = .dark
+        window.backgroundColor = PedalsTheme.uiCanvas
+        window.tintColor = PedalsTheme.uiContent
         window.rootViewController = MainViewController(services: services)
         window.makeKeyAndVisible()
         self.window = window
 
-        handle(urlContexts: connectionOptions.urlContexts)
     }
 
-    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
-        handle(urlContexts: URLContexts)
-    }
-
-    private func handle(urlContexts: Set<UIOpenURLContext>) {
-        for context in urlContexts where services?.handlePairingURL(context.url) == true {
-            // Pairing UI (scanner / paste sheet) is now stale; drop it.
-            window?.rootViewController?.presentedViewController?.dismiss(animated: true)
-            return
-        }
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        services?.terminals.kickAll()
+        services?.refreshStatusSurfaces()
     }
 }

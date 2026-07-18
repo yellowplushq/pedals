@@ -7,10 +7,10 @@ import XCTest
 /// shared/PedalsKit/TESTVECTORS.md.
 ///
 ///   secret     = 32 bytes of 0x42
-///   key_h2c    = HKDF-SHA256(ikm=secret, salt="pedals-v1", info="host->client", 32)
-///              = f5f1ae11b574be72b8afa4068d3509bf2d8f8d469d1ed16651d41406f923e641
-///   key_c2h    = HKDF-SHA256(ikm=secret, salt="pedals-v1", info="client->host", 32)
-///              = d4f715a850ee4d287fd5aba0d5dad7145fe93a9a4f22223a49bfa91b285ac333
+///   key_h2c    = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="host->client", 32)
+///              = 6972bc6da52c7ca19a55c1304c25846b032531a6142175312d54fdf09592ff40
+///   key_c2h    = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="client->host", 32)
+///              = 92961f97fbed1c21af672ab1f143c8b13589b10b849b0afed483aaff6cc4b3b7
 ///
 /// Sealed-message vector (direction host->client, key_h2c):
 ///   plaintext  = ctl frame: type 0x00 || sessionId 0 (u32 LE) || "hello"
@@ -20,8 +20,8 @@ import XCTest
 ///                (nonces are random on the wire; this one was fixed once at vector
 ///                 generation time so both implementations can assert exact bytes)
 ///   message    = seq || nonce || ciphertext || tag
-///              = 0100000000000000706564616c732d6e6f6e63658b58f5073d8b010d
-///                65505138d2966bdeed53ba46abe5967cb475
+///              = 0100000000000000706564616c732d6e6f6e636594d3740a19c7dc46
+///                5ace5279fe452d7a661383a99da076062944
 final class TestVectorTests: XCTestCase {
     private let secret = Data(repeating: 0x42, count: 32)
 
@@ -32,14 +32,14 @@ final class TestVectorTests: XCTestCase {
     func testHKDFHostToClientVector() {
         XCTAssertEqual(
             hex(KeyDerivation.hostToClientKey(secret: secret)),
-            "f5f1ae11b574be72b8afa4068d3509bf2d8f8d469d1ed16651d41406f923e641"
+            "6972bc6da52c7ca19a55c1304c25846b032531a6142175312d54fdf09592ff40"
         )
     }
 
     func testHKDFClientToHostVector() {
         XCTAssertEqual(
             hex(KeyDerivation.clientToHostKey(secret: secret)),
-            "d4f715a850ee4d287fd5aba0d5dad7145fe93a9a4f22223a49bfa91b285ac333"
+            "92961f97fbed1c21af672ab1f143c8b13589b10b849b0afed483aaff6cc4b3b7"
         )
     }
 
@@ -47,8 +47,8 @@ final class TestVectorTests: XCTestCase {
         let message = Data(hexString:
             "0100000000000000" // seq = 1, u64 LE
             + "706564616c732d6e6f6e6365" // nonce "pedals-nonce"
-            + "8b58f5073d8b010d6550" // ciphertext (10 bytes)
-            + "5138d2966bdeed53ba46abe5967cb475" // Poly1305 tag (16 bytes)
+            + "94d3740a19c7dc465ace" // ciphertext (10 bytes)
+            + "5279fe452d7a661383a99da076062944" // Poly1305 tag (16 bytes)
         )!
         var client = SecureChannel(secret: secret, role: .client)
         let plaintext = try client.open(message)
@@ -62,8 +62,8 @@ final class TestVectorTests: XCTestCase {
 
     func testSealedMessageVectorRejectsReplay() throws {
         let message = Data(hexString:
-            "0100000000000000706564616c732d6e6f6e63658b58f5073d8b010d"
-            + "65505138d2966bdeed53ba46abe5967cb475"
+            "0100000000000000706564616c732d6e6f6e636594d3740a19c7dc46"
+            + "5ace5279fe452d7a661383a99da076062944"
         )!
         var client = SecureChannel(secret: secret, role: .client)
         _ = try client.open(message)
@@ -78,8 +78,8 @@ final class TestVectorTests: XCTestCase {
     /// The vector's host->client blob must not open with the client->host key.
     func testSealedMessageVectorDirectionality() {
         let message = Data(hexString:
-            "0100000000000000706564616c732d6e6f6e63658b58f5073d8b010d"
-            + "65505138d2966bdeed53ba46abe5967cb475"
+            "0100000000000000706564616c732d6e6f6e636594d3740a19c7dc46"
+            + "5ace5279fe452d7a661383a99da076062944"
         )!
         var host = SecureChannel(secret: secret, role: .host)
         XCTAssertThrowsError(try host.open(message)) { error in

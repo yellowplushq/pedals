@@ -1,4 +1,4 @@
-// Node reference implementation of the Pedals E2EE (protocol v1 §2-4).
+// Node reference implementation of the Pedals E2EE protocol v2.
 //
 // Wire message = seq (u64 LE) || nonce(12) || ciphertext || tag(16)
 // where nonce||ciphertext||tag is the CryptoKit ChaChaPoly "combined"
@@ -14,7 +14,7 @@ import {
   randomBytes,
 } from "node:crypto";
 
-const HKDF_SALT = Buffer.from("pedals-v1", "utf8");
+const HKDF_SALT = Buffer.from("pedals-v2", "utf8");
 const INFO_H2C = Buffer.from("host->client", "utf8");
 const INFO_C2H = Buffer.from("client->host", "utf8");
 const KEY_LEN = 32;
@@ -27,11 +27,15 @@ export function deriveKey(secret, info) {
   return Buffer.from(hkdfSync("sha256", secret, HKDF_SALT, info, KEY_LEN));
 }
 
-/** Derive both direction keys: { h2c, c2h }. */
-export function deriveKeys(secret) {
+/**
+ * Derive both direction keys: { h2c, c2h }, bound to a channel (§3). Pass a
+ * numeric sid for a session channel; omit (or null) for the control channel.
+ */
+export function deriveKeys(secret, sid = null) {
+  const suffix = Buffer.from(sid == null ? "" : `:session:${sid}`, "utf8");
   return {
-    h2c: deriveKey(secret, INFO_H2C),
-    c2h: deriveKey(secret, INFO_C2H),
+    h2c: deriveKey(secret, Buffer.concat([INFO_H2C, suffix])),
+    c2h: deriveKey(secret, Buffer.concat([INFO_C2H, suffix])),
   };
 }
 
@@ -75,7 +79,7 @@ export function open(key, message) {
   return { seq: aad.readBigUInt64LE(0), plaintext };
 }
 
-// ---- Plaintext frame codec (protocol v1 §4) --------------------------------
+// ---- Plaintext frame codec --------------------------------------------------
 
 export const FrameType = Object.freeze({
   ctl: 0x00,

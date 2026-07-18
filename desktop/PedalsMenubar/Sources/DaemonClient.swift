@@ -56,6 +56,7 @@ struct DaemonClient: Sendable {
     func ls() async throws -> JSONValue { try await send(Request(cmd: "ls")) }
     func status() async throws -> JSONValue { try await send(Request(cmd: "status")) }
     func pair() async throws -> JSONValue { try await send(Request(cmd: "pair")) }
+    func cancelPair() async throws -> JSONValue { try await send(Request(cmd: "cancelPair")) }
     func new() async throws -> JSONValue { try await send(Request(cmd: "new")) }
 
     func kill(id: Int) async throws {

@@ -3,29 +3,61 @@ import PedalsKit
 import UIKit
 
 /// Safari-style main screen: floating glass tab strip on top, the active
-/// session's terminal filling the screen beneath it (content scrolls under the
-/// glass), and a persistent glass input toolbar at the bottom that rides above
-/// the keyboard. Horizontal pans on the terminal page between sessions, with
-/// the tab strip following the gesture.
+/// terminal filling the screen beneath it, and a persistent glass input
+/// toolbar at the bottom that rides above the keyboard. Terminals can live on
+/// different computers; every computer's full session list is shown as tabs.
+/// Horizontal pans page between terminals, with the tab strip following.
 @MainActor
 final class MainViewController: UIViewController {
     private let services: AppServices
+    private var manager: TerminalManager { services.terminals }
 
-    // Terminal hosting: one live emulator per attached session.
+    /// One page per terminal: the Ghostty host plus its freeze/loading mask,
+    /// wrapped in a container that the pan gesture slides around.
+    @MainActor
+    private final class Page {
+        let host: TerminalHost
+        let container = UIView()
+        let overlay = TerminalStatusOverlay()
+
+        init(host: TerminalHost) {
+            self.host = host
+            host.view.translatesAutoresizingMaskIntoConstraints = true
+            host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            host.view.frame = container.bounds
+            container.addSubview(host.view)
+            overlay.translatesAutoresizingMaskIntoConstraints = true
+            overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            overlay.frame = container.bounds
+            container.addSubview(overlay)
+        }
+    }
+
     private let pagesContainer = UIView()
-    private var hosts: [Int: TerminalHost] = [:]
-    private var orderedIds: [Int] = []
-    private var visibleHostId: Int?
+    private var pages: [TerminalID: Page] = [:]
+    private var orderedIds: [TerminalID] = []
+    private var visibleId: TerminalID?
 
     private let tabStrip = TabStripView()
     private let toolbar = TerminalToolbar()
 
     private let unpairedView = UnpairedStateView()
     private let noSessionsView = UIView()
+    private weak var noSessionsCreateButton: UIButton?
+
+    /// Bound computer count, taken from the `$computers` EMISSION — never read
+    /// `manager.computers` inside a sink (@Published emits during willSet, so
+    /// the property still holds the old value there).
+    private var computerCount = 0
 
     private var panGesture: UIPanGestureRecognizer!
     /// In-flight pan: target index we are dragging toward.
     private var panTarget: Int?
+    /// True between the first `.changed` and the end of a pan. While set,
+    /// `apply()` defers page-visibility reconciliation so a `sessions`
+    /// rebroadcast (title/cwd poll) can't hide the page under the finger.
+    private var isPanning = false
+    private var deferredApply = false
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -41,7 +73,7 @@ final class MainViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = services.preferences.backgroundColor
+        view.backgroundColor = PedalsTheme.uiCanvas
         buildLayout()
         bind()
     }
@@ -57,20 +89,20 @@ final class MainViewController: UIViewController {
 
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.onBytes = { [weak self] bytes in
-            guard let self, let id = visibleHostId else { return }
-            services.connection.sendStdin(sessionId: UInt32(id), data: bytes)
+            guard let self, let id = visibleId else { return }
+            manager.sendStdin(id, data: bytes)
         }
         toolbar.onStickyCtrl = { [weak self] armed in
-            guard let self, let id = visibleHostId else { return }
-            hosts[id]?.stickyCtrl = armed
+            guard let self, let id = visibleId else { return }
+            pages[id]?.host.stickyCtrl = armed
         }
         view.addSubview(toolbar)
 
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
-        tabStrip.onSelect = { [weak self] id in self?.services.sessionStore.activate(id) }
-        tabStrip.onClose = { [weak self] id in self?.services.connection.closeSession(id: id) }
+        tabStrip.onSelect = { [weak self] id in self?.manager.activate(id) }
+        tabStrip.onClose = { [weak self] id in self?.manager.closeTerminal(id) }
         tabStrip.onSettings = { [weak self] in self?.presentSettings() }
-        tabStrip.onCreate = { [weak self] in self?.createSession() }
+        tabStrip.onCreate = { [weak self] in self?.createOnOnlyComputer() }
         view.addSubview(tabStrip)
 
         noSessionsView.translatesAutoresizingMaskIntoConstraints = false
@@ -78,8 +110,7 @@ final class MainViewController: UIViewController {
         buildNoSessionsHint()
 
         unpairedView.translatesAutoresizingMaskIntoConstraints = false
-        unpairedView.onScan = { [weak self] in self?.presentScanner() }
-        unpairedView.onPaste = { [weak self] in self?.presentPasteAlert() }
+        unpairedView.onEnterCode = { [weak self] in self?.presentPairingCode() }
         view.addSubview(unpairedView)
 
         NSLayoutConstraint.activate([
@@ -123,17 +154,23 @@ final class MainViewController: UIViewController {
 
     private func buildNoSessionsHint() {
         let label = UILabel()
-        label.text = "No sessions"
+        label.text = "No terminals"
         label.font = .preferredFont(forTextStyle: .headline)
         label.textColor = .secondaryLabel
         label.textAlignment = .center
 
         var config = UIButton.Configuration.bordered()
-        config.title = "New Session"
+        config.title = "New Terminal"
         config.image = UIImage(systemName: "plus")
         config.imagePadding = 6
+        config.baseForegroundColor = PedalsTheme.uiContent
         let button = UIButton(configuration: config)
-        button.addAction(UIAction { [weak self] _ in self?.createSession() }, for: .touchUpInside)
+        button.addAction(
+            UIAction { [weak self] _ in self?.createOnOnlyComputer() }, for: .touchUpInside
+        )
+        // With several computers bound this button carries the same picker menu
+        // as the tab strip's + (installed by the $computers sink).
+        noSessionsCreateButton = button
 
         let stack = UIStackView(arrangedSubviews: [label, button])
         stack.axis = .vertical
@@ -152,159 +189,274 @@ final class MainViewController: UIViewController {
     // MARK: - Bindings
 
     private func bind() {
-        let store = services.sessionStore
-        store.$sessions
-            .combineLatest(store.$activeSessionId)
-            .sink { [weak self] sessions, activeId in
-                self?.apply(sessions: sessions, activeId: activeId)
+        manager.$terminals
+            .combineLatest(manager.$activeID)
+            .sink { [weak self] terminals, activeId in
+                self?.apply(terminals: terminals, activeId: activeId)
             }
             .store(in: &cancellables)
 
-        services.connection.events
-            .sink { [weak self] event in self?.handle(event) }
+        manager.outputs
+            .sink { [weak self] id, output in self?.handle(id: id, output: output) }
             .store(in: &cancellables)
 
-        services.connection.$pairing
-            .map { $0 == nil }
-            .removeDuplicates()
-            .sink { [weak self] unpaired in
-                self?.unpairedView.isHidden = !unpaired
-                self?.tabStrip.isHidden = unpaired
-                self?.toolbar.isHidden = unpaired
-            }
+        manager.exits
+            .sink { [weak self] id, code in self?.pages[id]?.host.markExited(code: code) }
             .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: AppServices.appearanceDidChange)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+        // NOTE: @Published emits during willSet — inside a sink the source
+        // property still holds the OLD value, so overlay state must be
+        // computed from the emitted values, never read back off the manager.
+        manager.$phases
+            .sink { [weak self] phases in
                 guard let self else { return }
-                view.backgroundColor = services.preferences.backgroundColor
+                updateOverlays(terminals: manager.terminals, phases: phases)
             }
             .store(in: &cancellables)
+
+        manager.$computers
+            .map(\.count)
+            .removeDuplicates()
+            .sink { [weak self] count in
+                guard let self else { return }
+                computerCount = count
+                let unpaired = count == 0
+                unpairedView.isHidden = !unpaired
+                tabStrip.isHidden = unpaired
+                toolbar.isHidden = unpaired
+                let menu = count > 1 ? makeCreateMenu() : nil
+                tabStrip.setCreateMenu(menu)
+                noSessionsCreateButton?.menu = menu
+                noSessionsCreateButton?.showsMenuAsPrimaryAction = menu != nil
+                noSessionsView.isHidden = !(manager.terminals.isEmpty && !unpaired)
+                // The tab-title "machine · " prefix depends on the computer
+                // count; refresh titles when it crosses the 1↔many boundary
+                // even if no session changed (e.g. binding an idle computer).
+                apply(terminals: manager.terminals, activeId: manager.activeID)
+            }
+            .store(in: &cancellables)
+
+        manager.errors
+            .sink { [weak self] message in self?.presentError(message) }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.manager.kickAll() }
+            .store(in: &cancellables)
+
     }
 
-    private func handle(_ event: ConnectionController.HostEvent) {
-        switch event {
-        case let .stdout(sessionId, data):
-            hosts[Int(sessionId)]?.feed(data)
-        case let .replay(sessionId, data):
-            hosts[Int(sessionId)]?.feedReplay(data)
-        case let .exit(id, code):
-            hosts[id]?.markExited(code: code)
-        case .sessions, .created, .title, .error:
-            break // handled via SessionStore
+    private func handle(id: TerminalID, output: TerminalManager.Output) {
+        guard let page = pages[id] else { return }
+        switch output {
+        case .replay(let data):
+            page.host.feedReplay(data)
+            // Sync the daemon-side grid to this device's current geometry
+            // (the replay was rendered for whoever attached last).
+            if let cols = page.host.cols, let rows = page.host.rows {
+                manager.sendResize(id, cols: cols, rows: rows)
+            }
+        case .stdout(let data):
+            page.host.feed(data)
         }
     }
 
-    // MARK: - Session/terminal reconciliation
+    // MARK: - Terminal/page reconciliation
 
-    private func apply(sessions: [SessionInfo], activeId: Int?) {
-        let ids = Set(sessions.map(\.id))
-        orderedIds = sessions.map(\.id)
+    private func apply(terminals: [Terminal], activeId: TerminalID?) {
+        // A pan drives page frames/visibility by hand; a mid-gesture rebuild
+        // would hide the page being dragged. Re-run once the gesture settles.
+        if isPanning {
+            deferredApply = true
+            return
+        }
+        let ids = Set(terminals.map(\.id))
+        orderedIds = terminals.map(\.id)
 
-        for (id, host) in hosts where !ids.contains(id) {
-            host.view.removeFromSuperview()
-            hosts.removeValue(forKey: id)
-            if visibleHostId == id { visibleHostId = nil }
+        for (id, page) in pages where !ids.contains(id) {
+            page.container.removeFromSuperview()
+            pages.removeValue(forKey: id)
+            if visibleId == id { visibleId = nil }
         }
 
-        for session in sessions where hosts[session.id] == nil {
-            let host = TerminalHost(
-                sessionId: session.id, controller: services.makeTerminalController()
-            )
-            let sid = UInt32(session.id)
-            host.onInput = { [weak self] data in
-                self?.services.connection.sendStdin(sessionId: sid, data: data)
+        for terminal in terminals where pages[terminal.id] == nil {
+            let page = Page(host: TerminalHost(controller: services.makeTerminalController()))
+            let id = terminal.id
+            page.host.onInput = { [weak self] data in
+                self?.manager.sendStdin(id, data: data)
             }
-            host.onResize = { [weak self] cols, rows in
-                self?.services.connection.sendResize(sessionId: sid, cols: cols, rows: rows)
+            page.host.onResize = { [weak self] cols, rows in
+                self?.manager.sendResize(id, cols: cols, rows: rows)
             }
-            host.onStickyCtrlConsumed = { [weak self] in
+            page.host.onStickyCtrlConsumed = { [weak self] in
                 self?.toolbar.consumeStickyCtrl()
             }
-            hosts[session.id] = host
+            pages[id] = page
 
-            host.view.isHidden = true
-            host.view.translatesAutoresizingMaskIntoConstraints = true
-            host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            host.view.frame = pagesContainer.bounds
-            pagesContainer.addSubview(host.view)
+            page.container.isHidden = true
+            page.container.translatesAutoresizingMaskIntoConstraints = true
+            page.container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            page.container.frame = pagesContainer.bounds
+            pagesContainer.addSubview(page.container)
 
-            services.connection.attach(id: session.id)
+            // The channel can go live while apply() is deferred by a pan — the
+            // replay arrived with no page to feed and was dropped. Fetch a
+            // fresh snapshot so the new page isn't permanently blank.
+            if manager.phases[id] == .live {
+                manager.requestReplay(id)
+            }
         }
 
-        setVisibleHost(activeId)
+        setVisiblePage(activeId)
+        updateOverlays(terminals: terminals, phases: manager.phases)
 
+        let showComputer = computerCount > 1
         tabStrip.update(
-            tabs: sessions.map { .init(id: $0.id, title: $0.title, alive: $0.alive) },
+            tabs: terminals.map {
+                .init(
+                    id: $0.id,
+                    title: showComputer ? "\($0.computerName) · \($0.info.title)" : $0.info.title,
+                    alive: $0.info.alive && !$0.closing
+                )
+            },
             activeId: activeId
         )
-        noSessionsView.isHidden =
-            !(sessions.isEmpty && services.connection.pairing != nil)
+        noSessionsView.isHidden = !(terminals.isEmpty && computerCount > 0)
     }
 
-    /// Idempotent on purpose: activeSessionId can update BEFORE the session
-    /// list does (create flow), so the first call may record an id whose host
-    /// doesn't exist yet — the re-run after host creation must still unhide it.
-    private func setVisibleHost(_ id: Int?) {
-        visibleHostId = id
-        for (hostId, host) in hosts {
-            host.view.isHidden = hostId != id
-            host.view.frame = pagesContainer.bounds
+    /// Idempotent on purpose: activeID can update BEFORE the terminal list
+    /// does (create flow), so the first call may record an id whose page
+    /// doesn't exist yet — the re-run after page creation must still unhide it.
+    private func setVisiblePage(_ id: TerminalID?) {
+        visibleId = id
+        for (pageId, page) in pages {
+            page.container.isHidden = pageId != id
+            page.container.frame = pagesContainer.bounds
         }
-        if let id, let host = hosts[id] {
-            host.stickyCtrl = toolbar.ctrlArmed
-            if !host.view.isFirstResponder {
-                host.view.becomeFirstResponder()
+        if let id, let page = pages[id] {
+            page.host.stickyCtrl = toolbar.ctrlArmed
+            if !page.host.view.isFirstResponder {
+                page.host.view.becomeFirstResponder()
             }
             // Unhiding does not fire didMoveToWindow, so nothing else
             // repaints output that arrived while the view was hidden.
-            host.kickRender()
+            page.host.kickRender()
         }
     }
 
-    private func createSession() {
-        let active = visibleHostId.flatMap { hosts[$0] }
-        services.connection.createSession(
+    private func updateOverlays(terminals: [Terminal], phases: [TerminalID: TerminalChannel.Phase]) {
+        for (id, page) in pages {
+            let mode: TerminalStatusOverlay.Mode
+            if terminals.first(where: { $0.id == id })?.closing == true {
+                mode = .closing
+            } else {
+                switch phases[id] {
+                case .connecting: mode = .connecting
+                case .reconnecting: mode = .reconnecting
+                case .live: mode = .hidden
+                // Asleep (pooled out) or never attached: switching to the tab
+                // opens a channel immediately, so show the loading state.
+                case nil: mode = id == visibleId ? .connecting : .hidden
+                }
+            }
+            page.overlay.setMode(mode)
+        }
+    }
+
+    // MARK: - Create
+
+    /// Direct + tap when 0–1 computers are bound (the multi-computer menu is
+    /// installed via `setCreateMenu` otherwise).
+    private func createOnOnlyComputer() {
+        guard let computer = manager.computers.first else { return }
+        create(on: computer.id)
+    }
+
+    private func create(on computerID: String) {
+        // The picker menu already disables offline computers; this covers the
+        // single-computer and empty-state paths (and races): a create sent to
+        // an absent host is dropped by the relay and would fail silently.
+        guard let computer = manager.computer(id: computerID) else { return }
+        guard computer.hostOnline else {
+            presentError("“\(computer.displayName)” is offline.")
+            return
+        }
+        let active = visibleId.flatMap { pages[$0] }?.host
+        manager.createTerminal(
+            on: computerID,
             cols: Int(active?.cols ?? 120),
             rows: Int(active?.rows ?? 40)
         )
     }
 
-    // MARK: - Horizontal pan between sessions
+    private func presentError(_ message: String) {
+        let alert = UIAlertController(
+            title: "Terminal Error", message: message, preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+
+    /// Menu listing every bound computer; rebuilt each presentation so names
+    /// and connection states are current.
+    private func makeCreateMenu() -> UIMenu {
+        UIMenu(children: [
+            UIDeferredMenuElement.uncached { [weak self] completion in
+                guard let self else { return completion([]) }
+                let actions = manager.computers.map { computer in
+                    let online = computer.hostOnline
+                    let action = UIAction(
+                        title: computer.displayName,
+                        image: UIImage(systemName: online ? "desktopcomputer" : "wifi.slash"),
+                        attributes: online ? [] : [.disabled],
+                        state: visibleId?.computerID == computer.id ? .on : .off
+                    ) { [weak self] _ in
+                        self?.create(on: computer.id)
+                    }
+                    if !online { action.subtitle = "Offline" }
+                    return action
+                }
+                completion(actions)
+            }
+        ])
+    }
+
+    // MARK: - Horizontal pan between terminals
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
-        guard let activeId = visibleHostId,
+        guard let activeId = visibleId,
               let activeIndex = orderedIds.firstIndex(of: activeId),
-              let activeHost = hosts[activeId]
+              let activePage = pages[activeId]
         else { return }
 
         let width = pagesContainer.bounds.width
         let tx = gesture.translation(in: pagesContainer).x
-        // Dragging left (tx < 0) reveals the NEXT session, and vice versa.
+        // Dragging left (tx < 0) reveals the NEXT terminal, and vice versa.
         let direction = tx < 0 ? 1 : -1
         let targetIndex = activeIndex + direction
         let hasTarget = orderedIds.indices.contains(targetIndex)
-        let targetHost = hasTarget ? hosts[orderedIds[targetIndex]] : nil
+        let targetPage = hasTarget ? pages[orderedIds[targetIndex]] : nil
 
         switch gesture.state {
         case .changed:
+            isPanning = true
             // Rubber-band when there is no neighbor on that side.
             let effectiveTx = hasTarget ? tx : tx / 3
-            activeHost.view.frame.origin.x = effectiveTx
+            activePage.container.frame.origin.x = effectiveTx
 
-            if let targetHost, hasTarget {
+            if let targetPage, hasTarget {
                 if panTarget != targetIndex {
                     // Direction changed mid-gesture: hide the old candidate.
                     if let old = panTarget, orderedIds.indices.contains(old),
-                       old != targetIndex, let oldHost = hosts[orderedIds[old]]
+                       old != targetIndex, let oldPage = pages[orderedIds[old]]
                     {
-                        oldHost.view.isHidden = true
+                        oldPage.container.isHidden = true
                     }
                     panTarget = targetIndex
-                    targetHost.view.isHidden = false
+                    targetPage.container.isHidden = false
                 }
-                targetHost.view.frame = pagesContainer.bounds.offsetBy(
+                targetPage.container.frame = pagesContainer.bounds.offsetBy(
                     dx: effectiveTx + CGFloat(direction) * width, dy: 0
                 )
                 tabStrip.setSwitchProgress(
@@ -313,27 +465,47 @@ final class MainViewController: UIViewController {
             }
 
         case .ended, .cancelled:
+            // Keep apply() deferred through the settle animation too — an active
+            // page hasn't been committed yet, so a mid-animation rebuild would
+            // hide the page sliding in. Cleared in the completion blocks.
             let velocity = gesture.velocity(in: pagesContainer).x
             let commit = hasTarget
                 && (abs(tx) > width * 0.35 || abs(velocity) > 700)
                 && (velocity == 0 || (velocity < 0) == (direction == 1))
 
-            if commit, let targetHost, gesture.state == .ended {
+            if commit, let targetPage, gesture.state == .ended {
                 let targetId = orderedIds[targetIndex]
+                // Settle the tab strip in parallel with the page slide (same
+                // spring) so they track; the completion's model update then
+                // re-animates nothing.
+                tabStrip.commitSwitch(
+                    to: targetIndex,
+                    duration: 0.42, damping: 0.86,
+                    initialVelocity: abs(velocity) / width
+                )
                 UIView.animate(
                     withDuration: 0.42, delay: 0,
                     usingSpringWithDamping: 0.86,
                     initialSpringVelocity: abs(velocity) / width,
                     options: [.allowUserInteraction, .beginFromCurrentState]
                 ) {
-                    activeHost.view.frame = self.pagesContainer.bounds.offsetBy(
+                    activePage.container.frame = self.pagesContainer.bounds.offsetBy(
                         dx: CGFloat(-direction) * width, dy: 0
                     )
-                    targetHost.view.frame = self.pagesContainer.bounds
+                    targetPage.container.frame = self.pagesContainer.bounds
                 } completion: { _ in
                     self.panTarget = nil
-                    // Drives setVisibleHost + tab strip settle via the binding.
-                    self.services.sessionStore.activate(targetId)
+                    self.isPanning = false
+                    let missedApply = self.deferredApply
+                    self.deferredApply = false
+                    // Drives setVisiblePage + tab strip settle via the binding.
+                    self.manager.activate(targetId)
+                    // activate() no-ops if the target was removed mid-gesture
+                    // (its reconcile was deferred above) — nothing would emit,
+                    // so run the skipped apply explicitly.
+                    if missedApply {
+                        self.apply(terminals: self.manager.terminals, activeId: self.manager.activeID)
+                    }
                 }
             } else {
                 UIView.animate(
@@ -341,20 +513,27 @@ final class MainViewController: UIViewController {
                     usingSpringWithDamping: 0.85, initialSpringVelocity: 0.3,
                     options: [.allowUserInteraction, .beginFromCurrentState]
                 ) {
-                    activeHost.view.frame = self.pagesContainer.bounds
-                    if let targetHost, hasTarget {
-                        targetHost.view.frame = self.pagesContainer.bounds.offsetBy(
+                    activePage.container.frame = self.pagesContainer.bounds
+                    if let targetPage, hasTarget {
+                        targetPage.container.frame = self.pagesContainer.bounds.offsetBy(
                             dx: CGFloat(direction) * width, dy: 0
                         )
                     }
                 } completion: { _ in
                     if let target = self.panTarget,
                        self.orderedIds.indices.contains(target),
-                       self.orderedIds[target] != self.visibleHostId
+                       self.orderedIds[target] != self.visibleId
                     {
-                        self.hosts[self.orderedIds[target]]?.view.isHidden = true
+                        self.pages[self.orderedIds[target]]?.container.isHidden = true
                     }
                     self.panTarget = nil
+                    self.isPanning = false
+                    // A rebroadcast was skipped mid-gesture; reconcile now that
+                    // we settled back on the same page.
+                    if self.deferredApply {
+                        self.deferredApply = false
+                        self.apply(terminals: self.manager.terminals, activeId: self.manager.activeID)
+                    }
                 }
                 tabStrip.cancelSwitchProgress()
             }
@@ -366,52 +545,14 @@ final class MainViewController: UIViewController {
 
     // MARK: - Pairing entry points
 
-    private func presentScanner() {
-        let scanner = PairingScanViewController()
-        scanner.onPaired = { [weak self] info in
-            self?.services.connection.pair(with: info)
+    private func presentPairingCode() {
+        let controller = PairingCodeViewController()
+        let services = services
+        controller.onPair = { code in
+            try await services.bind(code: code)
         }
-        scanner.modalPresentationStyle = .fullScreen
-        present(scanner, animated: true)
-    }
-
-    private func presentPasteAlert() {
-        let alert = UIAlertController(
-            title: "Paste Pairing Link",
-            message: "Paste the pedals:// link printed by “pedals pair”.",
-            preferredStyle: .alert
-        )
-        alert.addTextField { field in
-            field.placeholder = "pedals://pair?…"
-            field.autocorrectionType = .no
-            field.autocapitalizationType = .none
-            if let clip = UIPasteboard.general.string, clip.hasPrefix("pedals://") {
-                field.text = clip
-            }
-        }
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Connect", style: .default) { [weak self, weak alert] _ in
-            guard let self,
-                  let text = alert?.textFields?.first?.text?
-                      .trimmingCharacters(in: .whitespacesAndNewlines),
-                  let url = URL(string: text),
-                  services.handlePairingURL(url)
-            else {
-                self?.presentInvalidLinkAlert()
-                return
-            }
-        })
-        present(alert, animated: true)
-    }
-
-    private func presentInvalidLinkAlert() {
-        let alert = UIAlertController(
-            title: "Invalid Pairing Link",
-            message: "That doesn’t look like a pedals:// pairing link.",
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        controller.modalPresentationStyle = .fullScreen
+        present(controller, animated: true)
     }
 
     // MARK: - Settings

@@ -7,7 +7,6 @@ import UIKit
 /// and scrollback survives.
 @MainActor
 final class TerminalHost {
-    let sessionId: Int
     let view: TerminalView
     /// Each host owns its controller — see AppServices.makeTerminalController.
     let controller: TerminalController
@@ -26,8 +25,10 @@ final class TerminalHost {
 
     /// While a replay snapshot is being digested, the emulator re-answers any
     /// terminal queries (DA, DECRQM, …) contained in the replayed history.
-    /// Those responses must not reach the PTY — the host answered them long
-    /// ago — or the shell echoes them as garbage at the prompt.
+    /// Those auto-responses — all ESC-prefixed control sequences — must not
+    /// reach the PTY (the host answered them long ago) or the shell echoes them
+    /// as garbage. Only ESC-prefixed writes are muted, so keystrokes the user
+    /// types right after a reconnect/replay still go through.
     private var muteInputUntil: Date?
 
     private let session: InMemoryTerminalSession
@@ -38,8 +39,7 @@ final class TerminalHost {
         weak var host: TerminalHost?
     }
 
-    init(sessionId: Int, controller: TerminalController) {
-        self.sessionId = sessionId
+    init(controller: TerminalController) {
         self.controller = controller
 
         let relay = Relay()
@@ -107,8 +107,14 @@ final class TerminalHost {
 
     private func handleInput(_ data: Data) {
         if let until = muteInputUntil {
-            if Date() < until { return }
-            muteInputUntil = nil
+            if Date() < until {
+                // Drop only the emulator's query replies. Keyboard input can
+                // start with ESC too (bare Esc, arrow keys, Alt+letter) and
+                // must pass through even inside the mute window.
+                if Self.isEmulatorQueryReply(data) { return }
+            } else {
+                muteInputUntil = nil
+            }
         }
         var data = data
         if stickyCtrl, data.count == 1, let byte = data.first,
@@ -119,6 +125,26 @@ final class TerminalHost {
             onStickyCtrlConsumed?()
         }
         onInput?(data)
+    }
+
+    /// True for the auto-replies the emulator emits while digesting a replay:
+    /// CSI reports terminating in `c` (DA), `n` (DSR), `y` (DECRQM), `R` (CPR),
+    /// and DCS/OSC responses. Keyboard sequences are different shapes — bare
+    /// ESC, `ESC [ A…D` arrows, `ESC O …`, Alt+letter — and all return false.
+    private static func isEmulatorQueryReply(_ data: Data) -> Bool {
+        guard data.count >= 3, data.first == 0x1b, let last = data.last
+        else { return false }
+        switch data[data.index(data.startIndex, offsetBy: 1)] {
+        case UInt8(ascii: "["):
+            return [
+                UInt8(ascii: "c"), UInt8(ascii: "n"),
+                UInt8(ascii: "y"), UInt8(ascii: "R"),
+            ].contains(last)
+        case UInt8(ascii: "P"), UInt8(ascii: "]"):
+            return true // DCS / OSC response; never keyboard input
+        default:
+            return false
+        }
     }
 
     private func handleResize(_ viewport: InMemoryTerminalViewport) {

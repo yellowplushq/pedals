@@ -1,0 +1,133 @@
+import Combine
+import Foundation
+import PedalsKit
+
+/// Identity of one terminal across all bound computers.
+struct TerminalID: Hashable, Sendable {
+    /// The server-issued computer identifier.
+    let computerID: String
+    /// The daemon-assigned session id within that computer.
+    let sid: Int
+}
+
+/// One terminal's live data connection: a `session` channel WebSocket opened
+/// lazily when the terminal is activated (PROTOCOL.md §1). Connecting sends
+/// `hello`, which makes the host replay scrollback and stream stdout; stdin
+/// and resize go out on the same socket. Pooled by `TerminalManager` — the
+/// least recently activated channels are stopped ("asleep") when too many
+/// are open; the daemon keeps the PTY running regardless.
+@MainActor
+final class TerminalChannel {
+    enum Phase: Equatable {
+        /// Socket dialing / waiting for the host's first replay.
+        case connecting
+        /// Replay applied; live.
+        case live
+        /// Was live, connection lost; retrying with backoff.
+        case reconnecting
+    }
+
+    let terminalID: TerminalID
+    private(set) var phase: Phase = .connecting {
+        didSet { if phase != oldValue { onPhase?(phase) } }
+    }
+
+    var onPhase: ((Phase) -> Void)?
+    var onReplay: ((Data) -> Void)?
+    var onStdout: ((Data) -> Void)?
+
+    /// LRU stamp for the connection pool.
+    private(set) var lastActivated = Date()
+
+    private let link: RelayLink
+    private var everLive = false
+
+    init(terminalID: TerminalID, link: RelayLink) {
+        self.terminalID = terminalID
+        self.link = link
+        link.onState = { [weak self] state in
+            MainActor.assumeIsolated { self?.handle(state: state) }
+        }
+        link.onFrame = { [weak self] frame in
+            MainActor.assumeIsolated { self?.handle(frame: frame) }
+        }
+        link.onPeerPresence = { [weak self] online in
+            MainActor.assumeIsolated { self?.handle(hostPresent: online) }
+        }
+        link.start()
+    }
+
+    func touch() {
+        lastActivated = Date()
+    }
+
+    func stop() {
+        link.stop()
+    }
+
+    func kick() {
+        link.kick()
+    }
+
+    /// Ask the host for a fresh replay over the established E2EE channel.
+    /// Used when the UI missed an earlier replay (e.g. the page was created
+    /// after the channel already went live).
+    func requestReplay() {
+        link.send(.requestReplay)
+    }
+
+    func sendStdin(_ data: Data) {
+        link.send(.stdin(sessionId: UInt32(terminalID.sid), data: data))
+    }
+
+    func sendResize(cols: UInt16, rows: UInt16) {
+        link.send(.resize(sessionId: UInt32(terminalID.sid), cols: cols, rows: rows))
+    }
+
+    private func handle(state: RelayLink.State) {
+        switch state {
+        case .connected:
+            break // stays "connecting" until the host's replay lands
+        case .connecting:
+            phase = everLive ? .reconnecting : .connecting
+        case .idle:
+            break
+        }
+    }
+
+    /// Relay presence: the daemon's socket for this channel appeared/vanished.
+    /// Our own link can be healthy while the host end is gone (daemon quit) —
+    /// without this the terminal would freeze with no overlay.
+    private func handle(hostPresent: Bool) {
+        if !hostPresent, phase == .live {
+            phase = .reconnecting
+        }
+        // Host back: its hello triggers our re-hello → replay → .live.
+    }
+
+    private func handle(frame: Frame) {
+        // Defense in depth: per-channel keys already stop cross-channel
+        // ciphertext at decrypt, so a data frame whose sid isn't ours can only
+        // be a bug — drop it rather than render another session's output here.
+        if (frame.type == .replay || frame.type == .stdout),
+           frame.sessionId != UInt32(terminalID.sid) {
+            return
+        }
+        switch frame.type {
+        case .replay:
+            everLive = true
+            phase = .live
+            onReplay?(frame.payload)
+        case .stdout:
+            // Before the (re)connect replay lands, live stdout would paint onto
+            // a grid that's missing everything dropped during the outage; the
+            // replay covers those bytes, so drop them here.
+            guard phase == .live else { break }
+            onStdout?(frame.payload)
+        case .ctl:
+            break
+        case .stdin, .resize:
+            break // client→host only; ignore if mirrored back
+        }
+    }
+}

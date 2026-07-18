@@ -1,0 +1,56 @@
+# Desktop release
+
+Pedals desktop releases are universal, notarized macOS disk images. The menu
+bar app embeds the `pedals` daemon at `Contents/Resources/pedals`, so a release
+does not depend on a source checkout or a separately installed command-line
+tool.
+
+## GitHub configuration
+
+The `Release desktop app` workflow needs Actions to have read/write repository
+permissions and these repository secrets:
+
+| Secret | Value |
+|---|---|
+| `MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64` | Base64-encoded Developer ID Application certificate and private key (`.p12`) |
+| `MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD` | Password used when exporting that `.p12` |
+| `APPLE_API_KEY_P8_BASE64` | Base64-encoded App Store Connect API private key (`.p8`) with notarization access |
+| `APPLE_API_KEY_ID` | App Store Connect API key ID |
+| `APPLE_API_ISSUER_ID` | App Store Connect API issuer ID |
+
+Never add the source `.p12` or `.p8` files to the repository.
+
+## Publish a release
+
+Create and push a three-part version tag:
+
+```bash
+git tag desktop-v1.0.0
+git push origin desktop-v1.0.0
+```
+
+The workflow tests the daemon, builds both `arm64` and `x86_64` slices, embeds
+the daemon, signs with hardened runtime, creates a DMG, submits it to Apple's
+notary service, staples the ticket, and publishes these GitHub release assets:
+
+- `Pedals-macOS.dmg`
+- `Pedals-macOS.dmg.sha256`
+
+The website's `/download/macos` route redirects to that exact asset on the
+latest GitHub release. Set the Worker's `DESKTOP_RELEASE_REPOSITORY` variable to
+the repository slug, for example `owner/pedals`, before deploying the website.
+
+## Build locally
+
+Local builds are unsigned. Xcode 26, Swift 6, and XcodeGen are required:
+
+```bash
+PEDALS_DESKTOP_VERSION=1.0.0 \
+PEDALS_DESKTOP_BUILD_NUMBER=1 \
+./scripts/build-desktop-release.sh
+
+./scripts/package-desktop-dmg.sh
+```
+
+Outputs are written below `.artifacts/desktop-release/` and must not be
+committed.
