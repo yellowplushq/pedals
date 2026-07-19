@@ -99,4 +99,22 @@ test("the one-screen homepage exposes the product promise and download CTA", asy
   assert.match(html, /href="\/download\/macos"/);
   assert.match(html, /8-digit code/);
   assert.match(html, /Terminal bytes and encryption keys never live on the service/);
+  assert.match(html, /href="\/privacy\/"/);
+  assert.match(html, /href="\/support\/"/);
+});
+
+test("support and privacy pages expose release-ready public information", async () => {
+  const privacy = await readFile(
+    new URL("../public/privacy/index.html", import.meta.url),
+    "utf8",
+  );
+  const support = await readFile(
+    new URL("../public/support/index.html", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(privacy, /end-to-end encrypted/i);
+  assert.match(privacy, /does not store terminal content/i);
+  assert.match(support, /8-digit code/);
+  assert.match(support, /mailto:eyhn@yellowplus\.app/);
 });

@@ -198,7 +198,21 @@ NODE
 # transition before driving the first visible control.
 sleep 3
 tap_accessibility_label "pedals.onboarding.pair"
-sleep 1
+
+# Simulator HID delivery can occasionally acknowledge a tap without UIKit
+# receiving it. Prove that navigation completed and retry the source control
+# instead of treating one dropped synthetic tap as an application failure.
+PAIRING_UI_JSON="$PEDALS_E2E_HOME/pairing-ui.json"
+for _ in $(seq 1 3); do
+  sleep 1
+  baguette describe-ui --udid "$SIM_UDID" --output "$PAIRING_UI_JSON" >/dev/null 2>&1
+  if grep -q '"identifier":"pedals.pairing.code"' "$PAIRING_UI_JSON"; then
+    break
+  fi
+  tap_accessibility_label "pedals.onboarding.pair"
+done
+grep -q '"identifier":"pedals.pairing.code"' "$PAIRING_UI_JSON" \
+  || fail "pairing screen did not appear after tapping Connect"
 tap_accessibility_label "pedals.pairing.code"
 baguette type --udid "$SIM_UDID" --text "$IOS_PAIR_CODE" >/dev/null
 tap_accessibility_label "pedals.pairing.submit"

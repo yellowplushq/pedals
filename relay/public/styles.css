@@ -84,6 +84,21 @@ a { color: inherit; }
   box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.07);
 }
 
+.top-meta,
+.top-links {
+  display: flex;
+  align-items: center;
+}
+
+.top-meta { gap: 24px; }
+.top-links { gap: 14px; }
+.top-links a {
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+}
+.top-links a:hover { color: var(--ink); }
+
 .hero {
   min-height: 560px;
   display: grid;
@@ -397,6 +412,9 @@ h1 span { color: #737373; }
   body { background: var(--canvas); }
   .topbar { height: 66px; }
   .privacy-mark { font-size: 11px; }
+  .top-meta { gap: 12px; }
+  .top-links { gap: 9px; }
+  .top-links a { font-size: 11px; }
   .hero { gap: 34px; padding: 44px 0 32px; }
   .eyebrow { justify-content: flex-start; margin-bottom: 20px; font-size: 10px; }
   .hero-copy { text-align: left; }
@@ -422,6 +440,38 @@ h1 span { color: #737373; }
   .proof article { min-height: 82px; padding: 18px 2px; border-right: 0; border-bottom: 1px solid var(--line); }
   .proof article:first-child, .proof article:last-child { padding-left: 2px; padding-right: 2px; }
   .proof article:last-child { border-bottom: 0; }
+}
+
+.legal-shell {
+  width: min(760px, calc(100vw - 48px));
+  margin: 0 auto;
+  padding: 72px 0 96px;
+}
+
+.legal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 72px;
+}
+
+.legal-header .brand-mark { width: 32px; height: 32px; border-radius: 9px; }
+.legal-back { color: var(--muted); font-size: 13px; text-decoration: none; }
+.legal-back:hover { color: var(--ink); }
+.legal-copy h1 { font-size: clamp(42px, 8vw, 66px); line-height: 1; }
+.legal-updated { margin: 18px 0 52px; color: var(--faint); font-size: 12px; }
+.legal-copy section { margin-top: 38px; }
+.legal-copy h2 { margin: 0 0 12px; font-size: 15px; }
+.legal-copy p,
+.legal-copy li { color: var(--muted); font-size: 14px; line-height: 1.7; }
+.legal-copy ul { margin: 12px 0 0; padding-left: 20px; }
+.legal-copy a { color: var(--ink); }
+.support-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 34px; }
+
+@media (max-width: 640px) {
+  .privacy-mark { display: none; }
+  .legal-shell { width: calc(100vw - 36px); padding-top: 32px; }
+  .legal-header { margin-bottom: 52px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
