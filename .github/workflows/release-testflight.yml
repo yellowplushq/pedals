@@ -160,11 +160,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          legacy_pattern='in[.]eyhn[.]pedals|group[.]in[.]eyhn[.]pedals|app[.]yellowplus[.]pedals|group[.]app[.]yellowplus[.]pedals|pedals[.](eyhn[.]in|yellowplus[.]app)|5RWW''Z7DDG9|6792''224057|Pedals'' TTY|PEDALS-''20260718'
           if rg -n -uu --hidden \
             --glob '!.git/**' \
             --glob '!**/node_modules/**' \
             --glob '!AGENTS.md' \
-            'in\.eyhn\.pedals|group\.in\.eyhn\.pedals|app\.yellowplus\.pedals|group\.app\.yellowplus\.pedals|pedals\.(eyhn\.in|yellowplus\.app)|5RWWZ7DDG9|6792224057|Pedals TTY|PEDALS-20260718' \
+            "$legacy_pattern" \
             .; then
             echo "Retired Pedals identifier found." >&2
             exit 1
