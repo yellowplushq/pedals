@@ -381,6 +381,14 @@ final class MainViewController: UIViewController {
             }
         case .stdout(let data):
             page.host.feed(data)
+        case .hostRestored:
+            // The relay dropped client→host frames while the daemon socket
+            // was gone. The grid announcement is the one lost frame type that
+            // never self-heals, so repeat it; the daemon treats a same-size
+            // resize as a no-op.
+            if let cols = page.host.cols, let rows = page.host.rows {
+                manager.sendResize(id, cols: cols, rows: rows)
+            }
         }
     }
 

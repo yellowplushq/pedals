@@ -10,7 +10,8 @@ packages:
   PedalsKit:
     path: ../shared/PedalsKit
   GhosttyKit:
-    path: Vendor/PedalsGhostty
+    url: https://github.com/Lakr233/libghostty-spm
+    from: 1.3.0
 
 targets:
   Pedals:

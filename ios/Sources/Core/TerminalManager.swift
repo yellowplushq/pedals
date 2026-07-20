@@ -38,6 +38,9 @@ final class TerminalManager {
     enum Output {
         case replay(Data)
         case stdout(Data)
+        /// The daemon's relay socket blipped; frames sent meanwhile were
+        /// dropped. Re-announce idempotent per-terminal state (grid size).
+        case hostRestored
     }
     let outputs = PassthroughSubject<(id: TerminalID, output: Output), Never>()
     let exits = PassthroughSubject<(id: TerminalID, code: Int), Never>()
@@ -194,6 +197,9 @@ final class TerminalManager {
         }
         channel.onStdout = { [weak self] data in
             self?.outputs.send((id: id, output: .stdout(data)))
+        }
+        channel.onHostRestored = { [weak self] in
+            self?.outputs.send((id: id, output: .hostRestored))
         }
         channel.onPhase = { [weak self] phase in
             self?.phases[id] = phase

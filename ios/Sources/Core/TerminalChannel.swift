@@ -33,6 +33,11 @@ final class TerminalChannel {
     }
 
     var onPhase: ((Phase) -> Void)?
+    /// The daemon's relay socket vanished and came back while our own link
+    /// stayed up. Client→host frames sent in that window were dropped by the
+    /// relay with no error, so the owner must re-announce idempotent state
+    /// (the applied grid size).
+    var onHostRestored: (() -> Void)?
     var onReplay: ((Data) -> Void)?
     var onStdout: ((Data) -> Void)?
     /// LRU stamp for the connection pool.
@@ -109,6 +114,16 @@ final class TerminalChannel {
         if hostPresent {
             peerLossTask?.cancel()
             peerLossTask = nil
+            guard everLive else { return }
+            // While the host socket was gone the relay dropped our frames
+            // without an error. A fresh replay resynchronizes the stream (and
+            // flips a stuck `.reconnecting` back to `.live` — stdout is
+            // discarded until a replay lands); `onHostRestored` lets the owner
+            // re-announce the applied grid for blips too short to change phase.
+            if phase != .live {
+                link.send(.requestReplay)
+            }
+            onHostRestored?()
             return
         }
         guard phase == .live, peerLossTask == nil else { return }

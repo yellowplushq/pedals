@@ -1,26 +1,23 @@
-//
-//  InMemoryTerminalSizeReport.swift
-//  libghostty-spm
-//
-
 import Foundation
+import GhosttyTerminal
 
 /// A mode 2048 in-band size report (`CSI 48 ; rows ; cols ; hpx ; wpx t`).
 ///
-/// Ghostty emits this report through the host write channel from the same
+/// Ghostty emits this report through the host input channel from the same
 /// termio critical section that applies a grid resize to terminal state, so a
 /// report is the authoritative signal that all subsequently parsed bytes meet
-/// a grid of at least this size. Host-managed sessions strip reports out of
-/// the write stream (a remote pty must never receive them as input) and
-/// surface them as applied-resize events.
-struct InMemoryTerminalSizeReport: Equatable {
+/// a grid of at least this size. Pedals strips reports out of the input
+/// stream (the remote pty must never receive them as keystrokes) and treats
+/// them as applied-resize events — the only safe trigger for `resize` frames.
+struct TerminalSizeReport: Equatable {
     var rows: UInt16
     var columns: UInt16
     var heightPixels: UInt32
     var widthPixels: UInt32
 
-    /// The escape sequence that enables mode 2048. Enabling is idempotent and
-    /// makes the terminal emit one immediate report for the current grid.
+    /// The escape sequence that enables mode 2048. Enabling is idempotent,
+    /// survives grid resizes (only a full reset clears it), and makes the
+    /// terminal emit one immediate report for the current grid.
     static let enableSequence = Data("\u{1b}[?2048h".utf8)
 
     /// Reports are short; anything longer than this cannot be one.
@@ -43,13 +40,13 @@ struct InMemoryTerminalSizeReport: Equatable {
     /// chunk boundaries. Malformed candidates pass through untouched.
     static func extract(
         from data: Data
-    ) -> (passthrough: Data, reports: [InMemoryTerminalSizeReport]) {
+    ) -> (passthrough: Data, reports: [TerminalSizeReport]) {
         guard data.contains(0x1B) else { return (data, []) }
 
         let bytes = [UInt8](data)
         var passthrough = [UInt8]()
         passthrough.reserveCapacity(bytes.count)
-        var reports = [InMemoryTerminalSizeReport]()
+        var reports = [TerminalSizeReport]()
         var index = 0
 
         while index < bytes.count {
@@ -73,7 +70,7 @@ struct InMemoryTerminalSizeReport: Equatable {
     private static func parse(
         _ bytes: [UInt8],
         at start: Int
-    ) -> (report: InMemoryTerminalSizeReport, end: Int)? {
+    ) -> (report: TerminalSizeReport, end: Int)? {
         let prefix: [UInt8] = Array("\u{1b}[48;".utf8)
         guard bytes.count - start > prefix.count,
               Array(bytes[start ..< start + prefix.count]) == prefix
@@ -101,7 +98,7 @@ struct InMemoryTerminalSizeReport: Equatable {
                       let columns = UInt16(exactly: fields[1])
                 else { return nil }
                 return (
-                    InMemoryTerminalSizeReport(
+                    TerminalSizeReport(
                         rows: rows,
                         columns: columns,
                         heightPixels: UInt32(fields[2]),
