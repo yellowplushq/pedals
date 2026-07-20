@@ -1,9 +1,9 @@
 import UIKit
 
-/// Persistent Safari-style input bar. The high-frequency terminal keys stay at
-/// the front, while symbols and navigation keys continue in a horizontal
-/// scroller. The pinned keyboard button swaps the system keyboard for Pedals'
-/// expanded terminal keyboard without changing the surrounding layout.
+/// Persistent Safari-style input bar. The compact key order is intentionally
+/// optimized for shell editing and remains horizontally scrollable. The pinned
+/// keyboard button swaps the system keyboard for Pedals' expanded terminal
+/// keyboard without changing the surrounding layout.
 final class TerminalToolbar: UIView {
     var onKey: ((TerminalInputKey) -> Void)?
     var onModifierToggle: ((TerminalModifier) -> Void)?
@@ -96,37 +96,31 @@ final class TerminalToolbar: UIView {
     }
 
     private func buildKeys() {
-        appendKey(title: "esc", key: .escape, accessibilityLabel: "Escape")
-
-        configureModifierButton(ctrlButton, title: "ctrl", modifier: .ctrl)
+        configureModifierButton(
+            ctrlButton, title: "CTRL", modifier: .ctrl, accessibilityLabel: "Control"
+        )
         stack.addArrangedSubview(ctrlButton)
 
-        configureModifierButton(altButton, title: "alt", modifier: .alt)
-        stack.addArrangedSubview(altButton)
-
-        appendKey(title: "tab", key: .tab, accessibilityLabel: "Tab")
-        appendKey(symbol: "arrow.left", key: .arrow(.left), accessibilityLabel: "Left")
+        appendKey(title: "TAB", key: .tab, accessibilityLabel: "Tab")
+        appendKey(title: "-", key: .text("-"), accessibilityLabel: "Hyphen")
+        appendKey(title: "/", key: .text("/"), accessibilityLabel: "Slash")
+        appendKey(title: "⇧TAB", key: .shiftTab, accessibilityLabel: "Shift Tab")
+        appendKey(title: "ESC", key: .escape, accessibilityLabel: "Escape")
         appendKey(symbol: "arrow.up", key: .arrow(.up), accessibilityLabel: "Up")
         appendKey(symbol: "arrow.down", key: .arrow(.down), accessibilityLabel: "Down")
+
+        #if targetEnvironment(macCatalyst)
+        let altTitle = "OPT"
+        #else
+        let altTitle = "ALT"
+        #endif
+        configureModifierButton(
+            altButton, title: altTitle, modifier: .alt, accessibilityLabel: "Alt"
+        )
+        stack.addArrangedSubview(altButton)
+
+        appendKey(symbol: "arrow.left", key: .arrow(.left), accessibilityLabel: "Left")
         appendKey(symbol: "arrow.right", key: .arrow(.right), accessibilityLabel: "Right")
-        appendKey(symbol: "doc.on.clipboard", key: .paste, accessibilityLabel: "Paste")
-
-        appendSpacer()
-
-        for symbol in ["|", "/", "~", "-", "_", "`", "'", "\""] {
-            appendKey(title: symbol, key: .text(symbol), accessibilityLabel: symbol)
-        }
-
-        appendSpacer()
-
-        appendKey(title: "home", key: .home, accessibilityLabel: "Home")
-        appendKey(title: "end", key: .end, accessibilityLabel: "End")
-        appendKey(title: "pg↑", key: .pageUp, accessibilityLabel: "Page Up")
-        appendKey(title: "pg↓", key: .pageDown, accessibilityLabel: "Page Down")
-        appendKey(title: "ins", key: .insert, accessibilityLabel: "Insert")
-        appendKey(title: "del", key: .deleteForward, accessibilityLabel: "Forward Delete")
-        appendKey(symbol: "delete.left", key: .backspace, accessibilityLabel: "Backspace")
-        appendKey(symbol: "return.left", key: .enter, accessibilityLabel: "Return")
     }
 
     private func configureKeyboardButton() {
@@ -145,9 +139,14 @@ final class TerminalToolbar: UIView {
     private func configureModifierButton(
         _ button: TerminalToolbarButton,
         title: String,
-        modifier: TerminalModifier
+        modifier: TerminalModifier,
+        accessibilityLabel: String? = nil
     ) {
-        configure(button, title: title, accessibilityLabel: title.capitalized)
+        configure(
+            button,
+            title: title,
+            accessibilityLabel: accessibilityLabel ?? title.capitalized
+        )
         button.addAction(
             UIAction { [weak self] _ in self?.onModifierToggle?(modifier) },
             for: .touchUpInside
@@ -169,13 +168,6 @@ final class TerminalToolbar: UIView {
         stack.addArrangedSubview(button)
     }
 
-    private func appendSpacer() {
-        let spacer = UIView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        spacer.widthAnchor.constraint(equalToConstant: 8).isActive = true
-        stack.addArrangedSubview(spacer)
-    }
-
     private func configure(
         _ button: TerminalToolbarButton,
         title: String? = nil,
@@ -185,6 +177,9 @@ final class TerminalToolbar: UIView {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: 42).isActive = true
         button.accessibilityLabel = accessibilityLabel
+        button.accessibilityIdentifier = "terminal-toolbar-" + accessibilityLabel
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
 
         if let title {
             button.setTitle(title, for: .normal)
@@ -233,5 +228,7 @@ private final class TerminalToolbarButton: UIButton {
         } else {
             .clear
         }
+        layer.borderWidth = isSelected ? 1 : 0
+        layer.borderColor = PedalsTheme.uiContent.withAlphaComponent(0.92).cgColor
     }
 }

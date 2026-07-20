@@ -13,7 +13,7 @@ final class TerminalHost {
 
     /// Keyboard/accessory-bar input bytes, to be sent as `stdin` frames.
     var onInput: ((Data) -> Void)?
-    /// Mirrors libghostty's sticky Ctrl/Alt state into Pedals' custom toolbar.
+    /// Mirrors Pedals' one-shot modifier state into its custom input surfaces.
     var onModifierStateChange: ((TerminalModifierState) -> Void)?
     /// Focus follows UIKit's first responder state, including a terminal tap
     /// that dismisses either the system or Pedals keyboard.
@@ -25,6 +25,7 @@ final class TerminalHost {
     private var viewport: InMemoryTerminalViewport?
     private weak var selectionOverlay: TerminalSelectionOverlay?
     private var selectionStartedWithFirstResponder = false
+    private var shiftIsArmed = false
 
     var isTextSelectionActive: Bool { selectionOverlay != nil }
 
@@ -72,6 +73,9 @@ final class TerminalHost {
             guard let self else { return }
             onModifierStateChange?(modifierState)
         }
+        view.softwareKeyboardReturnHandler = { [weak self] in
+            self?.sendToolbarKey(.enter)
+        }
         view.focusChangeHandler = { [weak self] focused in
             self?.onFocusChange?(focused)
         }
@@ -79,29 +83,46 @@ final class TerminalHost {
 
     var modifierState: TerminalModifierState {
         TerminalModifierState(
+            shift: shiftIsArmed,
             ctrl: view.stickyActivation(for: .ctrl) != .inactive,
-            alt: view.stickyActivation(for: .alt) != .inactive
+            alt: view.stickyActivation(for: .alt) != .inactive,
+            command: view.stickyActivation(for: .command) != .inactive
         )
     }
 
     func toggleModifier(_ modifier: TerminalModifier) {
         switch modifier {
-        case .ctrl: view.toggleStickyModifier(.ctrl)
-        case .alt: view.toggleStickyModifier(.alt)
+        case .shift:
+            shiftIsArmed.toggle()
+            onModifierStateChange?(modifierState)
+        case .ctrl:
+            toggleOneShotStickyModifier(.ctrl)
+        case .alt:
+            toggleOneShotStickyModifier(.alt)
+        case .command:
+            toggleOneShotStickyModifier(.command)
         }
     }
 
     func sendToolbarKey(_ key: TerminalInputKey) {
         switch key {
         case .text(let text):
-            // Use libghostty's text path so sticky Ctrl/Alt and IME state are
-            // consumed by the same machinery as the system keyboard.
-            view.insertText(text)
+            // Use libghostty's text path so sticky Control/Option/Command and
+            // IME state are consumed by the same machinery as the system keyboard.
+            let output = shiftIsArmed
+                ? TerminalKeyboardText.applyingShift(to: text)
+                : text
+            let consumedShift = shiftIsArmed
+            shiftIsArmed = false
+            view.insertText(output)
+            if consumedShift {
+                onModifierStateChange?(modifierState)
+            }
         case .paste:
             if let text = UIPasteboard.general.string, !text.isEmpty {
                 onInput?(Data(text.utf8))
             }
-            view.resetStickyModifiers()
+            consumeModifiers()
         case .dismissKeyboard:
             // UIKit may immediately restore the responder while dispatching a
             // control event from inside its inputView. End editing on the next
@@ -117,7 +138,7 @@ final class TerminalHost {
             // Special keys bypass libghostty's text path, so consume the
             // sticky state explicitly after encoding it into the sequence.
             if !modifiers.isEmpty {
-                view.resetStickyModifiers()
+                consumeModifiers()
             }
         }
     }
@@ -131,10 +152,36 @@ final class TerminalHost {
 
     private var activeKeyModifiers: TerminalKeyModifiers {
         var modifiers: TerminalKeyModifiers = []
+        if shiftIsArmed { modifiers.insert(.shift) }
         if view.stickyActivation(for: .ctrl) != .inactive { modifiers.insert(.ctrl) }
         if view.stickyActivation(for: .alt) != .inactive { modifiers.insert(.alt) }
         if view.stickyActivation(for: .command) != .inactive { modifiers.insert(.command) }
         return modifiers
+    }
+
+    /// libghostty's built-in sticky state supports double-tap locking. Pedals'
+    /// keyboard deliberately uses simpler one-shot modifiers: tap to arm, tap
+    /// again to cancel, and any non-modifier key consumes the entire chord.
+    private func toggleOneShotStickyModifier(_ modifier: TerminalPublicStickyModifier) {
+        if view.stickyActivation(for: modifier) == .inactive {
+            view.toggleStickyModifier(modifier)
+            return
+        }
+
+        // `.armed` may advance to `.locked` when tapped quickly, so continue
+        // until the public state reports inactive (at most two transitions).
+        for _ in 0 ..< 2 where view.stickyActivation(for: modifier) != .inactive {
+            view.toggleStickyModifier(modifier)
+        }
+    }
+
+    private func consumeModifiers() {
+        let hadShift = shiftIsArmed
+        shiftIsArmed = false
+        view.resetStickyModifiers()
+        if hadShift {
+            onModifierStateChange?(modifierState)
+        }
     }
 
     /// Feed live remote `stdout` bytes into the emulator.
@@ -346,22 +393,68 @@ extension TerminalHost: TerminalSurfaceGridResizeDelegate,
 final class PedalsTerminalView: TerminalView {
     private var replacementInputView: UIView?
     private var preservesFirstResponderDuringSelection = false
+    private var hardwareReturnIsPressed = false
     private(set) var wasFirstResponderBeforeCurrentTouch = false
     private weak var focusTouch: UITouch?
     private var focusTouchStartPoint: CGPoint?
     private var focusTouchStartTimestamp: TimeInterval?
     private var focusTouchMaximumMovement: CGFloat = 0
     private var focusTouchIsEligible = false
+    var softwareKeyboardReturnHandler: (() -> Void)?
     var focusChangeHandler: ((Bool) -> Void)?
 
     override var inputView: UIView? { replacementInputView }
 
     override func insertText(_ text: String) {
-        // UIKit delivers the software keyboard's Return key as LF. Sending it
-        // through Ghostty as ordinary text makes TUIs treat it as a literal
-        // newline instead of the terminal Enter key (CR). Only normalize the
-        // standalone Return event so multiline paste remains byte-for-byte.
+        // `ghostty_surface_text` is a text/paste path, not a key path. Even if
+        // LF is changed to CR before calling super, a TUI can still receive it
+        // as inserted text rather than the terminal Enter key. Route a
+        // standalone software-keyboard Return through the same direct CR path
+        // as our terminal keyboard instead. Multiline paste stays untouched.
+        //
+        // Physical keyboards deliver Return through `pressesBegan` first and
+        // Ghostty suppresses the matching `insertText` callback. Keep that
+        // callback in the superclass path so we do not send Enter twice.
+        if TerminalSystemTextInput.shouldSendTerminalEnter(
+            text,
+            hardwareReturnIsPressed: hardwareReturnIsPressed,
+            hasMarkedText: markedTextRange != nil
+        ), let softwareKeyboardReturnHandler
+        {
+            softwareKeyboardReturnHandler()
+            return
+        }
         super.insertText(TerminalSystemTextInput.normalized(text))
+    }
+
+    override func pressesBegan(
+        _ presses: Set<UIPress>,
+        with event: UIPressesEvent?
+    ) {
+        if presses.contains(where: Self.isHardwareReturn) {
+            hardwareReturnIsPressed = true
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(
+        _ presses: Set<UIPress>,
+        with event: UIPressesEvent?
+    ) {
+        super.pressesEnded(presses, with: event)
+        if presses.contains(where: Self.isHardwareReturn) {
+            hardwareReturnIsPressed = false
+        }
+    }
+
+    override func pressesCancelled(
+        _ presses: Set<UIPress>,
+        with event: UIPressesEvent?
+    ) {
+        super.pressesCancelled(presses, with: event)
+        if presses.contains(where: Self.isHardwareReturn) {
+            hardwareReturnIsPressed = false
+        }
     }
 
     @discardableResult
@@ -504,6 +597,11 @@ final class PedalsTerminalView: TerminalView {
         focusTouchMaximumMovement = 0
         focusTouchIsEligible = false
     }
+
+    private static func isHardwareReturn(_ press: UIPress) -> Bool {
+        guard let usage = press.key?.keyCode else { return false }
+        return usage == .keyboardReturnOrEnter || usage == .keypadEnter
+    }
 }
 
 /// A terminal focus change is deliberately stricter than UIKit's long-press
@@ -520,6 +618,16 @@ enum TerminalFocusTapIntent {
 }
 
 enum TerminalSystemTextInput {
+    static func shouldSendTerminalEnter(
+        _ text: String,
+        hardwareReturnIsPressed: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        !hardwareReturnIsPressed
+            && !hasMarkedText
+            && (text == "\n" || text == "\r")
+    }
+
     static func normalized(_ text: String) -> String {
         text == "\n" ? "\r" : text
     }

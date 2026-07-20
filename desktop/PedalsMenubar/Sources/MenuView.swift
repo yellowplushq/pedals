@@ -35,7 +35,7 @@ struct MenuView: View {
         .tint(PedalsTheme.content)
         .onDisappear {
             showingPairingCode = false
-            model.clearPairingCode()
+            model.schedulePairingRevocationAfterDefocus()
         }
     }
 
@@ -96,7 +96,7 @@ struct MenuView: View {
                 Button {
                     showingPairingCode.toggle()
                     if showingPairingCode {
-                        model.fetchPairingCode()
+                        model.presentPairingCode()
                     } else {
                         model.clearPairingCode()
                     }

@@ -1,3 +1,4 @@
+import GhosttyTerminal
 import UIKit
 import XCTest
 
@@ -5,6 +6,31 @@ import XCTest
 
 final class TerminalInputKeyTests: XCTestCase {
     func testSystemKeyboardReturnBecomesTerminalEnterWithoutChangingPaste() {
+        XCTAssertTrue(TerminalSystemTextInput.shouldSendTerminalEnter(
+            "\n",
+            hardwareReturnIsPressed: false,
+            hasMarkedText: false
+        ))
+        XCTAssertTrue(TerminalSystemTextInput.shouldSendTerminalEnter(
+            "\r",
+            hardwareReturnIsPressed: false,
+            hasMarkedText: false
+        ))
+        XCTAssertFalse(TerminalSystemTextInput.shouldSendTerminalEnter(
+            "\n",
+            hardwareReturnIsPressed: true,
+            hasMarkedText: false
+        ))
+        XCTAssertFalse(TerminalSystemTextInput.shouldSendTerminalEnter(
+            "\n",
+            hardwareReturnIsPressed: false,
+            hasMarkedText: true
+        ))
+        XCTAssertFalse(TerminalSystemTextInput.shouldSendTerminalEnter(
+            "echo one\necho two",
+            hardwareReturnIsPressed: false,
+            hasMarkedText: false
+        ))
         XCTAssertEqual(TerminalSystemTextInput.normalized("\n"), "\r")
         XCTAssertEqual(TerminalSystemTextInput.normalized("\r"), "\r")
         XCTAssertEqual(
@@ -42,6 +68,15 @@ final class TerminalInputKeyTests: XCTestCase {
                 .applying(toUnmodifiedByte: UInt8(ascii: "[")),
             Data([0x1b, 0x1b])
         )
+        XCTAssertEqual(
+            TerminalKeyModifiers.shift.applying(toUnmodifiedByte: UInt8(ascii: "a")),
+            Data([UInt8(ascii: "A")])
+        )
+        XCTAssertEqual(
+            TerminalKeyModifiers.shift.union(.ctrl)
+                .applying(toUnmodifiedByte: UInt8(ascii: "2")),
+            Data([0x00])
+        )
     }
 
     func testCursorAndNavigationSequences() {
@@ -57,6 +92,24 @@ final class TerminalInputKeyTests: XCTestCase {
         XCTAssertEqual(TerminalInputKey.home.bytes(), bytes("\u{1b}[H"))
         XCTAssertEqual(TerminalInputKey.end.bytes(), bytes("\u{1b}[F"))
         XCTAssertEqual(TerminalInputKey.shiftTab.bytes(), bytes("\u{1b}[Z"))
+        XCTAssertEqual(
+            TerminalInputKey.tab.bytes(modifiers: [.shift]),
+            bytes("\u{1b}[Z")
+        )
+        XCTAssertEqual(
+            TerminalInputKey.arrow(.right).bytes(
+                modifiers: [.shift, .ctrl, .alt, .command]
+            ),
+            bytes("\u{1b}[1;16C")
+        )
+    }
+
+    func testShiftedQWERTYCharactersUseUSKeyboardPairs() {
+        XCTAssertEqual(TerminalKeyboardText.applyingShift(to: "q"), "Q")
+        XCTAssertEqual(TerminalKeyboardText.applyingShift(to: "1"), "!")
+        XCTAssertEqual(TerminalKeyboardText.applyingShift(to: "["), "{")
+        XCTAssertEqual(TerminalKeyboardText.applyingShift(to: "/"), "?")
+        XCTAssertEqual(TerminalKeyboardText.applyingShift(to: " "), " ")
     }
 
     func testFunctionKeySequences() {
@@ -75,6 +128,7 @@ final class TerminalInputKeyTests: XCTestCase {
 
     func testEditingAndAppOnlyKeys() {
         XCTAssertEqual(TerminalInputKey.escape.bytes(), Data([0x1b]))
+        XCTAssertEqual(TerminalInputKey.enter.bytes(), Data([0x0d]))
         XCTAssertEqual(TerminalInputKey.backspace.bytes(), Data([0x7f]))
         XCTAssertEqual(
             TerminalInputKey.backspace.bytes(modifiers: [.ctrl]),
@@ -106,13 +160,202 @@ final class TerminalInputSurfaceTests: XCTestCase {
         XCTAssertGreaterThan(scroll.contentSize.width, scroll.bounds.width)
     }
 
-    func testExpandedKeyboardContainsFunctionAndDismissKeys() {
+    func testCompactToolbarUsesRequestedKeyOrder() throws {
+        let toolbar = TerminalToolbar(
+            frame: CGRect(x: 0, y: 0, width: 344, height: TerminalToolbar.height)
+        )
+        toolbar.layoutIfNeeded()
+
+        let identifiers = [
+            "control", "tab", "hyphen", "slash", "shift-tab", "escape",
+            "up", "down", "alt", "left", "right",
+        ]
+        let buttons = try identifiers.map { identifier in
+            try XCTUnwrap(
+                findSubview(
+                    in: toolbar,
+                    identifier: "terminal-toolbar-\(identifier)"
+                ) as? UIButton
+            )
+        }
+
+        let xPositions = buttons.map(\.frame.minX)
+        XCTAssertEqual(xPositions, xPositions.sorted())
+        XCTAssertEqual(
+            buttons.compactMap { $0.title(for: .normal) },
+            ["CTRL", "TAB", "-", "/", "⇧TAB", "ESC", "ALT"]
+        )
+    }
+
+    func testExpandedKeyboardContainsEssentialKeysOnly() {
         let keyboard = TerminalKeyboardView()
         keyboard.layoutIfNeeded()
 
         XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-f12"))
-        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-hide-keyboard"))
+        XCTAssertNil(findSubview(in: keyboard, identifier: "terminal-key-hide-keyboard"))
+        XCTAssertNil(findSubview(in: keyboard, identifier: "terminal-key-paste"))
+        XCTAssertNil(findSubview(in: keyboard, identifier: "terminal-key-shift-tab"))
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-command"))
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-option"))
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-tab"))
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-q"))
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-keyboard-fixed-footer"))
+        let pageControl = findSubview(
+            in: keyboard,
+            identifier: "terminal-keyboard-page-control"
+        ) as? UIPageControl
+        XCTAssertEqual(pageControl?.numberOfPages, 2)
+        XCTAssertEqual(pageControl?.currentPage, 0)
         XCTAssertGreaterThan(keyboard.intrinsicContentSize.height, 0)
+    }
+
+    func testExpandedKeyboardUsesInteractiveHorizontalPagingGesture() throws {
+        let keyboard = TerminalKeyboardView()
+        keyboard.frame = CGRect(
+            x: 0, y: 0, width: 402,
+            height: keyboard.intrinsicContentSize.height
+        )
+        keyboard.layoutIfNeeded()
+        let pageContainer = try XCTUnwrap(
+            findSubview(
+                in: keyboard,
+                identifier: "terminal-keyboard-page-container"
+            ) as? UIScrollView
+        )
+
+        XCTAssertTrue(pageContainer.isPagingEnabled)
+        XCTAssertFalse(pageContainer.bounces)
+        XCTAssertTrue(pageContainer.delegate === keyboard)
+        XCTAssertFalse(pageContainer.isScrollEnabled)
+        let pagePan = try XCTUnwrap(
+            pageContainer.gestureRecognizers?.first {
+                $0.name == "terminal-keyboard-page-pan"
+            } as? UIPanGestureRecognizer
+        )
+        XCTAssertEqual(pagePan.minimumNumberOfTouches, 1)
+        XCTAssertEqual(pagePan.maximumNumberOfTouches, 1)
+        XCTAssertEqual(
+            pageContainer.contentSize.width,
+            pageContainer.bounds.width * 2 + 12,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(
+            pageContainer.contentOffset.x,
+            0,
+            accuracy: 0.5
+        )
+        keyboard.showQWERTYPage(animated: false)
+        XCTAssertEqual(
+            pageContainer.contentOffset.x,
+            pageContainer.bounds.width + 12,
+            accuracy: 0.5
+        )
+        XCTAssertFalse(
+            pageContainer.gestureRecognizers?.contains { $0 is UISwipeGestureRecognizer } ?? true
+        )
+    }
+
+    func testTabStaysOnKeyboardPageInsteadOfModifierFooter() throws {
+        let keyboard = TerminalKeyboardView()
+        let footer = try XCTUnwrap(
+            findSubview(in: keyboard, identifier: "terminal-keyboard-fixed-footer")
+        )
+        let tab = try XCTUnwrap(
+            findSubview(in: keyboard, identifier: "terminal-key-tab")
+        )
+
+        XCTAssertFalse(tab.isDescendant(of: footer))
+        for identifier in ["shift", "control", "option", "command"] {
+            let modifier = try XCTUnwrap(
+                findSubview(in: keyboard, identifier: "terminal-key-\(identifier)")
+            )
+            XCTAssertTrue(modifier.isDescendant(of: footer))
+        }
+    }
+
+    func testExpandedKeyboardKeepsOneShotModifiersVisibleAcrossPages() throws {
+        let keyboard = TerminalKeyboardView()
+        keyboard.setModifierState(TerminalModifierState(
+            shift: true, ctrl: true, alt: true, command: true
+        ))
+
+        for identifier in ["shift", "control", "option", "command"] {
+            let button = try XCTUnwrap(
+                findSubview(in: keyboard, identifier: "terminal-key-\(identifier)") as? UIButton
+            )
+            XCTAssertTrue(button.isSelected)
+            XCTAssertEqual(button.layer.borderWidth, 1)
+        }
+
+        let q = try XCTUnwrap(
+            findSubview(in: keyboard, identifier: "terminal-key-q") as? UIButton
+        )
+        XCTAssertEqual(q.title(for: .normal), "Q")
+
+        keyboard.showQWERTYPage(animated: false)
+        let pageControl = try XCTUnwrap(
+            findSubview(
+                in: keyboard,
+                identifier: "terminal-keyboard-page-control"
+            ) as? UIPageControl
+        )
+        XCTAssertEqual(pageControl.currentPage, 1)
+        XCTAssertNotNil(findSubview(in: keyboard, identifier: "terminal-key-tab"))
+    }
+
+    func testExpandedKeyboardVisualLayout() {
+        let keyboard = TerminalKeyboardView()
+        keyboard.frame = CGRect(
+            x: 0, y: 0, width: 402,
+            height: keyboard.intrinsicContentSize.height
+        )
+        keyboard.layoutIfNeeded()
+        attachSnapshot(of: keyboard, named: "terminal-keyboard")
+
+        keyboard.showQWERTYPage(animated: false)
+        keyboard.layoutIfNeeded()
+        attachSnapshot(of: keyboard, named: "qwerty-keyboard")
+    }
+
+    func testTerminalViewRoutesSoftwareReturnThroughDirectHandler() {
+        let view = PedalsTerminalView(frame: .zero)
+        var returnCount = 0
+        view.softwareKeyboardReturnHandler = { returnCount += 1 }
+
+        view.insertText("\n")
+        view.insertText("\r")
+        view.insertText("echo one\necho two")
+
+        XCTAssertEqual(returnCount, 2)
+    }
+
+    func testTerminalHostConsumesCompleteModifierChordAfterOneKey() {
+        let host = TerminalHost(controller: TerminalController())
+        var input: Data?
+        host.onInput = { input = $0 }
+
+        host.toggleModifier(.shift)
+        host.toggleModifier(.ctrl)
+        host.toggleModifier(.alt)
+        host.toggleModifier(.command)
+        XCTAssertEqual(
+            host.modifierState,
+            TerminalModifierState(shift: true, ctrl: true, alt: true, command: true)
+        )
+
+        host.sendToolbarKey(.arrow(.right))
+
+        XCTAssertEqual(input, Data("\u{1b}[1;16C".utf8))
+        XCTAssertEqual(host.modifierState, TerminalModifierState())
+    }
+
+    func testTappingArmedModifierAgainCancelsInsteadOfLocking() {
+        let host = TerminalHost(controller: TerminalController())
+
+        host.toggleModifier(.command)
+        XCTAssertTrue(host.modifierState.command)
+        host.toggleModifier(.command)
+        XCTAssertFalse(host.modifierState.command)
     }
 
     private func findSubview(in root: UIView, identifier: String) -> UIView? {
@@ -123,5 +366,15 @@ final class TerminalInputSurfaceTests: XCTestCase {
             }
         }
         return nil
+    }
+
+    private func attachSnapshot(of view: UIView, named name: String) {
+        let image = UIGraphicsImageRenderer(bounds: view.bounds).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 }

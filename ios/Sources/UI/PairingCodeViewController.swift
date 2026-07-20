@@ -11,10 +11,16 @@ final class PairingCodeViewController: UIViewController {
     private let titleLabel = UILabel()
     private let bodyLabel = UILabel()
     private let downloadGuide = PairingDownloadGuideView()
+    private let inputStack = UIStackView()
+    private let inputRegionGuide = UILayoutGuide()
     private let codeField = AEOTPTextField()
     private let statusLabel = UILabel()
     private let pairButton = UIButton(type: .system)
-    private var downloadGuideHeightConstraint: NSLayoutConstraint?
+    private var headerTopConstraint: NSLayoutConstraint?
+    private var inputBelowGuideConstraint: NSLayoutConstraint?
+    private var inputAboveButtonConstraint: NSLayoutConstraint?
+    private var inputCenteredConstraint: NSLayoutConstraint?
+    private var inputKeyboardCenteredConstraint: NSLayoutConstraint?
     private var pairButtonKeyboardConstraint: NSLayoutConstraint?
     private var pairButtonFrozenConstraint: NSLayoutConstraint?
     private var dismissalSnapshot: UIImageView?
@@ -91,29 +97,47 @@ final class PairingCodeViewController: UIViewController {
         pairButton.accessibilityIdentifier = "pedals.pairing.submit"
         pairButton.addAction(UIAction { [weak self] _ in self?.submit() }, for: .touchUpInside)
 
-        let input = UIStackView(arrangedSubviews: [bodyLabel, codeField, statusLabel])
-        input.axis = .vertical
-        input.spacing = 10
-        input.setCustomSpacing(18, after: bodyLabel)
+        [bodyLabel, codeField, statusLabel].forEach(inputStack.addArrangedSubview)
+        inputStack.axis = .vertical
+        inputStack.spacing = 10
+        inputStack.setCustomSpacing(18, after: bodyLabel)
+        inputStack.accessibilityIdentifier = "pedals.pairing.input"
 
-        [closeButton, titleLabel, downloadGuide, input, pairButton].forEach {
+        [closeButton, titleLabel, downloadGuide, inputStack, pairButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview($0)
         }
+        view.addLayoutGuide(inputRegionGuide)
 
-        let downloadGuideHeightConstraint = downloadGuide.heightAnchor.constraint(
-            equalToConstant: 160
+        let downloadGuideHeightConstraint = downloadGuide.heightAnchor.constraint(equalToConstant: 160)
+
+        let headerTopConstraint = closeButton.topAnchor.constraint(
+            equalTo: view.safeAreaLayoutGuide.topAnchor,
+            constant: 14
         )
-        self.downloadGuideHeightConstraint = downloadGuideHeightConstraint
+        self.headerTopConstraint = headerTopConstraint
 
-        let inputBelowGuide = input.topAnchor.constraint(
+        let inputBelowGuide = inputStack.topAnchor.constraint(
             greaterThanOrEqualTo: downloadGuide.bottomAnchor,
             constant: 28
         )
         inputBelowGuide.priority = .defaultHigh
+        inputBelowGuideConstraint = inputBelowGuide
 
-        let inputCentered = input.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        let inputAboveButton = inputStack.bottomAnchor.constraint(
+            lessThanOrEqualTo: pairButton.topAnchor,
+            constant: -20
+        )
+        inputAboveButtonConstraint = inputAboveButton
+
+        let inputCentered = inputStack.centerYAnchor.constraint(equalTo: view.centerYAnchor)
         inputCentered.priority = .defaultHigh
+        inputCenteredConstraint = inputCentered
+
+        let inputKeyboardCentered = inputStack.centerYAnchor.constraint(
+            equalTo: inputRegionGuide.centerYAnchor
+        )
+        inputKeyboardCenteredConstraint = inputKeyboardCentered
 
         let pairButtonKeyboardConstraint = pairButton.bottomAnchor.constraint(
             equalTo: view.keyboardLayoutGuide.topAnchor,
@@ -122,7 +146,7 @@ final class PairingCodeViewController: UIViewController {
         self.pairButtonKeyboardConstraint = pairButtonKeyboardConstraint
 
         NSLayoutConstraint.activate([
-            closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 14),
+            headerTopConstraint,
             closeButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             closeButton.widthAnchor.constraint(equalToConstant: 44),
             closeButton.heightAnchor.constraint(equalToConstant: 44),
@@ -143,9 +167,12 @@ final class PairingCodeViewController: UIViewController {
             downloadGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             downloadGuideHeightConstraint,
 
-            input.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            input.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-            input.bottomAnchor.constraint(lessThanOrEqualTo: pairButton.topAnchor, constant: -20),
+            inputRegionGuide.topAnchor.constraint(equalTo: downloadGuide.bottomAnchor),
+            inputRegionGuide.bottomAnchor.constraint(equalTo: pairButton.topAnchor),
+
+            inputStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            inputStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            inputAboveButton,
             inputBelowGuide,
             inputCentered,
             codeField.heightAnchor.constraint(equalToConstant: 52),
@@ -160,8 +187,8 @@ final class PairingCodeViewController: UIViewController {
     private func observeKeyboard() {
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(keyboardWillShow(_:)),
-            name: UIResponder.keyboardWillShowNotification,
+            selector: #selector(keyboardWillChangeFrame(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -173,15 +200,22 @@ final class PairingCodeViewController: UIViewController {
     }
 
     @objc
-    private func keyboardWillShow(_ notification: Notification) {
+    private func keyboardWillChangeFrame(_ notification: Notification) {
         guard !isDismissing else { return }
-        setDownloadGuideVisible(false, notification: notification)
+        guard
+            let screenFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey]
+                as? CGRect
+        else { return }
+        let keyboardFrame = view.convert(screenFrame, from: nil)
+        let visible = keyboardFrame.minY < view.bounds.maxY - 0.5
+            && keyboardFrame.maxY > view.bounds.minY
+        updateLayoutForKeyboard(notification: notification, visible: visible)
     }
 
     @objc
     private func keyboardWillHide(_ notification: Notification) {
         guard !isDismissing else { return }
-        setDownloadGuideVisible(true, notification: notification)
+        updateLayoutForKeyboard(notification: notification, visible: false)
     }
 
     /// Dismissal overlaps two system animations: the full-screen controller
@@ -233,17 +267,28 @@ final class PairingCodeViewController: UIViewController {
         frozen.isActive = true
         pairButtonFrozenConstraint = frozen
 
-        downloadGuide.layer.removeAllAnimations()
+        view.layer.removeAllAnimations()
         view.isUserInteractionEnabled = false
     }
 
-    private func setDownloadGuideVisible(_ visible: Bool, notification: Notification) {
-        guard downloadGuideHeightConstraint?.constant != (visible ? 160 : 0) else { return }
+    private func updateLayoutForKeyboard(notification: Notification, visible: Bool) {
         view.layoutIfNeeded()
+
         if visible {
-            downloadGuide.isHidden = false
+            inputCenteredConstraint?.isActive = false
+            inputKeyboardCenteredConstraint?.isActive = true
+            inputBelowGuideConstraint?.constant = 12
+            inputBelowGuideConstraint?.priority = UILayoutPriority(999)
+            inputAboveButtonConstraint?.constant = -12
+            headerTopConstraint?.constant = 14 - requiredUpwardShift(for: notification)
+        } else {
+            inputKeyboardCenteredConstraint?.isActive = false
+            inputCenteredConstraint?.isActive = true
+            inputBelowGuideConstraint?.constant = 28
+            inputBelowGuideConstraint?.priority = .defaultHigh
+            inputAboveButtonConstraint?.constant = -20
+            headerTopConstraint?.constant = 14
         }
-        downloadGuideHeightConstraint?.constant = visible ? 160 : 0
 
         let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey]
             as? TimeInterval ?? 0.25
@@ -256,11 +301,39 @@ final class PairingCodeViewController: UIViewController {
             options: UIView.AnimationOptions(rawValue: rawCurve << 16)
                 .union(.beginFromCurrentState)
         ) {
-            self.downloadGuide.alpha = visible ? 1 : 0
             self.view.layoutIfNeeded()
-        } completion: { _ in
-            self.downloadGuide.isHidden = !visible
         }
+    }
+
+    /// Returns only the extra movement needed after compacting the vertical
+    /// gaps. The download card is never collapsed; on short screens its whole
+    /// content group moves upward, capped so the complete card remains visible.
+    private func requiredUpwardShift(for notification: Notification) -> CGFloat {
+        guard
+            let screenFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey]
+                as? CGRect
+        else { return 0 }
+
+        let keyboardFrame = view.convert(screenFrame, from: nil)
+        let keyboardTop = min(max(keyboardFrame.minY, 0), view.bounds.maxY)
+        let inputWidth = max(view.bounds.width - 48, 1)
+        let inputHeight = inputStack.systemLayoutSizeFitting(
+            CGSize(width: inputWidth, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        ).height
+
+        let safeTop = view.safeAreaInsets.top
+        let guideTop = safeTop + 14 + 44 + 18
+        let guideBottom = guideTop + 160
+        let pairButtonTop = keyboardTop - 16 - 48
+        let requiredBottom = guideBottom + 12 + inputHeight + 12
+        let shortage = max(0, requiredBottom - pairButtonTop)
+
+        // Keep the entire 160pt illustration card on-screen even when the
+        // navigation row needs to slide behind the status bar on a short phone.
+        let maximumShiftKeepingGuideVisible = max(0, guideTop - 8)
+        return min(shortage, maximumShiftKeepingGuideVisible)
     }
 
     private func configureInput() {
@@ -335,12 +408,49 @@ final class PairingCodeViewController: UIViewController {
                 pairButton.configuration?.showsActivityIndicator = false
                 pairButton.configuration?.image = UIImage(systemName: "arrow.clockwise")
                 pairButton.configuration?.title = "Try Again"
-                statusLabel.text = "Code expired or couldn’t be used. Request a new code on your computer."
+                statusLabel.text = PairingErrorPresentation.message(for: error)
                 statusLabel.textColor = PedalsTheme.uiCritical
                 updateInputState()
                 codeField.becomeFirstResponder()
             }
         }
+    }
+}
+
+enum PairingErrorPresentation {
+    static func message(for error: any Error) -> String {
+        if let storeError = error as? PairingStore.StoreError {
+            switch storeError {
+            case .serviceMismatch:
+                return "This installation has pairing data from another Pedals service. Restart the app and try again."
+            case .missingClientIdentity:
+                return "Pairing data is incomplete. Restart Pedals and try again."
+            case .compensationFailed:
+                return "Pairing couldn’t be saved securely. Try again."
+            }
+        }
+
+        if let apiError = error as? PedalsServiceAPI.APIError {
+            switch apiError {
+            case .rejected(let status, _):
+                if status == 400 || status == 404 || status == 410 {
+                    return "Code expired or couldn’t be used. Request a new code on your computer."
+                }
+                if status == 429 {
+                    return "Too many pairing attempts. Wait a moment and try again."
+                }
+                return "Pedals couldn’t complete pairing. Try again."
+            case .serviceMismatch:
+                return "This pairing code belongs to another Pedals service."
+            case .invalidResponse:
+                return "Pedals returned an unexpected response. Try again."
+            }
+        }
+
+        if error is URLError {
+            return "Couldn’t reach Pedals. Check your connection and try again."
+        }
+        return "Couldn’t connect to your computer. Try again."
     }
 }
 
@@ -402,12 +512,23 @@ private final class PairingDownloadGuideView: UIView {
         caption.textColor = PedalsTheme.uiSecondaryContent
         caption.textAlignment = .center
 
-        var linkConfiguration = UIButton.Configuration.plain()
-        linkConfiguration.title = "pedals.air.build"
-        linkConfiguration.baseForegroundColor = PedalsTheme.uiContent
-        linkConfiguration.contentInsets = .zero
-        PedalsTheme.applyTextFont(to: &linkConfiguration, emphasized: true)
-        let link = UIButton(configuration: linkConfiguration)
+        // A configuration title can report its intrinsic width before the
+        // scaled semibold font transformer is applied, which clips the final
+        // characters on some content-size/device combinations. Configure the
+        // title label directly so Auto Layout measures the font it renders.
+        let link = UIButton(type: .system)
+        link.setTitle("pedals.air.build", for: .normal)
+        link.setTitleColor(PedalsTheme.uiContent, for: .normal)
+        link.titleLabel?.font = PedalsTheme.uiEmphasizedTextFont
+        link.titleLabel?.adjustsFontForContentSizeCategory = true
+        link.titleLabel?.adjustsFontSizeToFitWidth = true
+        link.titleLabel?.minimumScaleFactor = 0.72
+        link.titleLabel?.lineBreakMode = .byClipping
+        link.titleLabel?.clipsToBounds = false
+        link.clipsToBounds = false
+        link.contentHorizontalAlignment = .center
+        link.setContentCompressionResistancePriority(.required, for: .horizontal)
+        link.accessibilityIdentifier = "pedals.pairing.website"
         link.accessibilityLabel = "Download Pedals from pedals.air.build"
         link.accessibilityHint = "Opens the Pedals website"
         link.addAction(UIAction { _ in
@@ -418,6 +539,8 @@ private final class PairingDownloadGuideView: UIView {
         text.axis = .vertical
         text.alignment = .center
         text.spacing = 1
+        link.widthAnchor.constraint(lessThanOrEqualTo: text.widthAnchor).isActive = true
+        link.heightAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
 
         let stack = UIStackView(arrangedSubviews: [icons, text])
         stack.axis = .vertical
