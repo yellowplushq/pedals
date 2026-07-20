@@ -1,0 +1,490 @@
+name: Release TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: Marketing version; leave blank to use ios/project.yml
+        required: false
+        type: string
+      build_number:
+        description: Build number; leave blank to use the next App Store Connect number
+        required: false
+        type: string
+      distribution:
+        description: TestFlight audience
+        required: true
+        default: internal
+        type: choice
+        options:
+          - internal
+          - external
+      test_notes:
+        description: What to Test (en-US)
+        required: true
+        default: Verify pairing, terminal synchronization, text selection, keyboard controls, widgets, Live Activities, and Apple Watch status.
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, sign, and publish
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      ASC_APP_ID: "6792312114"
+      ASC_BYPASS_KEYCHAIN: "true"
+      ASC_STRICT_AUTH: "true"
+      ASC_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      ASC_PRIVATE_KEY_B64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      PEDALS_TEAM_ID: QDJ93ZUQ9B
+      PEDALS_INTERNAL_GROUP_ID: a3f73f1d-e7a5-47d8-9b57-8ada4baad549
+      PEDALS_EXTERNAL_GROUP_ID: 2ad1c56f-4ac7-4e9c-b54f-29aa102f5114
+      PEDALS_DISTRIBUTION: ${{ inputs.distribution }}
+      PEDALS_REQUESTED_VERSION: ${{ inputs.marketing_version }}
+      PEDALS_REQUESTED_BUILD: ${{ inputs.build_number }}
+      PEDALS_TEST_NOTES: ${{ inputs.test_notes }}
+      PEDALS_RELEASE_DIR: ${{ github.workspace }}/.artifacts/testflight-release
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install release tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install asc xcodegen
+          asc version
+          xcodegen --version
+
+      - name: Verify App Store Connect identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY_B64; do
+            if [[ -z "${!value:-}" ]]; then
+              echo "Required App Store Connect credential $value is missing." >&2
+              exit 1
+            fi
+          done
+          asc auth status --verbose
+          asc apps view --id "$ASC_APP_ID" --output json > "$RUNNER_TEMP/app.json"
+          jq -e \
+            --arg app "$ASC_APP_ID" \
+            '.data.id == $app and .data.attributes.bundleId == "air.build.pedals"' \
+            "$RUNNER_TEMP/app.json" >/dev/null
+          asc testflight groups list --app "$ASC_APP_ID" --output json \
+            > "$RUNNER_TEMP/groups.json"
+          jq -e \
+            --arg internal "$PEDALS_INTERNAL_GROUP_ID" \
+            --arg external "$PEDALS_EXTERNAL_GROUP_ID" \
+            'any(.data[]; .id == $internal and .attributes.isInternalGroup == true)
+             and any(.data[]; .id == $external)' \
+            "$RUNNER_TEMP/groups.json" >/dev/null
+
+      - name: Resolve and apply release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_version="$(awk -F'"' '/MARKETING_VERSION:/ { print $2; exit }' ios/project.yml)"
+          release_version="${PEDALS_REQUESTED_VERSION:-$source_version}"
+          if [[ ! "$release_version" =~ ^[0-9]+([.][0-9]+){0,2}$ ]]; then
+            echo "Invalid marketing version: $release_version" >&2
+            exit 1
+          fi
+
+          asc builds list --app "$ASC_APP_ID" --platform IOS --paginate --output json \
+            > "$RUNNER_TEMP/builds.json"
+          release_build="$PEDALS_REQUESTED_BUILD"
+          if [[ -z "$release_build" ]]; then
+            highest="$(jq \
+              '[.data[].attributes.version | select(test("^[0-9]+$")) | tonumber]
+               | max // 0' \
+              "$RUNNER_TEMP/builds.json")"
+            release_build="$((highest + 1))"
+          fi
+          if [[ ! "$release_build" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid build number: $release_build" >&2
+            exit 1
+          fi
+          if jq -e --arg build "$release_build" \
+            'any(.data[]; .attributes.version == $build)' \
+            "$RUNNER_TEMP/builds.json" >/dev/null; then
+            echo "Build number $release_build has already been uploaded." >&2
+            exit 1
+          fi
+
+          PEDALS_RELEASE_VERSION="$release_version" \
+          PEDALS_RELEASE_BUILD="$release_build" \
+          ruby <<'RUBY'
+          path = "ios/project.yml"
+          text = File.read(path)
+          build_pattern = /CURRENT_PROJECT_VERSION: "[^"]+"/
+          version_pattern = /MARKETING_VERSION: "[^"]+"/
+          abort "expected four embedded build versions" unless text.scan(build_pattern).length == 4
+          abort "expected four embedded marketing versions" unless text.scan(version_pattern).length == 4
+          text.gsub!(build_pattern, "CURRENT_PROJECT_VERSION: \"#{ENV.fetch("PEDALS_RELEASE_BUILD")}\"")
+          text.gsub!(version_pattern, "MARKETING_VERSION: \"#{ENV.fetch("PEDALS_RELEASE_VERSION")}\"")
+          File.write(path, text)
+          RUBY
+
+          echo "PEDALS_RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "PEDALS_RELEASE_BUILD=$release_build" >> "$GITHUB_ENV"
+          cd ios
+          xcodegen generate
+          cd ..
+          count="$(rg -c "CURRENT_PROJECT_VERSION = $release_build;" \
+            ios/Pedals.xcodeproj/project.pbxproj)"
+          [[ "$count" == "4" ]]
+          git diff --check
+
+      - name: Run protocol and service tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix relay
+          npm test --prefix relay
+          swift test --package-path shared/PedalsKit
+          swift test --package-path desktop/PedalsDaemon
+          npm run test:contract --prefix relay
+
+      - name: Audit retired identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n -uu --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            --glob '!AGENTS.md' \
+            'in\.eyhn\.pedals|group\.in\.eyhn\.pedals|app\.yellowplus\.pedals|group\.app\.yellowplus\.pedals|pedals\.(eyhn\.in|yellowplus\.app)|5RWWZ7DDG9|6792224057|Pedals TTY|PEDALS-20260718' \
+            .; then
+            echo "Retired Pedals identifier found." >&2
+            exit 1
+          else
+            result=$?
+            [[ "$result" == "1" ]]
+          fi
+
+      - name: Run iOS tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          simulator="$(xcrun simctl list devices available -j | jq -r \
+            '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')"
+          if [[ -z "$simulator" ]]; then
+            echo "No available iPhone Simulator was found on the runner." >&2
+            exit 1
+          fi
+          xcrun simctl boot "$simulator" 2>/dev/null || true
+          xcrun simctl bootstatus "$simulator" -b
+          xcodebuild \
+            -project ios/Pedals.xcodeproj \
+            -scheme Pedals \
+            -destination "platform=iOS Simulator,id=$simulator" \
+            -derivedDataPath "$PEDALS_RELEASE_DIR/derived-data-tests" \
+            test
+
+      - name: Import iOS Distribution certificate
+        shell: bash
+        env:
+          IOS_DISTRIBUTION_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
+          IOS_DISTRIBUTION_P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IOS_DISTRIBUTION_P12_BASE64" || -z "$IOS_DISTRIBUTION_P12_PASSWORD" ]]; then
+            echo "iOS Distribution certificate secrets are missing." >&2
+            exit 1
+          fi
+          mkdir -p "$PEDALS_RELEASE_DIR"
+          certificate="$RUNNER_TEMP/ios-distribution.p12"
+          keychain="$RUNNER_TEMP/pedals-ios-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$IOS_DISTRIBUTION_P12_BASE64" | base64 --decode > "$certificate"
+          chmod 600 "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$IOS_DISTRIBUTION_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          identity_sha="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]\{40\}\) "iPhone Distribution: YellowPlus, Inc\. (QDJ93ZUQ9B)"$/\1/p')"
+          if [[ ! "$identity_sha" =~ ^[0-9A-F]{40}$ ]]; then
+            echo "The YellowPlus iOS Distribution identity was not imported exactly once." >&2
+            exit 1
+          fi
+          echo "IOS_SIGNING_IDENTITY_SHA=$identity_sha" >> "$GITHUB_ENV"
+
+      - name: Download and validate provisioning profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile_dir="$RUNNER_TEMP/profiles"
+          install_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profile_dir" "$install_dir"
+          asc profiles list --profile-state ACTIVE --paginate --output json \
+            > "$profile_dir/active.json"
+
+          install_profile() {
+            local name="$1"
+            local application_identifier="$2"
+            local requires_apns="$3"
+            local count profile_id mobileprovision decoded uuid
+            count="$(jq --arg name "$name" \
+              '[.data[] | select(.attributes.name == $name)] | length' \
+              "$profile_dir/active.json")"
+            if [[ "$count" != "1" ]]; then
+              echo "Expected one active profile named '$name'; found $count." >&2
+              exit 1
+            fi
+            profile_id="$(jq -r --arg name "$name" \
+              '.data[] | select(.attributes.name == $name) | .id' \
+              "$profile_dir/active.json")"
+            mobileprovision="$profile_dir/$profile_id.mobileprovision"
+            decoded="$profile_dir/$profile_id.plist"
+            asc profiles download --id "$profile_id" --output "$mobileprovision"
+            security cms -D -i "$mobileprovision" > "$decoded"
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Name' "$decoded")" == "$name" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$decoded")" \
+              == "$application_identifier" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups:0' "$decoded")" \
+              == "group.air.build.pedals" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:beta-reports-active' "$decoded")" \
+              == "true" ]]
+            if [[ "$requires_apns" == "true" ]]; then
+              [[ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$decoded")" \
+                == "production" ]]
+            fi
+            uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$decoded")"
+            cp "$mobileprovision" "$install_dir/$uuid.mobileprovision"
+          }
+
+          install_profile \
+            "Pedals YellowPlus App Store" \
+            "$PEDALS_TEAM_ID.air.build.pedals" \
+            true
+          install_profile \
+            "Pedals Widgets YellowPlus App Store" \
+            "$PEDALS_TEAM_ID.air.build.pedals.widgets" \
+            true
+          install_profile \
+            "Pedals Watch YellowPlus App Store" \
+            "$PEDALS_TEAM_ID.air.build.pedals.watchapp" \
+            false
+          install_profile \
+            "Pedals Watch Widgets YellowPlus App Store" \
+            "$PEDALS_TEAM_ID.air.build.pedals.watchapp.widgets" \
+            true
+
+      - name: Create export options
+        shell: bash
+        run: |
+          set -euo pipefail
+          export_options="$PEDALS_RELEASE_DIR/ExportOptions.plist"
+          cat > "$export_options" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>destination</key><string>export</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>method</key><string>app-store-connect</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>air.build.pedals</key><string>Pedals YellowPlus App Store</string>
+              <key>air.build.pedals.widgets</key><string>Pedals Widgets YellowPlus App Store</string>
+              <key>air.build.pedals.watchapp</key><string>Pedals Watch YellowPlus App Store</string>
+              <key>air.build.pedals.watchapp.widgets</key><string>Pedals Watch Widgets YellowPlus App Store</string>
+            </dict>
+            <key>signingCertificate</key><string>$IOS_SIGNING_IDENTITY_SHA</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$PEDALS_TEAM_ID</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$export_options"
+
+      - name: Archive iPhone, widgets, and Watch products
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/Pedals.xcodeproj \
+            -scheme Pedals \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PEDALS_RELEASE_DIR/Pedals.xcarchive" \
+            archive
+
+      - name: Verify signed archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$PEDALS_RELEASE_DIR/Pedals.xcarchive/Products/Applications/Pedals.app"
+          verify_bundle() {
+            local bundle="$1"
+            local bundle_id="$2"
+            local profile_name="$3"
+            local requires_apns="$4"
+            local entitlements profile bundle_name
+            bundle_name="$(basename "$bundle")"
+            entitlements="$RUNNER_TEMP/$bundle_name.entitlements.xml"
+            profile="$RUNNER_TEMP/$bundle_name.profile.plist"
+            codesign --verify --strict --verbose=4 "$bundle"
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Info.plist")" \
+              == "$bundle_id" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Info.plist")" \
+              == "$PEDALS_RELEASE_VERSION" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$bundle/Info.plist")" \
+              == "$PEDALS_RELEASE_BUILD" ]]
+            codesign -d --entitlements :- --xml "$bundle" > "$entitlements" 2>/dev/null
+            security cms -D -i "$bundle/embedded.mobileprovision" > "$profile"
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$entitlements")" \
+              == "$PEDALS_TEAM_ID.$bundle_id" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups:0' "$entitlements")" \
+              == "group.air.build.pedals" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Name' "$profile")" == "$profile_name" ]]
+            [[ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:beta-reports-active' "$profile")" \
+              == "true" ]]
+            if [[ "$requires_apns" == "true" ]]; then
+              [[ "$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' "$entitlements")" \
+                == "production" ]]
+            fi
+          }
+
+          verify_bundle \
+            "$app" \
+            air.build.pedals \
+            "Pedals YellowPlus App Store" \
+            true
+          verify_bundle \
+            "$app/PlugIns/PedalsWidgets.appex" \
+            air.build.pedals.widgets \
+            "Pedals Widgets YellowPlus App Store" \
+            true
+          verify_bundle \
+            "$app/Watch/PedalsWatch.app" \
+            air.build.pedals.watchapp \
+            "Pedals Watch YellowPlus App Store" \
+            false
+          verify_bundle \
+            "$app/Watch/PedalsWatch.app/PlugIns/PedalsWatchWidgets.appex" \
+            air.build.pedals.watchapp.widgets \
+            "Pedals Watch Widgets YellowPlus App Store" \
+            true
+
+      - name: Export IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          asc xcode export \
+            --archive-path "$PEDALS_RELEASE_DIR/Pedals.xcarchive" \
+            --export-options "$PEDALS_RELEASE_DIR/ExportOptions.plist" \
+            --ipa-path "$PEDALS_RELEASE_DIR/Pedals.ipa" \
+            --timeout 20m \
+            --output json \
+            --pretty
+          test -s "$PEDALS_RELEASE_DIR/Pedals.ipa"
+          shasum -a 256 "$PEDALS_RELEASE_DIR/Pedals.ipa"
+
+      - name: Publish to TestFlight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PEDALS_DISTRIBUTION" == "external" ]]; then
+            group="$PEDALS_EXTERNAL_GROUP_ID"
+            review_args=(--submit --confirm)
+          else
+            group="$PEDALS_INTERNAL_GROUP_ID"
+            review_args=()
+          fi
+          asc publish testflight \
+            --app "$ASC_APP_ID" \
+            --ipa "$PEDALS_RELEASE_DIR/Pedals.ipa" \
+            --version "$PEDALS_RELEASE_VERSION" \
+            --build-number "$PEDALS_RELEASE_BUILD" \
+            --group "$group" \
+            --test-notes "$PEDALS_TEST_NOTES" \
+            --locale en-US \
+            --wait \
+            --timeout 45m \
+            --poll-interval 30s \
+            --notify \
+            "${review_args[@]}" \
+            --output json \
+            --pretty | tee "$PEDALS_RELEASE_DIR/publish.json"
+
+          jq -e '.processingState == "VALID" and .uploaded == true' \
+            "$PEDALS_RELEASE_DIR/publish.json" >/dev/null
+          build_id="$(jq -er '.buildId' "$PEDALS_RELEASE_DIR/publish.json")"
+          echo "PEDALS_BUILD_ID=$build_id" >> "$GITHUB_ENV"
+          asc testflight groups links view \
+            --group-id "$group" \
+            --type builds \
+            --paginate \
+            --output json > "$PEDALS_RELEASE_DIR/group-builds.json"
+          jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
+            "$PEDALS_RELEASE_DIR/group-builds.json" >/dev/null
+
+      - name: Verify TestFlight state
+        shell: bash
+        run: |
+          set -euo pipefail
+          asc builds info \
+            --app "$ASC_APP_ID" \
+            --build-number "$PEDALS_RELEASE_BUILD" \
+            --version "$PEDALS_RELEASE_VERSION" \
+            --platform IOS \
+            --output json > "$PEDALS_RELEASE_DIR/build-info.json"
+          jq -e --arg id "$PEDALS_BUILD_ID" \
+            '.data.id == $id and .data.attributes.processingState == "VALID"' \
+            "$PEDALS_RELEASE_DIR/build-info.json" >/dev/null
+
+          external_state="not submitted"
+          if [[ "$PEDALS_DISTRIBUTION" == "external" ]]; then
+            asc testflight review submissions list \
+              --build-id "$PEDALS_BUILD_ID" \
+              --output json > "$PEDALS_RELEASE_DIR/beta-review.json"
+            external_state="$(jq -er '.data[0].attributes.betaReviewState' \
+              "$PEDALS_RELEASE_DIR/beta-review.json")"
+          fi
+
+          {
+            echo "## Pedals TestFlight release"
+            echo
+            echo "- Version: \`$PEDALS_RELEASE_VERSION ($PEDALS_RELEASE_BUILD)\`"
+            echo "- Build ID: \`$PEDALS_BUILD_ID\`"
+            echo "- Processing: \`VALID\`"
+            echo "- Distribution: \`$PEDALS_DISTRIBUTION\`"
+            echo "- Beta Review: \`$external_state\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          keychain="$RUNNER_TEMP/pedals-ios-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          if [[ -f "$RUNNER_TEMP/ios-distribution.p12" ]]; then
+            unlink "$RUNNER_TEMP/ios-distribution.p12"
+          fi
