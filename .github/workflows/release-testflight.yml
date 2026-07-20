@@ -11,14 +11,6 @@ on:
         description: Build number; leave blank to use the next App Store Connect number
         required: false
         type: string
-      distribution:
-        description: TestFlight audience
-        required: true
-        default: internal
-        type: choice
-        options:
-          - internal
-          - external
       test_notes:
         description: What to Test (en-US)
         required: true
@@ -47,7 +39,6 @@ jobs:
       PEDALS_TEAM_ID: QDJ93ZUQ9B
       PEDALS_INTERNAL_GROUP_ID: a3f73f1d-e7a5-47d8-9b57-8ada4baad549
       PEDALS_EXTERNAL_GROUP_ID: 2ad1c56f-4ac7-4e9c-b54f-29aa102f5114
-      PEDALS_DISTRIBUTION: ${{ inputs.distribution }}
       PEDALS_REQUESTED_VERSION: ${{ inputs.marketing_version }}
       PEDALS_REQUESTED_BUILD: ${{ inputs.build_number }}
       PEDALS_TEST_NOTES: ${{ inputs.test_notes }}
@@ -405,44 +396,55 @@ jobs:
           test -s "$PEDALS_RELEASE_DIR/Pedals.ipa"
           shasum -a 256 "$PEDALS_RELEASE_DIR/Pedals.ipa"
 
-      - name: Publish to TestFlight
+      - name: Publish to internal and external TestFlight
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$PEDALS_DISTRIBUTION" == "external" ]]; then
-            group="$PEDALS_EXTERNAL_GROUP_ID"
-            review_args=(--submit --confirm)
-          else
-            group="$PEDALS_INTERNAL_GROUP_ID"
-            review_args=()
-          fi
           asc publish testflight \
             --app "$ASC_APP_ID" \
             --ipa "$PEDALS_RELEASE_DIR/Pedals.ipa" \
             --version "$PEDALS_RELEASE_VERSION" \
             --build-number "$PEDALS_RELEASE_BUILD" \
-            --group "$group" \
+            --group "$PEDALS_INTERNAL_GROUP_ID" \
             --test-notes "$PEDALS_TEST_NOTES" \
             --locale en-US \
             --wait \
             --timeout 45m \
             --poll-interval 30s \
             --notify \
-            "${review_args[@]}" \
             --output json \
-            --pretty | tee "$PEDALS_RELEASE_DIR/publish.json"
+            --pretty | tee "$PEDALS_RELEASE_DIR/internal-publish.json"
 
           jq -e '.processingState == "VALID" and .uploaded == true' \
-            "$PEDALS_RELEASE_DIR/publish.json" >/dev/null
-          build_id="$(jq -er '.buildId' "$PEDALS_RELEASE_DIR/publish.json")"
+            "$PEDALS_RELEASE_DIR/internal-publish.json" >/dev/null
+          build_id="$(jq -er '.buildId' "$PEDALS_RELEASE_DIR/internal-publish.json")"
           echo "PEDALS_BUILD_ID=$build_id" >> "$GITHUB_ENV"
           asc testflight groups links view \
-            --group-id "$group" \
+            --group-id "$PEDALS_INTERNAL_GROUP_ID" \
             --type builds \
             --paginate \
-            --output json > "$PEDALS_RELEASE_DIR/group-builds.json"
+            --output json > "$PEDALS_RELEASE_DIR/internal-group-builds.json"
           jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
-            "$PEDALS_RELEASE_DIR/group-builds.json" >/dev/null
+            "$PEDALS_RELEASE_DIR/internal-group-builds.json" >/dev/null
+
+          asc publish testflight \
+            --app "$ASC_APP_ID" \
+            --build "$build_id" \
+            --group "$PEDALS_EXTERNAL_GROUP_ID" \
+            --wait \
+            --notify \
+            --submit \
+            --confirm \
+            --output json \
+            --pretty | tee "$PEDALS_RELEASE_DIR/external-publish.json"
+
+          asc testflight groups links view \
+            --group-id "$PEDALS_EXTERNAL_GROUP_ID" \
+            --type builds \
+            --paginate \
+            --output json > "$PEDALS_RELEASE_DIR/external-group-builds.json"
+          jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
+            "$PEDALS_RELEASE_DIR/external-group-builds.json" >/dev/null
 
       - name: Verify TestFlight state
         shell: bash
@@ -458,14 +460,11 @@ jobs:
             '.data.id == $id and .data.attributes.processingState == "VALID"' \
             "$PEDALS_RELEASE_DIR/build-info.json" >/dev/null
 
-          external_state="not submitted"
-          if [[ "$PEDALS_DISTRIBUTION" == "external" ]]; then
-            asc testflight review submissions list \
-              --build-id "$PEDALS_BUILD_ID" \
-              --output json > "$PEDALS_RELEASE_DIR/beta-review.json"
-            external_state="$(jq -er '.data[0].attributes.betaReviewState' \
-              "$PEDALS_RELEASE_DIR/beta-review.json")"
-          fi
+          asc testflight review submissions list \
+            --build-id "$PEDALS_BUILD_ID" \
+            --output json > "$PEDALS_RELEASE_DIR/beta-review.json"
+          external_state="$(jq -er '.data[0].attributes.betaReviewState' \
+            "$PEDALS_RELEASE_DIR/beta-review.json")"
 
           {
             echo "## Pedals TestFlight release"
@@ -473,7 +472,7 @@ jobs:
             echo "- Version: \`$PEDALS_RELEASE_VERSION ($PEDALS_RELEASE_BUILD)\`"
             echo "- Build ID: \`$PEDALS_BUILD_ID\`"
             echo "- Processing: \`VALID\`"
-            echo "- Distribution: \`$PEDALS_DISTRIBUTION\`"
+            echo "- Distribution: \`internal + external\`"
             echo "- Beta Review: \`$external_state\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
