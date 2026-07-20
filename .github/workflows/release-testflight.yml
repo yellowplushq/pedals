@@ -55,13 +55,13 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install release tools
         shell: bash
         run: |
           set -euo pipefail
-          brew install asc xcodegen
+          brew install asc ripgrep xcodegen
           asc version
           xcodegen --version
 
