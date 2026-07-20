@@ -2,6 +2,19 @@ import Combine
 import PedalsKit
 import UIKit
 
+/// Process-local only: a fresh app launch creates a fresh hint opportunity,
+/// while controller/view reconstruction during the same run cannot replay it.
+@MainActor
+private enum TerminalKeyboardPagingHintMemory {
+    private static var hasShown = false
+
+    static func claim() -> Bool {
+        guard !hasShown else { return false }
+        hasShown = true
+        return true
+    }
+}
+
 /// Safari-style main screen: floating glass tab strip on top, the active
 /// terminal filling the screen beneath it, and a persistent glass input
 /// toolbar at the bottom that rides above the keyboard. Terminals can live on
@@ -107,6 +120,10 @@ final class MainViewController: UIViewController {
 
         terminalKeyboard.onKey = { [weak self] key in
             self?.sendToolbarKey(key)
+        }
+        terminalKeyboard.onModifierToggle = { [weak self] modifier in
+            guard let self, let id = visibleId else { return }
+            pages[id]?.host.toggleModifier(modifier)
         }
 
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
@@ -334,6 +351,7 @@ final class MainViewController: UIViewController {
             page.host.onModifierStateChange = { [weak self] state in
                 guard let self, visibleId == id else { return }
                 toolbar.setModifierState(state)
+                terminalKeyboard.setModifierState(state)
             }
             page.host.onFocusChange = { [weak self] focused in
                 guard let self, !focused, visibleId == id else { return }
@@ -388,6 +406,7 @@ final class MainViewController: UIViewController {
                 isTerminalKeyboardEnabled ? terminalKeyboard : nil
             )
             toolbar.setModifierState(page.host.modifierState)
+            terminalKeyboard.setModifierState(page.host.modifierState)
             if (previousVisibleId != id || !page.hasBeenFocused)
                 && !page.host.view.isFirstResponder
             {
@@ -399,6 +418,7 @@ final class MainViewController: UIViewController {
             page.host.kickRender()
         } else {
             toolbar.setModifierState(TerminalModifierState())
+            terminalKeyboard.setModifierState(TerminalModifierState())
         }
     }
 
@@ -411,6 +431,11 @@ final class MainViewController: UIViewController {
         guard let id = visibleId, let page = pages[id] else { return }
         isTerminalKeyboardEnabled.toggle()
         toolbar.setTerminalKeyboardEnabled(isTerminalKeyboardEnabled)
+        if isTerminalKeyboardEnabled {
+            terminalKeyboard.prepareForPresentation(
+                showPagingHint: TerminalKeyboardPagingHintMemory.claim()
+            )
+        }
         page.host.setReplacementInputView(
             isTerminalKeyboardEnabled ? terminalKeyboard : nil
         )
@@ -442,6 +467,7 @@ final class MainViewController: UIViewController {
             pagesBottomToViewConstraint.isActive = true
             view.endEditing(true)
             toolbar.setModifierState(TerminalModifierState())
+            terminalKeyboard.setModifierState(TerminalModifierState())
         }
     }
 

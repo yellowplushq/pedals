@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
     static let pairedDeviceKey = "hasPairedDesktopClientV1"
     private static let legacyOnboardingKey = "completedDesktopOnboardingV2"
     private static let productionService = "https://pedals.air.build"
+    private static let pairingDefocusGracePeriod = Duration.seconds(30)
 
     @Published private(set) var serviceRunning = false
     @Published private(set) var sessions: [SessionInfo] = []
@@ -54,6 +55,9 @@ final class AppModel: ObservableObject {
     private var startupTask: Task<Void, Never>?
     private var monitoringTask: Task<Void, Never>?
     private var pairingTask: Task<Void, Never>?
+    private var pairingRevocationTask: Task<Void, Never>?
+    private var pairingRefreshTask: Task<Void, Never>?
+    private var pairingPresentationIsFocused = false
     private var terminationObserver: NotificationObserverToken?
     private var sleepObserver: NotificationObserverToken?
     private var wakeObserver: NotificationObserverToken?
@@ -75,6 +79,8 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.pairingTask?.cancel()
+                self?.pairingRevocationTask?.cancel()
+                self?.pairingRefreshTask?.cancel()
                 self?.monitoringTask?.cancel()
                 self?.startupTask?.cancel()
                 self?.service?.shutdown()
@@ -206,8 +212,22 @@ final class AppModel: ObservableObject {
 
     // MARK: Pairing
 
+    func presentPairingCode() {
+        pairingPresentationIsFocused = true
+        cancelPairingRevocation()
+        guard !isLoadingPairingCode else { return }
+        guard let pairingCode, let pairingExpiresAt, pairingExpiresAt > Date() else {
+            fetchPairingCode()
+            return
+        }
+        schedulePairingRefresh(code: pairingCode, expiresAt: pairingExpiresAt)
+    }
+
     func fetchPairingCode() {
         guard let service else { return }
+        pairingPresentationIsFocused = true
+        cancelPairingRevocation()
+        cancelPairingRefresh()
         pairingTask?.cancel()
         pairingCode = nil
         pairingExpiresAt = nil
@@ -227,6 +247,12 @@ final class AppModel: ObservableObject {
                 pairingCode = invitation.code.digits
                 pairingExpiresAt = invitation.expiresAt
                 lastError = nil
+                if pairingPresentationIsFocused {
+                    schedulePairingRefresh(
+                        code: invitation.code.digits,
+                        expiresAt: invitation.expiresAt
+                    )
+                }
             } catch {
                 guard !Task.isCancelled else { return }
                 pairingCode = nil
@@ -237,6 +263,9 @@ final class AppModel: ObservableObject {
     }
 
     func clearPairingCode() {
+        pairingPresentationIsFocused = false
+        cancelPairingRevocation()
+        cancelPairingRefresh()
         pairingTask?.cancel()
         pairingTask = nil
         let shouldRevoke = pairingCode != nil || isLoadingPairingCode
@@ -249,7 +278,60 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// A menu-bar popover disappears as soon as the user clicks an iPhone
+    /// Simulator. Keep its code alive briefly so that interaction is treated
+    /// differently from an explicit Hide Code action.
+    func schedulePairingRevocationAfterDefocus() {
+        pairingPresentationIsFocused = false
+        cancelPairingRefresh()
+        cancelPairingRevocation()
+        guard pairingCode != nil || isLoadingPairingCode else { return }
+
+        pairingRevocationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.pairingDefocusGracePeriod)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            pairingRevocationTask = nil
+            clearPairingCode()
+        }
+    }
+
+    private func cancelPairingRevocation() {
+        pairingRevocationTask?.cancel()
+        pairingRevocationTask = nil
+    }
+
+    private func schedulePairingRefresh(code: String, expiresAt: Date) {
+        cancelPairingRefresh()
+        let delay = max(0, expiresAt.timeIntervalSinceNow)
+        pairingRefreshTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self,
+                  pairingPresentationIsFocused,
+                  pairingCode == code,
+                  pairingExpiresAt == expiresAt
+            else { return }
+            pairingRefreshTask = nil
+            fetchPairingCode()
+        }
+    }
+
+    private func cancelPairingRefresh() {
+        pairingRefreshTask?.cancel()
+        pairingRefreshTask = nil
+    }
+
     private func finishPairingPresentation() {
+        pairingPresentationIsFocused = false
+        cancelPairingRevocation()
+        cancelPairingRefresh()
         pairingTask?.cancel()
         pairingTask = nil
         pairingCode = nil

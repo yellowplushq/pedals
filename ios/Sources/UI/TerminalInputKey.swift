@@ -6,10 +6,12 @@ struct TerminalKeyModifiers: OptionSet, Equatable {
     static let ctrl = Self(rawValue: 1 << 0)
     static let alt = Self(rawValue: 1 << 1)
     static let command = Self(rawValue: 1 << 2)
+    static let shift = Self(rawValue: 1 << 3)
 
     /// Xterm's modifier parameter is one plus Shift/Alt/Ctrl/Super bit values.
     var xtermParameter: Int {
         1
+            + (contains(.shift) ? 1 : 0)
             + (contains(.alt) ? 2 : 0)
             + (contains(.ctrl) ? 4 : 0)
             + (contains(.command) ? 8 : 0)
@@ -23,9 +25,9 @@ struct TerminalKeyModifiers: OptionSet, Equatable {
     func applying(toUnmodifiedByte byte: UInt8) -> Data? {
         guard (0x20 ... 0x7e).contains(byte) else { return nil }
 
-        var output = byte
+        var output = contains(.shift) ? TerminalKeyboardText.shiftedASCII(byte) : byte
         if contains(.ctrl) {
-            guard let controlByte = Self.controlByte(for: byte) else { return nil }
+            guard let controlByte = Self.controlByte(for: output) else { return nil }
             output = controlByte
         }
 
@@ -61,14 +63,46 @@ struct TerminalKeyModifiers: OptionSet, Equatable {
     }
 }
 
-enum TerminalModifier: Equatable {
+enum TerminalModifier: CaseIterable, Hashable {
+    case shift
     case ctrl
     case alt
+    case command
 }
 
 struct TerminalModifierState: Equatable {
+    var shift = false
     var ctrl = false
     var alt = false
+    var command = false
+}
+
+/// US-keyboard Shift pairs shared by the expanded keyboard labels and the
+/// terminal input encoder. Keeping the visual and emitted character in one
+/// table prevents keys such as `[` / `{` from drifting apart.
+enum TerminalKeyboardText {
+    private static let shiftedCharacters: [Character: Character] = [
+        "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
+        "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+        "`": "~", "-": "_", "=": "+", "[": "{", "]": "}",
+        "\\": "|", ";": ":", "'": "\"", ",": "<", ".": ">", "/": "?",
+    ]
+
+    static func applyingShift(to text: String) -> String {
+        guard text.count == 1, let character = text.first else { return text }
+        if character.isLetter { return text.uppercased() }
+        if let shifted = shiftedCharacters[character] { return String(shifted) }
+        return text
+    }
+
+    static func shiftedASCII(_ byte: UInt8) -> UInt8 {
+        guard let scalar = UnicodeScalar(Int(byte)) else { return byte }
+        let shifted = applyingShift(to: String(Character(scalar)))
+        guard shifted.utf8.count == 1, let shiftedByte = shifted.utf8.first else {
+            return byte
+        }
+        return shiftedByte
+    }
 }
 
 /// Semantic keys shared by the compact toolbar and the expanded terminal
@@ -105,6 +139,10 @@ enum TerminalInputKey: Equatable {
         case .escape:
             return Data([0x1b])
         case .tab:
+            if modifiers.contains(.shift) {
+                if modifiers == .shift { return Data("\u{1b}[Z".utf8) }
+                return Data("\u{1b}[1;\(modifiers.xtermParameter)Z".utf8)
+            }
             return prefixedForAlt(Data([0x09]), modifiers: modifiers)
         case .shiftTab:
             return Data("\u{1b}[Z".utf8)

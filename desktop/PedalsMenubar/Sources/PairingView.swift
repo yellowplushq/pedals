@@ -31,8 +31,8 @@ struct DesktopPairingView: View {
         .padding(16)
         .frame(maxWidth: .infinity)
         .task(id: pairingReady) {
-            if pairingReady, model.pairingCode == nil, !model.isLoadingPairingCode {
-                model.fetchPairingCode()
+            if pairingReady {
+                model.presentPairingCode()
             }
         }
     }

@@ -22,7 +22,9 @@ final class AppServices {
 
     init() {
         #if DEBUG
-        if ProcessInfo.processInfo.environment["PEDALS_RESET_PAIRING"] == "1" {
+        let forceReset = ProcessInfo.processInfo.environment["PEDALS_RESET_PAIRING"] == "1"
+        let storedServiceURL = try? pairingStore.loadClientIdentity()?.serviceURL
+        if forceReset || storedServiceURL.map({ $0 != Self.pairingServiceURL }) == true {
             PairingStore.resetKeychainForUITesting()
         }
         #endif
