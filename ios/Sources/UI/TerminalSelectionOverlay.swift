@@ -74,40 +74,50 @@ struct TerminalSelectionBuffer {
             return Integration(prependedUTF16Length: 0, changed: true)
         }
 
-        if direction < 0 {
-            guard let match = Self.longestCommonRun(incoming, current),
-                  match.incomingStart > match.currentStart
-            else {
-                return Integration(prependedUTF16Length: 0, changed: false)
-            }
-            let prefixCount = match.incomingStart - match.currentStart
+        guard let match = Self.bestCommonRun(
+            incoming,
+            current,
+            requestedDirection: direction
+        ) else {
+            return Integration(prependedUTF16Length: 0, changed: false)
+        }
+
+        // If the viewport moved by `delta`, a row at `incomingStart` now
+        // overlaps the row that used to be at `currentStart`. Deriving the
+        // shift from both indices avoids assuming a one-line movement at the
+        // scrollback boundary, where Ghostty may satisfy only part of a larger
+        // request.
+        let delta = match.currentStart - match.incomingStart
+        guard delta != 0,
+              direction < 0 ? delta < 0 : delta > 0
+        else {
+            return Integration(prependedUTF16Length: 0, changed: false)
+        }
+
+        var newViewportStart = viewportStartLine + delta
+        var prependedUTF16Length = 0
+        if newViewportStart < 0 {
+            let prefixCount = min(-newViewportStart, incoming.count)
             let prefix = Array(incoming.prefix(prefixCount))
             guard !prefix.isEmpty else {
                 return Integration(prependedUTF16Length: 0, changed: false)
             }
             let inserted = prefix.map(\.text).joined(separator: "\n") + "\n"
+            prependedUTF16Length = (inserted as NSString).length
             rows.insert(contentsOf: prefix, at: 0)
-            viewportStartLine = 0
-            return Integration(
-                prependedUTF16Length: (inserted as NSString).length,
-                changed: true
-            )
+            newViewportStart = 0
         }
 
-        let overlap = Self.largestOverlap(suffixOf: current, prefixOf: incoming)
-        guard overlap > 0 else {
-            return Integration(prependedUTF16Length: 0, changed: false)
+        let requiredEnd = newViewportStart + incoming.count
+        if requiredEnd > rows.count {
+            let suffixCount = min(requiredEnd - rows.count, incoming.count)
+            rows.append(contentsOf: incoming.suffix(suffixCount))
         }
-        let suffix = Array(incoming.dropFirst(overlap))
-        guard !suffix.isEmpty else {
-            return Integration(prependedUTF16Length: 0, changed: false)
-        }
-        let shift = max(0, current.count - overlap)
-        if !rows.isEmpty, !suffix.isEmpty {
-            rows.append(contentsOf: suffix)
-        }
-        viewportStartLine += shift
-        return Integration(prependedUTF16Length: 0, changed: true)
+        viewportStartLine = newViewportStart
+        return Integration(
+            prependedUTF16Length: prependedUTF16Length,
+            changed: true
+        )
     }
 
     func utf16Offset(ofLine line: Int) -> Int {
@@ -166,10 +176,7 @@ struct TerminalSelectionBuffer {
     }
 
     func selectionSegments(in selectedRange: NSRange) -> [SelectionSegment] {
-        let valid = NSIntersectionRange(
-            selectedRange,
-            NSRange(location: 0, length: (text as NSString).length)
-        )
+        let valid = normalizedSelectionRange(selectedRange)
         guard valid.length > 0 else { return [] }
 
         var segments: [SelectionSegment] = []
@@ -207,10 +214,7 @@ struct TerminalSelectionBuffer {
     }
 
     func copyText(in selectedRange: NSRange) -> String {
-        let valid = NSIntersectionRange(
-            selectedRange,
-            NSRange(location: 0, length: (text as NSString).length)
-        )
+        let valid = normalizedSelectionRange(selectedRange)
         guard valid.length > 0 else { return "" }
 
         var result = ""
@@ -238,6 +242,20 @@ struct TerminalSelectionBuffer {
         return result
     }
 
+    /// Clamp a selection to the snapshot and expand endpoints to complete
+    /// grapheme clusters. UIKit reports ranges in UTF-16 units, but terminal
+    /// cells contain whole graphemes; allowing an endpoint inside a surrogate
+    /// pair or ZWJ emoji makes both the painted columns and copied text drift.
+    func normalizedSelectionRange(_ range: NSRange) -> NSRange {
+        let snapshot = text as NSString
+        let valid = NSIntersectionRange(
+            range,
+            NSRange(location: 0, length: snapshot.length)
+        )
+        guard valid.length > 0 else { return valid }
+        return snapshot.rangeOfComposedCharacterSequences(for: valid)
+    }
+
     private var currentViewport: [Row] {
         let start = min(max(0, viewportStartLine), rows.count)
         let end = min(rows.count, start + viewportLineCount)
@@ -255,8 +273,9 @@ struct TerminalSelectionBuffer {
         let directional = candidates.filter {
             direction < 0 ? $0 < viewportStartLine : $0 > viewportStartLine
         }
+        let expectedStart = viewportStartLine + direction
         return directional.min {
-            abs($0 - viewportStartLine) < abs($1 - viewportStartLine)
+            abs($0 - expectedStart) < abs($1 - expectedStart)
         }
     }
 
@@ -300,7 +319,16 @@ struct TerminalSelectionBuffer {
     private func displayWidth(of text: NSString, utf16Length: Int) -> Int {
         let safeLength = min(max(0, utf16Length), text.length)
         guard safeLength > 0 else { return 0 }
-        return Self.displayWidth(of: text.substring(to: safeLength))
+
+        var consumed = 0
+        var width = 0
+        for character in text as String {
+            let characterLength = String(character).utf16.count
+            guard consumed + characterLength <= safeLength else { break }
+            consumed += characterLength
+            width += Self.cellWidth(of: character)
+        }
+        return width
     }
 
     private static func displayWidth(of text: String) -> Int {
@@ -312,12 +340,20 @@ struct TerminalSelectionBuffer {
     /// emoji occupy two cells, while ambiguous-width characters remain one.
     private static func cellWidth(of character: Character) -> Int {
         let scalars = character.unicodeScalars
-        if scalars.contains(where: {
-            $0.properties.isEmojiPresentation || isWideScalar($0.value)
-        }) {
+        let values = scalars.map(\.value)
+        if values.contains(0xFE0F)
+            || values.contains(where: isRegionalIndicator)
+            || scalars.contains(where: {
+                $0.properties.isEmojiPresentation || isWideScalar($0.value)
+            })
+        {
             return 2
         }
         return 1
+    }
+
+    private static func isRegionalIndicator(_ value: UInt32) -> Bool {
+        (0x1F1E6 ... 0x1F1FF).contains(value)
     }
 
     private static func isWideScalar(_ value: UInt32) -> Bool {
@@ -339,40 +375,60 @@ struct TerminalSelectionBuffer {
         }
     }
 
-    private static func largestOverlap(suffixOf lhs: [Row], prefixOf rhs: [Row]) -> Int {
-        let upper = min(lhs.count, rhs.count)
-        guard upper > 0 else { return 0 }
-        for length in stride(from: upper, through: 1, by: -1) {
-            if Array(lhs.suffix(length)) == Array(rhs.prefix(length)) {
-                return length
-            }
-        }
-        return 0
-    }
-
-    private static func longestCommonRun(
-        _ lhs: [Row],
-        _ rhs: [Row]
+    private static func bestCommonRun(
+        _ incoming: [Row],
+        _ current: [Row],
+        requestedDirection: Int
     ) -> (incomingStart: Int, currentStart: Int, length: Int)? {
-        var best: (incomingStart: Int, currentStart: Int, length: Int)?
-        for lhsStart in lhs.indices {
-            for rhsStart in rhs.indices where lhs[lhsStart] == rhs[rhsStart] {
+        var candidates: [(incomingStart: Int, currentStart: Int, length: Int)] = []
+        for incomingStart in incoming.indices {
+            for currentStart in current.indices
+            where incoming[incomingStart] == current[currentStart] {
                 var length = 0
-                while lhsStart + length < lhs.count,
-                      rhsStart + length < rhs.count,
-                      lhs[lhsStart + length] == rhs[rhsStart + length]
+                while incomingStart + length < incoming.count,
+                      currentStart + length < current.count,
+                      incoming[incomingStart + length] == current[currentStart + length]
                 {
                     length += 1
                 }
-                if best == nil
-                    || length > best!.length
-                    || (length == best!.length && lhsStart > best!.incomingStart)
-                {
-                    best = (lhsStart, rhsStart, length)
-                }
+                let delta = currentStart - incomingStart
+                guard requestedDirection < 0 ? delta < 0 : delta > 0 else { continue }
+                candidates.append((incomingStart, currentStart, length))
             }
         }
-        return best
+        guard !candidates.isEmpty else { return nil }
+
+        // A normal N-line scroll leaves roughly rowCount-N rows overlapping.
+        // Prefer such full alignments before considering a coincidental repeated
+        // prompt or blank line. Near the scrollback boundary the real movement
+        // may be smaller, which only increases the overlap.
+        let expectedOverlap = max(
+            1,
+            min(incoming.count, current.count) - abs(requestedDirection)
+        )
+        let plausible = candidates.filter { $0.length >= expectedOverlap }
+        let pool = plausible.isEmpty ? candidates : plausible
+
+        return pool.min { lhs, rhs in
+            let lhsDelta = lhs.currentStart - lhs.incomingStart
+            let rhsDelta = rhs.currentStart - rhs.incomingStart
+            if plausible.isEmpty, lhs.length != rhs.length {
+                return lhs.length > rhs.length
+            }
+            let lhsDistance = abs(lhsDelta - requestedDirection)
+            let rhsDistance = abs(rhsDelta - requestedDirection)
+            if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+            return lhs.length > rhs.length
+        }
+    }
+}
+
+enum TerminalSelectionEdgeScrollIntent {
+    static func direction(pointY: CGFloat, in bounds: CGRect, edgeInset: CGFloat) -> Int {
+        let inset = max(0, edgeInset)
+        if pointY < bounds.minY + inset { return -1 }
+        if pointY > bounds.maxY - inset { return 1 }
+        return 0
     }
 }
 
@@ -671,40 +727,52 @@ final class TerminalSelectionOverlay: UIView, UIGestureRecognizerDelegate {
     private func wordRange(at point: CGPoint) -> NSRange? {
         guard !buffer.lines.isEmpty else { return nil }
         let row = visibleLine(at: point.y)
-        let line = buffer.lines[row] as NSString
+        let lineString = buffer.lines[row]
+        let line = lineString as NSString
         guard line.length > 0 else { return nil }
 
         let rowStart = buffer.utf16Offset(ofLine: row)
-        var index = min(max(0, characterOffset(at: point) - rowStart), line.length - 1)
+        let touchedOffset = min(
+            max(0, characterOffset(at: point) - rowStart),
+            line.length - 1
+        )
         let whitespace = CharacterSet.whitespacesAndNewlines
-        func isWhitespace(_ offset: Int) -> Bool {
-            guard offset >= 0, offset < line.length,
-                  let scalar = UnicodeScalar(line.character(at: offset))
-            else { return true }
-            return whitespace.contains(scalar)
-        }
 
-        if isWhitespace(index) {
-            let nonWhitespace = (0 ..< line.length).filter { !isWhitespace($0) }
+        var clusters: [(range: NSRange, isWhitespace: Bool)] = []
+        lineString.enumerateSubstrings(
+            in: lineString.startIndex ..< lineString.endIndex,
+            options: .byComposedCharacterSequences
+        ) { substring, range, _, _ in
+            guard let substring else { return }
+            clusters.append((
+                range: NSRange(range, in: lineString),
+                isWhitespace: substring.unicodeScalars.allSatisfy(whitespace.contains)
+            ))
+        }
+        guard !clusters.isEmpty else { return nil }
+
+        var clusterIndex = clusters.firstIndex {
+            NSLocationInRange(touchedOffset, $0.range)
+        } ?? (clusters.count - 1)
+        if clusters[clusterIndex].isWhitespace {
+            let nonWhitespace = clusters.indices.filter { !clusters[$0].isWhitespace }
             guard let nearest = nonWhitespace.min(by: {
-                abs($0 - index) < abs($1 - index)
+                abs(clusters[$0].range.location - touchedOffset)
+                    < abs(clusters[$1].range.location - touchedOffset)
             }) else { return nil }
-            index = nearest
+            clusterIndex = nearest
         }
 
-        var lower = index
-        var upper = index + 1
-        while lower > 0, !isWhitespace(lower - 1) { lower -= 1 }
-        while upper < line.length, !isWhitespace(upper) { upper += 1 }
-        return NSRange(location: rowStart + lower, length: upper - lower)
+        var lower = clusterIndex
+        var upper = clusterIndex
+        while lower > clusters.startIndex, !clusters[lower - 1].isWhitespace { lower -= 1 }
+        while upper + 1 < clusters.endIndex, !clusters[upper + 1].isWhitespace { upper += 1 }
+        let localRange = NSUnionRange(clusters[lower].range, clusters[upper].range)
+        return NSRange(location: rowStart + localRange.location, length: localRange.length)
     }
 
     private func applySelection(_ proposedRange: NSRange) {
-        let validLength = (buffer.text as NSString).length
-        selectedRange = NSIntersectionRange(
-            proposedRange,
-            NSRange(location: 0, length: validLength)
-        )
+        selectedRange = buffer.normalizedSelectionRange(proposedRange)
         refreshSelectionRendering()
     }
 
@@ -732,10 +800,13 @@ final class TerminalSelectionOverlay: UIView, UIGestureRecognizerDelegate {
             moveSelectionEndpoint(endpoint, to: point)
 
             let edge = min(78, bounds.height * 0.16)
-            if endpoint == .start, point.y < edge {
-                startEdgeScrolling(direction: -1)
-            } else if endpoint == .end, point.y > bounds.height - edge {
-                startEdgeScrolling(direction: 1)
+            let direction = TerminalSelectionEdgeScrollIntent.direction(
+                pointY: point.y,
+                in: bounds,
+                edgeInset: edge
+            )
+            if direction != 0 {
+                startEdgeScrolling(direction: direction)
             } else {
                 stopEdgeScrolling()
             }
@@ -766,10 +837,14 @@ final class TerminalSelectionOverlay: UIView, UIGestureRecognizerDelegate {
         case .start:
             let end = NSMaxRange(current)
             let start = min(max(0, offset), max(0, end - 1))
-            selectedRange = NSRange(location: start, length: end - start)
+            selectedRange = buffer.normalizedSelectionRange(
+                NSRange(location: start, length: end - start)
+            )
         case .end:
             let end = max(current.location + 1, min(offset, length))
-            selectedRange = NSRange(location: current.location, length: end - current.location)
+            selectedRange = buffer.normalizedSelectionRange(
+                NSRange(location: current.location, length: end - current.location)
+            )
         }
         refreshSelectionRendering()
     }
@@ -1013,27 +1088,29 @@ final class TerminalSelectionOverlay: UIView, UIGestureRecognizerDelegate {
             }
 
             if integration.changed {
+                let firstVisibleLine = min(
+                    buffer.viewportStartLine,
+                    max(0, buffer.lines.count - 1)
+                )
+                let lastVisibleLine = min(
+                    buffer.viewportStartLine + Int(max(1, viewport.rows)) - 1,
+                    max(0, buffer.lines.count - 1)
+                )
+                let edgeLine = lines < 0 ? firstVisibleLine : lastVisibleLine
+                let edge = buffer.utf16Offset(
+                    atLine: edgeLine,
+                    cellPosition: CGFloat(column)
+                )
+
                 switch endpoint {
                 case .start:
                     let end = NSMaxRange(selected)
-                    let line = min(buffer.viewportStartLine, max(0, buffer.lines.count - 1))
-                    let edge = buffer.utf16Offset(
-                        atLine: line,
-                        cellPosition: CGFloat(column)
-                    )
-                    selected.location = min(selected.location, edge)
-                    selected.length = max(1, end - selected.location)
+                    let start = min(max(0, edge), max(0, end - 1))
+                    selected = NSRange(location: start, length: end - start)
                 case .end:
-                    let line = min(
-                        buffer.viewportStartLine + Int(max(1, viewport.rows)) - 1,
-                        max(0, buffer.lines.count - 1)
-                    )
-                    let edge = buffer.utf16Offset(
-                        atLine: line,
-                        cellPosition: CGFloat(column)
-                    )
-                    let end = max(NSMaxRange(selected), edge)
-                    selected.length = max(1, end - selected.location)
+                    let textLength = (buffer.text as NSString).length
+                    let end = max(selected.location + 1, min(edge, textLength))
+                    selected.length = end - selected.location
                 case nil:
                     break
                 }

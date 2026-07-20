@@ -187,6 +187,61 @@ final class TerminalInputSurfaceTests: XCTestCase {
         )
     }
 
+    func testCompactToolbarPinsPasteKeyboardAndAnimatedDismissRegion() throws {
+        let toolbar = TerminalToolbar(
+            frame: CGRect(x: 0, y: 0, width: 390, height: TerminalToolbar.height)
+        )
+        toolbar.layoutIfNeeded()
+
+        let scroll = try XCTUnwrap(
+            findSubview(in: toolbar, identifier: "terminal-toolbar-scroll") as? UIScrollView
+        )
+        let fixedActions = try XCTUnwrap(
+            findSubview(in: toolbar, identifier: "terminal-toolbar-fixed-actions")
+        )
+        let paste = try XCTUnwrap(
+            findSubview(in: toolbar, identifier: "terminal-toolbar-paste") as? UIButton
+        )
+        let keyboard = try XCTUnwrap(
+            findSubview(in: toolbar, identifier: "terminal-keyboard-toggle") as? UIButton
+        )
+        let dismiss = try XCTUnwrap(
+            findSubview(in: toolbar, identifier: "terminal-toolbar-hide-keyboard") as? UIButton
+        )
+        fixedActions.superview?.layoutIfNeeded()
+
+        XCTAssertTrue(paste.isDescendant(of: fixedActions))
+        XCTAssertTrue(keyboard.isDescendant(of: fixedActions))
+        XCTAssertTrue(dismiss.isDescendant(of: fixedActions))
+        XCTAssertFalse(paste.isDescendant(of: scroll))
+        XCTAssertEqual(dismiss.alpha, 0)
+        XCTAssertTrue(dismiss.accessibilityElementsHidden)
+        let dismissWidthConstraint = try XCTUnwrap(
+            dismiss.constraints.first {
+                $0.identifier == "terminal-toolbar-hide-keyboard-width"
+            }
+        )
+        XCTAssertEqual(dismissWidthConstraint.constant, 0)
+
+        var receivedKeys: [TerminalInputKey] = []
+        toolbar.onKey = { receivedKeys.append($0) }
+        paste.sendActions(for: .touchUpInside)
+
+        toolbar.setKeyboardVisible(true, animated: false)
+        fixedActions.superview?.layoutIfNeeded()
+        XCTAssertEqual(dismiss.alpha, 1)
+        XCTAssertFalse(dismiss.accessibilityElementsHidden)
+        XCTAssertEqual(dismissWidthConstraint.constant, 42)
+        dismiss.sendActions(for: .touchUpInside)
+        XCTAssertEqual(receivedKeys, [.paste, .dismissKeyboard])
+
+        toolbar.setKeyboardVisible(false, animated: false)
+        fixedActions.superview?.layoutIfNeeded()
+        XCTAssertEqual(dismiss.alpha, 0)
+        XCTAssertTrue(dismiss.accessibilityElementsHidden)
+        XCTAssertEqual(dismissWidthConstraint.constant, 0)
+    }
+
     func testExpandedKeyboardContainsEssentialKeysOnly() {
         let keyboard = TerminalKeyboardView()
         keyboard.layoutIfNeeded()

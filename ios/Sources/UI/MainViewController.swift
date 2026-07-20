@@ -301,6 +301,49 @@ final class MainViewController: UIViewController {
             .sink { [weak self] _ in self?.manager.kickAll() }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(
+            for: UIResponder.keyboardWillChangeFrameNotification
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] notification in
+            self?.updateToolbarKeyboardVisibility(from: notification)
+        }
+        .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.updateToolbarKeyboardVisibility(from: notification, forceHidden: true)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func updateToolbarKeyboardVisibility(
+        from notification: Notification,
+        forceHidden: Bool = false
+    ) {
+        let userInfo = notification.userInfo ?? [:]
+        let visible: Bool
+        if forceHidden {
+            visible = false
+        } else if let screenFrame = userInfo[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
+            let localFrame = view.convert(screenFrame, from: nil)
+            visible = view.bounds.intersection(localFrame).height > 1
+        } else {
+            return
+        }
+
+        let duration = (userInfo[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?
+            .doubleValue ?? 0.25
+        let curve = (userInfo[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?
+            .uintValue ?? UInt(UIView.AnimationCurve.easeInOut.rawValue)
+        let options = UIView.AnimationOptions(rawValue: curve << 16)
+        toolbar.setKeyboardVisible(
+            visible,
+            animated: view.window != nil,
+            duration: duration,
+            options: options
+        )
     }
 
     private func handle(id: TerminalID, output: TerminalManager.Output) {
@@ -466,6 +509,7 @@ final class MainViewController: UIViewController {
             pagesBottomToToolbarConstraint.isActive = false
             pagesBottomToViewConstraint.isActive = true
             view.endEditing(true)
+            toolbar.setKeyboardVisible(false, animated: false)
             toolbar.setModifierState(TerminalModifierState())
             terminalKeyboard.setModifierState(TerminalModifierState())
         }

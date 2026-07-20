@@ -115,6 +115,49 @@ final class TerminalSelectionBufferTests: XCTestCase {
         )
     }
 
+    func testLargeUpwardRequestUsesActualPartialMovementAtScrollbackTop() {
+        var buffer = TerminalSelectionBuffer(
+            viewportText: "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot",
+            viewportLineCount: 6
+        )
+
+        let integration = buffer.integrate(
+            viewportText: "older one\nolder two\nalpha\nbravo\ncharlie\ndelta",
+            direction: -6
+        )
+
+        XCTAssertTrue(integration.changed)
+        XCTAssertEqual(buffer.viewportStartLine, 0)
+        XCTAssertEqual(
+            buffer.lines,
+            [
+                "older one", "older two", "alpha", "bravo",
+                "charlie", "delta", "echo", "foxtrot",
+            ]
+        )
+    }
+
+    func testRepeatedRowsDoNotOverrideTheFullViewportAlignment() {
+        var buffer = TerminalSelectionBuffer(
+            viewportText: "prompt\none\nprompt\ntwo\nprompt\nthree",
+            viewportLineCount: 6
+        )
+
+        let integration = buffer.integrate(
+            viewportText: "older one\nolder two\nprompt\none\nprompt\ntwo",
+            direction: -2
+        )
+
+        XCTAssertTrue(integration.changed)
+        XCTAssertEqual(
+            buffer.lines,
+            [
+                "older one", "older two", "prompt", "one",
+                "prompt", "two", "prompt", "three",
+            ]
+        )
+    }
+
     func testSelectionSegmentsUseTerminalCellsForWideCharacters() {
         let buffer = TerminalSelectionBuffer(
             viewportText: "a你b",
@@ -143,6 +186,86 @@ final class TerminalSelectionBufferTests: XCTestCase {
         XCTAssertEqual(
             buffer.copyText(in: NSRange(location: 0, length: 5)),
             "ab你c"
+        )
+    }
+
+    func testEmojiSequencesUseGhosttyCompatibleTwoCellWidths() {
+        let buffer = TerminalSelectionBuffer(
+            viewportText: "a☁️🇺🇸1️⃣b",
+            viewportLineCount: 1,
+            viewportColumnCount: 8
+        )
+
+        XCTAssertEqual(
+            buffer.selectionSegments(in: NSRange(location: 1, length: 2)),
+            [.init(line: 0, startColumn: 1, endColumn: 3)]
+        )
+        XCTAssertEqual(
+            buffer.selectionSegments(in: NSRange(location: 3, length: 4)),
+            [.init(line: 0, startColumn: 3, endColumn: 5)]
+        )
+        XCTAssertEqual(
+            buffer.selectionSegments(in: NSRange(location: 7, length: 3)),
+            [.init(line: 0, startColumn: 5, endColumn: 7)]
+        )
+        XCTAssertEqual(
+            buffer.gridPosition(forUTF16Offset: 11),
+            .init(line: 0, column: 8)
+        )
+    }
+
+    func testUTF16OffsetsInsideEmojiSnapToTheWholeGrapheme() {
+        let buffer = TerminalSelectionBuffer(
+            viewportText: "a😀b",
+            viewportLineCount: 1,
+            viewportColumnCount: 4
+        )
+
+        XCTAssertEqual(
+            buffer.normalizedSelectionRange(NSRange(location: 2, length: 1)),
+            NSRange(location: 1, length: 2)
+        )
+        XCTAssertEqual(
+            buffer.copyText(in: NSRange(location: 2, length: 1)),
+            "😀"
+        )
+        XCTAssertEqual(
+            buffer.gridPosition(forUTF16Offset: 2),
+            .init(line: 0, column: 1)
+        )
+    }
+}
+
+final class TerminalSelectionEdgeScrollIntentTests: XCTestCase {
+    private let bounds = CGRect(x: 0, y: 0, width: 390, height: 420)
+
+    func testDraggingIntoTheKeyboardRegionScrollsTowardNewerContent() {
+        XCTAssertEqual(
+            TerminalSelectionEdgeScrollIntent.direction(
+                pointY: 500,
+                in: bounds,
+                edgeInset: 64
+            ),
+            1
+        )
+    }
+
+    func testTopEdgeAndMiddleDirections() {
+        XCTAssertEqual(
+            TerminalSelectionEdgeScrollIntent.direction(
+                pointY: 20,
+                in: bounds,
+                edgeInset: 64
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            TerminalSelectionEdgeScrollIntent.direction(
+                pointY: 210,
+                in: bounds,
+                edgeInset: 64
+            ),
+            0
         )
     }
 }
