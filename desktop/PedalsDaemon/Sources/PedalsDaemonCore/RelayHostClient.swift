@@ -3,7 +3,7 @@ import PedalsKit
 
 /// Host end of the relay: one `control` RelayLink (session list, create/close)
 /// plus one `session` RelayLink per listed session (replay + stdout out,
-/// stdin/resize in). Each link is its own encrypted WebSocket with reconnect
+/// stdin/resize in, authoritative resize out). Each link is its own encrypted WebSocket with reconnect
 /// (PROTOCOL.md §1); a client `hello` on a session link triggers a fresh
 /// `replay` broadcast.
 public final class RelayHostClient: @unchecked Sendable {
@@ -243,6 +243,9 @@ public final class RelayHostClient: @unchecked Sendable {
                   let snapshot = sessions.replaySnapshot(id: id)
             else { return }
             replayedThrough[id] = max(replayedThrough[id] ?? 0, snapshot.coversUpTo)
+            link.send(.resize(
+                sessionId: UInt32(id), cols: snapshot.cols, rows: snapshot.rows
+            ))
             link.send(.replay(sessionId: UInt32(id), data: snapshot.data))
         case .stdin:
             sessions.write(id: id, data: frame.payload)
@@ -263,6 +266,10 @@ public final class RelayHostClient: @unchecked Sendable {
             reportDirectoryLocked(force: false, sessions: list)
             control?.send(.sessions(list: list))
             reconcileSessionLinksLocked(with: list)
+        case .resized(let id, let cols, let rows):
+            sessionLinks[id]?.send(.resize(
+                sessionId: UInt32(id), cols: cols, rows: rows
+            ))
         case .output(let id, let data, let offset):
             guard let link = sessionLinks[id] else { return }
             let covered = replayedThrough[id] ?? 0

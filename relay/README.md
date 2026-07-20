@@ -111,8 +111,9 @@ stale retry row before new relay access is authorized.
 
 ### `POST /v2/clients`
 
-No body or `{}`. Creates one logical client installation (normally one iPhone;
-its companion Watch registers push surfaces under the same client identity).
+No body or `{}`. Creates one logical client installation. An iPhone and its
+terminal-viewing Watch use distinct relay client identities; Watch status and
+push surfaces still use the iPhone's least-privilege status identity.
 
 ```json
 {
@@ -130,6 +131,26 @@ independent SHA-256 hashes.
 A client may bind at most 32 computers. The pairing completion and binding
 limit check share one D1 transaction; a rejected over-limit attempt does not
 complete the session.
+
+### `PUT /v2/clients/me/delegated-bindings`
+
+Source client control bearer required. Reconciles a second client principal's
+server-side bindings to exactly the source client's current set:
+
+```json
+{"clientId":"32-lowercase-hex","clientToken":"opaque-control-bearer"}
+```
+
+Both credentials are verified and self-delegation is rejected. The operation
+records one `watch-terminal` child relationship and copies only D1 binding
+edges; it never accepts a computer E2EE secret. Removed edges commit
+client-targeted relay revocations in the same D1 transaction and are closed
+immediately when possible. A source-client unbind removes that computer from
+both principals atomically. Replacing a lost Watch identity revokes the old
+identity and its live sockets. The response is
+`{"bindingCount":<number>}`. The iPhone uses this for an independent Watch
+relay principal, then transfers the corresponding E2EE bindings directly with
+WatchConnectivity.
 
 ### `DELETE /v2/clients/me/bindings/:computerId`
 

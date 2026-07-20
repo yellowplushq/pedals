@@ -32,6 +32,7 @@ const APNS_TOKEN = /^[0-9a-fA-F]{16,512}$/;
 const PAIRING_CODE = /^\d{8}$/;
 const CURVE25519_PUBLIC_KEY = /^[A-Za-z0-9_-]{43}$/;
 const ENCRYPTED_SECRET = /^[A-Za-z0-9_-]{64,256}$/;
+const CLIENT_TOKEN = /^[A-Za-z0-9_-]{32,128}$/;
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -424,9 +425,15 @@ async function requireStatusClient(request, env) {
 async function unbindComputer(request, env, ctx, computerId) {
   const client = await requireControlClient(request, env);
   await limitAuthenticated(request, env, "MUTATION_LIMITER", "unbind", client.id);
+  const delegates = await env.DB.prepare(
+    `SELECT delegate_client_id AS clientId
+       FROM client_delegates
+      WHERE parent_client_id = ?1
+      ORDER BY delegate_client_id`,
+  ).bind(client.id).all();
+  const principalIds = [client.id, ...delegates.results.map((row) => row.clientId)];
   const now = nowSeconds();
-  const results = await env.DB.batch([
-    env.DB.prepare(
+  const deliveryStatements = principalIds.map((clientId) => env.DB.prepare(
       `UPDATE client_delivery_state
           SET sequence = sequence + 1,
               last_fingerprint = NULL
@@ -435,27 +442,46 @@ async function unbindComputer(request, env, ctx, computerId) {
                 SELECT 1 FROM client_computers
                  WHERE client_id = ?1 AND computer_id = ?2
               )`,
-    ).bind(client.id, computerId),
-    clientRevocationStatement(env, computerId, client.id, now),
-    env.DB.prepare(
+    ).bind(clientId, computerId));
+  const revocationStatements = principalIds.map((clientId) =>
+    clientRevocationStatement(env, computerId, clientId, now));
+  const deleteStatements = principalIds.map((clientId) => env.DB.prepare(
       `DELETE FROM client_computers
         WHERE client_id = ?1 AND computer_id = ?2`,
-    )
-      .bind(client.id, computerId),
+    ).bind(clientId, computerId));
+  const results = await env.DB.batch([
+    ...deliveryStatements,
+    ...revocationStatements,
+    ...deleteStatements,
     env.DB.prepare(
-      `SELECT id
+      `SELECT id AS revocationId, principal_id AS clientId
          FROM relay_revocation_outbox
-        WHERE kind = 'client' AND computer_id = ?1 AND principal_id = ?2`,
+        WHERE kind = 'client' AND computer_id = ?1
+          AND principal_id IN (
+                SELECT ?2
+                UNION ALL
+                SELECT delegate_client_id
+                  FROM client_delegates
+                 WHERE parent_client_id = ?2
+              )
+        ORDER BY principal_id`,
     ).bind(computerId, client.id),
   ]);
-  const removed = Number(results[2].meta?.changes ?? 0) > 0;
-  const revocationId = results[3].results?.[0]?.id;
+  const deleteStart = deliveryStatements.length + revocationStatements.length;
+  const removed = results.slice(deleteStart, deleteStart + deleteStatements.length)
+    .some((result) => Number(result.meta?.changes ?? 0) > 0);
+  const revocations = results[results.length - 1].results ?? [];
   // The D1 transaction is the access-revocation commit boundary. An eager
   // Durable Object call keeps the common path immediate; a failed call leaves
   // the outbox row due for the minute cron instead of restoring the binding.
-  if (isId(revocationId)) {
+  for (const revocation of revocations) {
     try {
-      await deliverClientRelayRevocation(env, computerId, client.id, revocationId);
+      await deliverClientRelayRevocation(
+        env,
+        computerId,
+        revocation.clientId,
+        revocation.revocationId,
+      );
     } catch (error) {
       console.error(
         "client socket revocation failed",
@@ -464,9 +490,231 @@ async function unbindComputer(request, env, ctx, computerId) {
     }
   }
   if (removed) {
-    background(ctx, notifyPushCoordinator(env, [client.id]), "unbind push notify failed");
+    background(ctx, notifyPushCoordinator(env, principalIds), "unbind push notify failed");
   }
   return new Response(null, { status: 204 });
+}
+
+async function synchronizeDelegatedBindings(request, env, ctx) {
+  const client = await requireControlClient(request, env);
+  await limitAuthenticated(
+    request,
+    env,
+    "MUTATION_LIMITER",
+    "delegated-bindings",
+    client.id,
+  );
+  const body = await readJson(request);
+  requireBodyShape(body, ["clientId", "clientToken"]);
+  if (!isId(body.clientId) || !CLIENT_TOKEN.test(body.clientToken)) {
+    throw new ApiFailure(400, "invalid_delegate", "delegated client credential is invalid");
+  }
+  if (body.clientId === client.id) {
+    throw new ApiFailure(400, "invalid_delegate", "a client cannot delegate to itself");
+  }
+
+  const delegateTokenHash = await tokenHash(body.clientToken);
+  const delegate = await env.DB.prepare(
+    `SELECT id
+       FROM clients
+      WHERE id = ?1 AND auth_token_hash = ?2 AND revoked_at IS NULL`,
+  ).bind(body.clientId, delegateTokenHash).first();
+  if (!delegate) {
+    throw new ApiFailure(403, "invalid_delegate", "delegated client credential is invalid");
+  }
+
+  const relationship = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT parent_client_id AS parentClientId
+         FROM client_delegates
+        WHERE delegate_client_id = ?1`,
+    ).bind(delegate.id),
+    env.DB.prepare(
+      `SELECT delegate_client_id AS delegateClientId
+         FROM client_delegates
+        WHERE parent_client_id = ?1 AND kind = 'watch-terminal'`,
+    ).bind(client.id),
+    env.DB.prepare(
+      `SELECT parent_client_id AS parentClientId
+         FROM client_delegates
+        WHERE delegate_client_id = ?1`,
+    ).bind(client.id),
+    env.DB.prepare(
+      `SELECT delegated.computer_id AS computerId
+         FROM client_computers delegated
+        WHERE delegated.client_id = ?1
+          AND NOT EXISTS (
+                SELECT 1
+                  FROM client_computers source
+                 WHERE source.client_id = ?2
+                   AND source.computer_id = delegated.computer_id
+              )
+        ORDER BY delegated.computer_id`,
+    ).bind(delegate.id, client.id),
+  ]);
+  const owner = relationship[0].results?.[0]?.parentClientId;
+  if (owner !== undefined && owner !== client.id) {
+    throw new ApiFailure(403, "invalid_delegate", "delegated client belongs to another client");
+  }
+  if (relationship[2].results?.length) {
+    throw new ApiFailure(403, "invalid_delegate", "a delegated client cannot create delegates");
+  }
+  const previousDelegateId = relationship[1].results?.[0]?.delegateClientId;
+  const replacedDelegateId = previousDelegateId !== undefined && previousDelegateId !== delegate.id
+    ? previousDelegateId
+    : null;
+  const removed = relationship[3].results ?? [];
+  const replacedBindings = replacedDelegateId === null
+    ? { results: [] }
+    : await env.DB.prepare(
+      `SELECT computer_id AS computerId
+         FROM client_computers
+        WHERE client_id = ?1
+        ORDER BY computer_id`,
+    ).bind(replacedDelegateId).all();
+
+  const now = nowSeconds();
+  const removals = [
+    ...removed.map((row) => ({ clientId: delegate.id, computerId: row.computerId })),
+    ...replacedBindings.results.map((row) => ({
+      clientId: replacedDelegateId,
+      computerId: row.computerId,
+    })),
+  ];
+  const statements = [
+    env.DB.prepare(
+      `UPDATE client_delivery_state
+          SET sequence = sequence + 1,
+              last_fingerprint = NULL
+        WHERE client_id = ?1
+          AND (
+                EXISTS (
+                  SELECT 1
+                    FROM client_computers source
+                   WHERE source.client_id = ?2
+                     AND NOT EXISTS (
+                           SELECT 1 FROM client_computers delegated
+                            WHERE delegated.client_id = ?1
+                              AND delegated.computer_id = source.computer_id
+                         )
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM client_computers delegated
+                   WHERE delegated.client_id = ?1
+                     AND NOT EXISTS (
+                           SELECT 1 FROM client_computers source
+                            WHERE source.client_id = ?2
+                              AND source.computer_id = delegated.computer_id
+                         )
+                )
+              )`,
+    ).bind(delegate.id, client.id),
+    ...(replacedDelegateId === null ? [] : [env.DB.prepare(
+      `UPDATE client_delivery_state
+          SET sequence = sequence + 1,
+              last_fingerprint = NULL
+        WHERE client_id = ?1
+          AND EXISTS (SELECT 1 FROM client_computers WHERE client_id = ?1)`,
+    ).bind(replacedDelegateId)]),
+    ...removals.map((removal) => env.DB.prepare(
+      `INSERT INTO relay_revocation_outbox
+         (id, kind, computer_id, principal_id, created_at, attempt_count,
+          next_attempt_at, last_error)
+       SELECT ?1, 'client', ?2, ?3, ?4, 0, 0, NULL
+        WHERE EXISTS (
+                SELECT 1 FROM client_computers
+                 WHERE client_id = ?3 AND computer_id = ?2
+              )
+       ON CONFLICT(kind, computer_id, principal_id) DO UPDATE SET
+         id = excluded.id,
+         created_at = excluded.created_at,
+         attempt_count = 0,
+         next_attempt_at = 0,
+         last_error = NULL`,
+    ).bind(randomId(), removal.computerId, removal.clientId, now)),
+    ...(replacedDelegateId === null ? [] : [
+      env.DB.prepare(`DELETE FROM client_computers WHERE client_id = ?1`)
+        .bind(replacedDelegateId),
+      env.DB.prepare(
+        `UPDATE clients SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL`,
+      ).bind(replacedDelegateId, now),
+    ]),
+    env.DB.prepare(
+      `DELETE FROM client_delegates
+        WHERE parent_client_id = ?1 AND kind = 'watch-terminal'`,
+    ).bind(client.id),
+    env.DB.prepare(
+      `INSERT INTO client_delegates
+         (parent_client_id, delegate_client_id, kind, created_at)
+       VALUES (?1, ?2, 'watch-terminal', ?3)`,
+    ).bind(client.id, delegate.id, now),
+    env.DB.prepare(
+      `DELETE FROM client_computers AS delegated
+        WHERE delegated.client_id = ?1
+          AND NOT EXISTS (
+                SELECT 1 FROM client_computers source
+                 WHERE source.client_id = ?2
+                   AND source.computer_id = delegated.computer_id
+              )`,
+    ).bind(delegate.id, client.id),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO client_computers
+         (client_id, computer_id, mutation_id, created_at)
+       SELECT ?1, computer_id, ?3, ?4
+         FROM client_computers
+        WHERE client_id = ?2`,
+    ).bind(delegate.id, client.id, randomId(), now),
+    env.DB.prepare(
+      `DELETE FROM relay_revocation_outbox
+        WHERE kind = 'client' AND principal_id = ?1
+          AND computer_id IN (
+                SELECT computer_id FROM client_computers WHERE client_id = ?2
+              )`,
+    ).bind(delegate.id, client.id),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS bindingCount
+         FROM client_computers
+        WHERE client_id = ?1`,
+    ).bind(delegate.id),
+    env.DB.prepare(
+      `SELECT id AS revocationId, computer_id AS computerId,
+              principal_id AS clientId
+         FROM relay_revocation_outbox
+        WHERE kind = 'client'
+          AND (principal_id = ?1 OR principal_id = ?2)
+        ORDER BY principal_id, computer_id`,
+    ).bind(delegate.id, replacedDelegateId ?? ""),
+  ];
+  const results = await env.DB.batch(statements);
+  const changed = Number(results[0].meta?.changes ?? 0) === 1;
+  const countResult = results[results.length - 2].results?.[0];
+  const revocations = results[results.length - 1].results ?? [];
+
+  for (const revocation of revocations) {
+    try {
+      await deliverClientRelayRevocation(
+        env,
+        revocation.computerId,
+        revocation.clientId,
+        revocation.revocationId,
+      );
+    } catch (error) {
+      console.error(
+        "delegated client socket revocation failed",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+  if (changed) {
+    background(
+      ctx,
+      notifyPushCoordinator(env, [delegate.id]),
+      "delegated binding push notify failed",
+    );
+  }
+  await touchClient(env.DB, delegate.id);
+  return json({ bindingCount: Number(countResult?.bindingCount ?? 0) });
 }
 
 async function deleteComputer(request, env, ctx, computerId) {
@@ -736,6 +984,10 @@ export async function handleApi(request, env, ctx, url) {
   if (request.method === "DELETE" && match) {
     requireQueryShape(url);
     return unbindComputer(request, env, ctx, match[1]);
+  }
+  if (request.method === "PUT" && pathname === "/v2/clients/me/delegated-bindings") {
+    requireQueryShape(url);
+    return synchronizeDelegatedBindings(request, env, ctx);
   }
   if (request.method === "GET" && pathname === "/v2/clients/me/state") {
     requireQueryShape(url);

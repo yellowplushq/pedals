@@ -18,8 +18,13 @@ final class TerminalHost {
     /// Focus follows UIKit's first responder state, including a terminal tap
     /// that dismisses either the system or Pedals keyboard.
     var onFocusChange: ((Bool) -> Void)?
-    /// Grid size changes (view layout / font size), to be sent as `resize` frames.
+    /// Grid size changes, to be sent as `resize` frames. Fired only once the
+    /// emulator has applied the grid, so a TUI repaint triggered by the frame
+    /// can never be parsed against a smaller, stale grid.
     var onResize: ((_ cols: UInt16, _ rows: UInt16) -> Void)?
+    /// The grid the emulator has applied — the only size safe to hand to the
+    /// daemon. During a layout change this lags `viewport` by one emulator
+    /// resize round trip.
     private(set) var cols: UInt16?
     private(set) var rows: UInt16?
     private var viewport: InMemoryTerminalViewport?
@@ -54,7 +59,7 @@ final class TerminalHost {
                 Task { @MainActor in relay.host?.handleInput(data) }
             },
             resize: { viewport in
-                Task { @MainActor in relay.host?.handleResize(viewport) }
+                Task { @MainActor in relay.host?.handleAppliedResize(viewport) }
             }
         )
 
@@ -186,7 +191,7 @@ final class TerminalHost {
 
     /// Feed live remote `stdout` bytes into the emulator.
     func feed(_ data: Data) {
-        session.receive(data)
+        session.receiveSynchronously(data)
         kickRender()
     }
 
@@ -194,8 +199,11 @@ final class TerminalHost {
     /// scrollback) so a reconnect replay doesn't duplicate earlier output.
     func feedReplay(_ data: Data) {
         muteInputUntil = Date().addingTimeInterval(0.5)
-        session.receive(Data("\u{1b}c\u{1b}[3J".utf8))
-        session.receive(data)
+        session.receiveSynchronously(Data("\u{1b}c\u{1b}[3J".utf8))
+        session.receiveSynchronously(data)
+        // Both the RIS above and any reset inside the replayed history clear
+        // mode 2048, which the applied-resize pipeline depends on.
+        session.armInBandSizeReports()
         kickRender()
     }
 
@@ -205,24 +213,11 @@ final class TerminalHost {
         kickRender()
     }
 
-    /// This libghostty build never emits GHOSTTY_ACTION_RENDER for
-    /// host-managed writes, so nothing schedules a redraw when remote bytes
-    /// land (verified via TerminalDebugLog: writes reach the surface, zero
-    /// render callbacks follow). fitToSize() ends in requestImmediateTick,
-    /// making "remote data → one render pass" deterministic. The emulator
-    /// digests writes on a serial queue; the async hop orders the kick after
-    /// the enqueue without blocking the feed path.
+    /// Host-managed writes do not emit GHOSTTY_ACTION_RENDER. Pedals parses
+    /// them synchronously on this main-actor host, then requests a render pass;
+    /// parsing and drawing therefore never touch the surface concurrently.
     func kickRender() {
-        DispatchQueue.main.async { [weak view] in
-            guard let view else { return }
-            view.fitToSize()
-            if ProcessInfo.processInfo.environment["PEDALS_GHOSTTY_DEBUG"] != nil {
-                let layers = (view.layer.sublayers ?? []).map {
-                    "\(type(of: $0)) f=\($0.frame) hid=\($0.isHidden) op=\($0.opacity)"
-                }
-                print("[pedals-dbg] view f=\(view.frame) hid=\(view.isHidden) win=\(view.window != nil) sublayers=\(layers)")
-            }
-        }
+        view.requestRender()
     }
 
     private func handleInput(_ data: Data) {
@@ -274,16 +269,29 @@ final class TerminalHost {
         }
     }
 
-    private func handleResize(_ viewport: InMemoryTerminalViewport) {
+    /// The emulator applied `viewport` to its grid (mode 2048 size report).
+    /// Only now is it safe to announce the size to the daemon: the repaint a
+    /// TUI answers with is guaranteed to be parsed against this grid, never a
+    /// stale smaller one that would clamp its cursor addressing.
+    private func handleAppliedResize(_ viewport: InMemoryTerminalViewport) {
         guard viewport.columns > 0, viewport.rows > 0 else { return }
 
+        noteViewportGeometry(viewport)
+
+        guard cols != viewport.columns || rows != viewport.rows else { return }
+        cols = viewport.columns
+        rows = viewport.rows
+        onResize?(viewport.columns, viewport.rows)
+    }
+
+    private func noteViewportGeometry(_ viewport: InMemoryTerminalViewport) {
         let previous = self.viewport
         self.viewport = viewport
 
         // A selection is tied to the exact Ghostty grid that produced its
         // snapshot. Reflowing it onto a different grid would make the boxes
         // drift from the glyphs, so end only genuinely geometry-changing
-        // selections. An identical session resize callback is harmless.
+        // selections. An identical resize notification is harmless.
         if let previous,
            previous.columns != viewport.columns
             || previous.rows != viewport.rows
@@ -292,11 +300,6 @@ final class TerminalHost {
         {
             selectionOverlay?.finish()
         }
-
-        guard cols != viewport.columns || rows != viewport.rows else { return }
-        cols = viewport.columns
-        rows = viewport.rows
-        onResize?(viewport.columns, viewport.rows)
     }
 
     private func beginTextSelection(_ request: TerminalTextSelectionRequest) {
@@ -358,7 +361,7 @@ final class TerminalHost {
                 completion(nil)
                 return
             }
-            view.fitToSize()
+            view.requestRender()
             completion(session.readViewportText())
         }
     }
@@ -368,11 +371,13 @@ extension TerminalHost: TerminalSurfaceGridResizeDelegate,
     TerminalSurfaceTextSelectionRequestDelegate
 {
     func terminalDidResize(_ size: TerminalGridMetrics) {
-        // Unlike the in-memory session callback (which hops through Task), the
-        // delegate receives the surface's current metrics synchronously. This
-        // prevents a long press during keyboard/layout animation from starting
-        // against a stale grid.
-        handleResize(InMemoryTerminalViewport(
+        // The delegate reports the grid projected from the new view layout
+        // synchronously, before the emulator has applied it. That is exactly
+        // right for view-side geometry (a long press during a keyboard
+        // animation must not select against a stale grid), and exactly wrong
+        // for the daemon: `onResize` waits for the applied-resize callback.
+        guard size.columns > 0, size.rows > 0 else { return }
+        noteViewportGeometry(InMemoryTerminalViewport(
             columns: size.columns,
             rows: size.rows,
             widthPixels: size.widthPixels,

@@ -128,7 +128,7 @@ final class TerminalChannel {
         // Defense in depth: per-channel keys already stop cross-channel
         // ciphertext at decrypt, so a data frame whose sid isn't ours can only
         // be a bug — drop it rather than render another session's output here.
-        if (frame.type == .replay || frame.type == .stdout),
+        if (frame.type == .replay || frame.type == .stdout || frame.type == .resize),
            frame.sessionId != UInt32(terminalID.sid) {
             return
         }
@@ -147,7 +147,11 @@ final class TerminalChannel {
             onStdout?(frame.payload)
         case .ctl:
             break
-        case .stdin, .resize:
+        case .resize:
+            // The iPhone owns this renderer's grid. Host resize echoes are for
+            // passive observers such as Watch and are intentionally ignored.
+            break
+        case .stdin:
             break // client→host only; ignore if mirrored back
         }
     }

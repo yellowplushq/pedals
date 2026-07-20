@@ -8,6 +8,10 @@ import PedalsKit
 public enum SessionEvent: Sendable {
     /// The session list changed (create / close / exit / title).
     case sessionsChanged([SessionInfo])
+    /// The PTY accepted a new grid size. Emitted before any output produced by
+    /// the resulting SIGWINCH, so remote renderers can resize before parsing
+    /// the application's redraw.
+    case resized(id: Int, cols: UInt16, rows: UInt16)
     /// Raw PTY output. `offset` is the total number of bytes output before this chunk.
     case output(id: Int, data: Data, offset: UInt64)
     case title(id: Int, title: String)
@@ -210,6 +214,7 @@ public final class SessionManager: @unchecked Sendable {
             session.cols = cols
             session.rows = rows
             session.pty.resize(cols: cols, rows: rows)
+            self._onEvent?(.resized(id: id, cols: cols, rows: rows))
             emitSessionsChangedLocked()
         }
     }
@@ -219,10 +224,15 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     /// Ring-buffer snapshot + the output offset it covers, for replay-on-attach.
-    public func replaySnapshot(id: Int) -> (data: Data, coversUpTo: UInt64)? {
+    public func replaySnapshot(
+        id: Int
+    ) -> (data: Data, coversUpTo: UInt64, cols: UInt16, rows: UInt16)? {
         queue.sync {
             guard let session = sessions[id] else { return nil }
-            return (session.ring.snapshot(), session.outputOffset)
+            return (
+                session.ring.snapshot(), session.outputOffset,
+                session.cols, session.rows
+            )
         }
     }
 

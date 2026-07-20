@@ -58,6 +58,7 @@ final class MainViewController: UIViewController {
     private let toolbar = TerminalToolbar()
     private let terminalKeyboard = TerminalKeyboardView()
     private var isTerminalKeyboardEnabled = false
+    private var toolbarBottomConstraint: NSLayoutConstraint!
     private var pagesBottomToToolbarConstraint: NSLayoutConstraint!
     private var pagesBottomToViewConstraint: NSLayoutConstraint!
 
@@ -152,6 +153,10 @@ final class MainViewController: UIViewController {
         pagesBottomToViewConstraint = pagesContainer.bottomAnchor.constraint(
             equalTo: view.bottomAnchor
         )
+        toolbarBottomConstraint = toolbar.bottomAnchor.constraint(
+            equalTo: view.safeAreaLayoutGuide.bottomAnchor,
+            constant: -6
+        )
 
         NSLayoutConstraint.activate([
             // libghostty has no asymmetric content inset, so the grid sits
@@ -182,9 +187,7 @@ final class MainViewController: UIViewController {
             toolbar.trailingAnchor.constraint(
                 equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12
             ),
-            toolbar.bottomAnchor.constraint(
-                equalTo: view.keyboardLayoutGuide.topAnchor, constant: -6
-            ),
+            toolbarBottomConstraint,
             toolbar.heightAnchor.constraint(equalToConstant: TerminalToolbar.height),
 
             noSessionsView.centerXAnchor.constraint(equalTo: pagesContainer.centerXAnchor),
@@ -324,13 +327,33 @@ final class MainViewController: UIViewController {
     ) {
         let userInfo = notification.userInfo ?? [:]
         let visible: Bool
+        var localKeyboardFrame: CGRect?
         if forceHidden {
             visible = false
         } else if let screenFrame = userInfo[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
             let localFrame = view.convert(screenFrame, from: nil)
+            localKeyboardFrame = localFrame
             visible = view.bounds.intersection(localFrame).height > 1
         } else {
             return
+        }
+
+        let safeAreaBottom = view.safeAreaLayoutGuide.layoutFrame.maxY
+        let keyboardTop = localKeyboardFrame.map {
+            min(max($0.minY, view.bounds.minY), view.bounds.maxY)
+        } ?? safeAreaBottom
+        toolbarBottomConstraint.constant = visible
+            ? keyboardTop - safeAreaBottom - 6
+            : -6
+
+        // `UIKeyboardLayoutGuide` animates its presentation frame while
+        // Auto Layout exposes the final model frame. An IOSurface-backed
+        // terminal cannot derive a valid contentsScale from those two
+        // different heights. Apply the terminal geometry atomically to the
+        // notification's final keyboard frame; the keyboard itself continues
+        // using the system animation.
+        UIView.performWithoutAnimation {
+            view.layoutIfNeeded()
         }
 
         let duration = (userInfo[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?

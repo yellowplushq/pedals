@@ -19,6 +19,8 @@ final class AppServices {
     private var statusSubscriptions: Set<AnyCancellable> = []
     private var computerStatusSubscriptions: Set<AnyCancellable> = []
     private var statusRefreshTask: Task<Void, Never>?
+    private let watchTerminalProvisioner = WatchTerminalProvisioner()
+    private var watchTerminalSyncTask: Task<Void, Never>?
 
     init() {
         #if DEBUG
@@ -26,12 +28,14 @@ final class AppServices {
         let storedServiceURL = try? pairingStore.loadClientIdentity()?.serviceURL
         if forceReset || storedServiceURL.map({ $0 != Self.pairingServiceURL }) == true {
             PairingStore.resetKeychainForUITesting()
+            WatchTerminalProvisioner.resetKeychainForUITesting()
         }
         #endif
         terminals = TerminalManager(pairingStore: pairingStore)
         terminals.$computers
             .sink { [weak self] computers in
                 self?.observeStatusChanges(in: computers)
+                self?.synchronizeWatchTerminalContext()
                 self?.scheduleStatusRefresh()
             }
             .store(in: &statusSubscriptions)
@@ -94,11 +98,13 @@ final class AppServices {
         do {
             guard let storedIdentity = try pairingStore.loadClientIdentity() else {
                 StatusSharedStore.removeCredential()
+                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
                 return
             }
             identity = storedIdentity
         } catch {
             StatusSharedStore.removeCredential()
+            IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
             return
         }
         let credential = PedalsStatusCredential(
@@ -109,6 +115,41 @@ final class AppServices {
         Task {
             await PedalsStatusRuntime.installCredential(credential)
             IOSWatchConnectivityBridge.shared.sendCurrentContext()
+        }
+        synchronizeWatchTerminalContext()
+    }
+
+    private func synchronizeWatchTerminalContext() {
+        watchTerminalSyncTask?.cancel()
+        let source: ClientIdentity
+        let bindings: [ComputerBinding]
+        do {
+            guard let identity = try pairingStore.loadClientIdentity() else {
+                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+                return
+            }
+            source = identity
+            bindings = try pairingStore.loadAll()
+        } catch {
+            IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+            return
+        }
+
+        watchTerminalSyncTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let context = try await watchTerminalProvisioner.context(
+                    source: source,
+                    bindings: bindings
+                )
+                guard !Task.isCancelled else { return }
+                IOSWatchConnectivityBridge.shared.setTerminalContext(context)
+            } catch {
+                guard !Task.isCancelled else { return }
+                // Never give the Watch a credential whose authorization set
+                // could not be reconciled with the iPhone's current bindings.
+                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+            }
         }
     }
 

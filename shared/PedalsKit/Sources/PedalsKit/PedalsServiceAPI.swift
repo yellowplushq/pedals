@@ -35,6 +35,15 @@ public final class PedalsServiceAPI: @unchecked Sendable {
         let statusToken: String
     }
 
+    private struct SynchronizeDelegatedBindingsRequest: Encodable {
+        let clientId: String
+        let clientToken: String
+    }
+
+    private struct SynchronizeDelegatedBindingsResponse: Decodable {
+        let bindingCount: Int
+    }
+
     private struct CreatePairingSessionRequest: Encodable {
         let hostPublicKey: String
     }
@@ -279,6 +288,30 @@ public final class PedalsServiceAPI: @unchecked Sendable {
             path: "/v2/clients/me/bindings/\(computerID)",
             bearer: client.clientToken
         )
+    }
+
+    /// Makes a second client principal (for example, a paired Watch) inherit
+    /// exactly the source client's current server-side computer bindings.
+    /// E2EE computer secrets are never sent to the service by this operation.
+    @discardableResult
+    public func synchronizeBindings(
+        from source: ClientIdentity,
+        to delegate: ClientIdentity
+    ) async throws -> Int {
+        guard source.serviceURL == serviceURL,
+              delegate.serviceURL == serviceURL,
+              source.clientID != delegate.clientID
+        else { throw APIError.serviceMismatch }
+        let response: SynchronizeDelegatedBindingsResponse = try await send(
+            method: "PUT",
+            path: "/v2/clients/me/delegated-bindings",
+            bearer: source.clientToken,
+            body: SynchronizeDelegatedBindingsRequest(
+                clientId: delegate.clientID,
+                clientToken: delegate.clientToken
+            )
+        )
+        return response.bindingCount
     }
 
     private struct EmptyResponse: Decodable {}

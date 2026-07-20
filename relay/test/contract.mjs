@@ -115,6 +115,7 @@ async function waitForState(statusToken, predicate) {
 let computer = null;
 let host = null;
 let clientSocket = null;
+let delegatedSocket = null;
 try {
   computer = await json("/v2/computers", { method: "POST" }, 201);
   const client = await json("/v2/clients", { method: "POST" }, 201);
@@ -223,6 +224,31 @@ try {
   assert.equal(state.computers[0].name, "Contract Mac");
   assert.equal(state.computers[0].runningTTYCount, 1);
 
+  const delegated = await json("/v2/clients", { method: "POST" }, 201);
+  const synchronized = await json(
+    "/v2/clients/me/delegated-bindings",
+    {
+      method: "PUT",
+      token: client.clientToken,
+      body: {
+        clientId: delegated.clientId,
+        clientToken: delegated.clientToken,
+      },
+    },
+    200,
+  );
+  assert.equal(synchronized.bindingCount, 1);
+  delegatedSocket = await connect(computer.computerId, delegated.clientToken);
+  const delegatedDirectory = JSON.parse(await delegatedSocket.nextText());
+  assert.equal(delegatedDirectory.type, "terminal-directory");
+  assert.equal(delegatedDirectory.online, true);
+  assert.deepEqual(delegatedDirectory.sessions, [{ id: 1, alive: true }]);
+  const delegatedState = await waitForState(
+    delegated.statusToken,
+    (value) => value.version === 2 && value.totalRunning === 1,
+  );
+  assert.equal(delegatedState.computers[0].id, computer.computerId);
+
   const legacy = await request(`/v1/room/${computer.computerId}`);
   assert.equal(legacy.status, 404, "v1 route must not exist");
   console.log(`v2 contract passed: ${baseURL.origin}`);
@@ -230,6 +256,7 @@ try {
   try {
     host?.ws.close(1000, "contract complete");
     clientSocket?.ws.close(1000, "contract complete");
+    delegatedSocket?.ws.close(1000, "contract complete");
   } catch {
     // Cleanup continues through the authenticated HTTP reset.
   }
