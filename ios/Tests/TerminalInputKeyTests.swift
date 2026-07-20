@@ -4,6 +4,30 @@ import XCTest
 @testable import Pedals
 
 final class TerminalInputKeyTests: XCTestCase {
+    func testSystemKeyboardReturnBecomesTerminalEnterWithoutChangingPaste() {
+        XCTAssertEqual(TerminalSystemTextInput.normalized("\n"), "\r")
+        XCTAssertEqual(TerminalSystemTextInput.normalized("\r"), "\r")
+        XCTAssertEqual(
+            TerminalSystemTextInput.normalized("echo one\necho two"),
+            "echo one\necho two"
+        )
+    }
+
+    func testOnlyShortStationaryTerminalTouchTogglesFocus() {
+        XCTAssertTrue(TerminalFocusTapIntent.shouldToggle(
+            duration: 0.12,
+            maximumMovement: 2
+        ))
+        XCTAssertFalse(TerminalFocusTapIntent.shouldToggle(
+            duration: 0.31,
+            maximumMovement: 2
+        ))
+        XCTAssertFalse(TerminalFocusTapIntent.shouldToggle(
+            duration: 0.12,
+            maximumMovement: 8.1
+        ))
+    }
+
     func testHardwareTextFallbackAppliesControlAndAlt() {
         XCTAssertEqual(
             TerminalKeyModifiers.ctrl.applying(toUnmodifiedByte: UInt8(ascii: "c")),

@@ -17,6 +17,20 @@ public enum SessionEvent: Sendable {
 /// Owns all PTY sessions (PROTOCOL.md §6): spawn, ring buffers, titles, teardown.
 /// Thread-safe; events are delivered on an internal serial queue.
 public final class SessionManager: @unchecked Sendable {
+    public enum SessionError: Error, CustomStringConvertible, Equatable {
+        case capacityReached(Int)
+        case idSpaceExhausted
+
+        public var description: String {
+            switch self {
+            case .capacityReached(let limit):
+                "terminal limit reached (\(limit))"
+            case .idSpaceExhausted:
+                "terminal ID space exhausted"
+            }
+        }
+    }
+
     public struct Options: Sendable {
         /// Shell binary. Default: `$SHELL`, fallback `/bin/zsh`.
         public var shell: String
@@ -25,6 +39,9 @@ public final class SessionManager: @unchecked Sendable {
         public var extraEnvironment: [String: String]
         public var defaultCols: UInt16 = 120
         public var defaultRows: UInt16 = 40
+        /// The Durable Object directory is deliberately bounded so a host
+        /// cannot amplify an unbounded metadata snapshot to every client.
+        public var maximumSessions = 255
         /// First session id to allocate. Session-channel keys are derived from
         /// (secret, sid), so ids must never be reused across daemon restarts
         /// while the pairing persists — pass a persisted high-water mark + 1
@@ -123,10 +140,17 @@ public final class SessionManager: @unchecked Sendable {
     @discardableResult
     public func create(cwd: String? = nil, cols: Int? = nil, rows: Int? = nil) throws -> Int {
         try queue.sync {
+            let limit = min(max(options.maximumSessions, 0), 255)
+            guard sessions.count < limit else {
+                throw SessionError.capacityReached(limit)
+            }
             let cols = UInt16(clamping: cols ?? Int(options.defaultCols))
             let rows = UInt16(clamping: rows ?? Int(options.defaultRows))
             let directory = Self.resolveCwd(cwd)
             let id = nextId
+            guard id <= Int(UInt32.max) else {
+                throw SessionError.idSpaceExhausted
+            }
             // Persist before any PTY exists. A failed spawn burns an id, which
             // is safe; a failed persistence prevents key/sid reuse entirely.
             try options.onIdAllocated?(id)

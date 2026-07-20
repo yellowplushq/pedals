@@ -15,11 +15,18 @@ final class TerminalHost {
     var onInput: ((Data) -> Void)?
     /// Mirrors libghostty's sticky Ctrl/Alt state into Pedals' custom toolbar.
     var onModifierStateChange: ((TerminalModifierState) -> Void)?
+    /// Focus follows UIKit's first responder state, including a terminal tap
+    /// that dismisses either the system or Pedals keyboard.
+    var onFocusChange: ((Bool) -> Void)?
     /// Grid size changes (view layout / font size), to be sent as `resize` frames.
     var onResize: ((_ cols: UInt16, _ rows: UInt16) -> Void)?
-
     private(set) var cols: UInt16?
     private(set) var rows: UInt16?
+    private var viewport: InMemoryTerminalViewport?
+    private weak var selectionOverlay: TerminalSelectionOverlay?
+    private var selectionStartedWithFirstResponder = false
+
+    var isTextSelectionActive: Bool { selectionOverlay != nil }
 
     /// While a replay snapshot is being digested, the emulator re-answers any
     /// terminal queries (DA, DECRQM, …) contained in the replayed history.
@@ -53,6 +60,7 @@ final class TerminalHost {
         view = PedalsTerminalView(frame: .zero)
         view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
         view.controller = controller
+        view.delegate = self
         view.backgroundColor = .clear
         view.isOpaque = false
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -63,6 +71,9 @@ final class TerminalHost {
         view.setStickyModifierChangeHandler { [weak self] in
             guard let self else { return }
             onModifierStateChange?(modifierState)
+        }
+        view.focusChangeHandler = { [weak self] focused in
+            self?.onFocusChange?(focused)
         }
     }
 
@@ -218,9 +229,114 @@ final class TerminalHost {
 
     private func handleResize(_ viewport: InMemoryTerminalViewport) {
         guard viewport.columns > 0, viewport.rows > 0 else { return }
+
+        let previous = self.viewport
+        self.viewport = viewport
+
+        // A selection is tied to the exact Ghostty grid that produced its
+        // snapshot. Reflowing it onto a different grid would make the boxes
+        // drift from the glyphs, so end only genuinely geometry-changing
+        // selections. An identical session resize callback is harmless.
+        if let previous,
+           previous.columns != viewport.columns
+            || previous.rows != viewport.rows
+            || previous.cellWidthPixels != viewport.cellWidthPixels
+            || previous.cellHeightPixels != viewport.cellHeightPixels
+        {
+            selectionOverlay?.finish()
+        }
+
+        guard cols != viewport.columns || rows != viewport.rows else { return }
         cols = viewport.columns
         rows = viewport.rows
         onResize?(viewport.columns, viewport.rows)
+    }
+
+    private func beginTextSelection(_ request: TerminalTextSelectionRequest) {
+        selectionOverlay?.finish()
+        selectionStartedWithFirstResponder = view.wasFirstResponderBeforeCurrentTouch
+        view.setPreservesFirstResponderDuringSelection(true)
+
+        let metrics = viewport ?? InMemoryTerminalViewport(
+            columns: cols ?? 1,
+            rows: rows ?? 1
+        )
+        let overlay = TerminalSelectionOverlay(
+            viewportText: request.text,
+            anchorRange: request.anchorRange,
+            sourcePoint: request.sourcePoint,
+            viewport: metrics,
+            viewportSize: view.bounds.size,
+            displayScale: view.window?.screen.nativeScale
+                ?? max(1, view.traitCollection.displayScale)
+        )
+        overlay.frame = view.bounds
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.onScrollRequest = { [weak self] direction, completion in
+            self?.scrollSelectionViewport(direction: direction, completion: completion)
+        }
+        overlay.onFinish = { [weak self, weak overlay] in
+            overlay?.removeFromSuperview()
+            self?.selectionOverlay = nil
+            self?.view.setTouchScrollGestureEnabled(true)
+            self?.view.setPreservesFirstResponderDuringSelection(false)
+            if self?.selectionStartedWithFirstResponder == false {
+                self?.view.resignFirstResponder()
+            }
+        }
+        view.setTouchScrollGestureEnabled(false)
+        view.addSubview(overlay)
+        selectionOverlay = overlay
+        overlay.activate()
+    }
+
+    private func scrollSelectionViewport(
+        direction: Int,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard direction != 0 else {
+            completion(session.readViewportText())
+            return
+        }
+        guard view.performBindingAction("scroll_page_lines:\(direction)") else {
+            completion(nil)
+            return
+        }
+
+        // The binding mutates Ghostty immediately, while its Metal layer draws
+        // on the next main-loop pass. Update the selection in that same pass so
+        // it cannot get one frame ahead of the terminal framebuffer.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                completion(nil)
+                return
+            }
+            view.fitToSize()
+            completion(session.readViewportText())
+        }
+    }
+}
+
+extension TerminalHost: TerminalSurfaceGridResizeDelegate,
+    TerminalSurfaceTextSelectionRequestDelegate
+{
+    func terminalDidResize(_ size: TerminalGridMetrics) {
+        // Unlike the in-memory session callback (which hops through Task), the
+        // delegate receives the surface's current metrics synchronously. This
+        // prevents a long press during keyboard/layout animation from starting
+        // against a stale grid.
+        handleResize(InMemoryTerminalViewport(
+            columns: size.columns,
+            rows: size.rows,
+            widthPixels: size.widthPixels,
+            heightPixels: size.heightPixels,
+            cellWidthPixels: size.cellWidthPixels,
+            cellHeightPixels: size.cellHeightPixels
+        ))
+    }
+
+    func terminalDidRequestTextSelection(_ request: TerminalTextSelectionRequest) {
+        beginTextSelection(request)
     }
 }
 
@@ -229,10 +345,182 @@ final class TerminalHost {
 /// then asks UIKit to reload the responder's input views when the mode changes.
 final class PedalsTerminalView: TerminalView {
     private var replacementInputView: UIView?
+    private var preservesFirstResponderDuringSelection = false
+    private(set) var wasFirstResponderBeforeCurrentTouch = false
+    private weak var focusTouch: UITouch?
+    private var focusTouchStartPoint: CGPoint?
+    private var focusTouchStartTimestamp: TimeInterval?
+    private var focusTouchMaximumMovement: CGFloat = 0
+    private var focusTouchIsEligible = false
+    var focusChangeHandler: ((Bool) -> Void)?
 
     override var inputView: UIView? { replacementInputView }
 
+    override func insertText(_ text: String) {
+        // UIKit delivers the software keyboard's Return key as LF. Sending it
+        // through Ghostty as ordinary text makes TUIs treat it as a literal
+        // newline instead of the terminal Enter key (CR). Only normalize the
+        // standalone Return event so multiline paste remains byte-for-byte.
+        super.insertText(TerminalSystemTextInput.normalized(text))
+    }
+
+    @discardableResult
+    override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        if result {
+            focusChangeHandler?(true)
+        }
+        return result
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first(where: { $0.type == .direct }) else {
+            super.touchesBegan(touches, with: event)
+            return
+        }
+
+        // Ghostty normally focuses on touch-down, before its pan and long-press
+        // recognizers know what the user intended. Defer focus until a short,
+        // stationary touch ends so scrolling and selection never summon the
+        // keyboard. Gesture recognizers still receive this touch independently.
+        wasFirstResponderBeforeCurrentTouch = isFirstResponder
+        focusTouch = touch
+        focusTouchStartPoint = touch.location(in: self)
+        focusTouchStartTimestamp = touch.timestamp
+        focusTouchMaximumMovement = 0
+        focusTouchIsEligible = event?.allTouches?.filter { $0.type == .direct }.count == 1
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first(where: { $0 === focusTouch }),
+              let startPoint = focusTouchStartPoint
+        else {
+            if !touches.contains(where: { $0.type == .direct }) {
+                super.touchesMoved(touches, with: event)
+            }
+            return
+        }
+
+        let point = touch.location(in: self)
+        focusTouchMaximumMovement = max(
+            focusTouchMaximumMovement,
+            hypot(point.x - startPoint.x, point.y - startPoint.y)
+        )
+        if focusTouchMaximumMovement > TerminalFocusTapIntent.maximumMovement {
+            focusTouchIsEligible = false
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first(where: { $0 === focusTouch }) else {
+            if !touches.contains(where: { $0.type == .direct }) {
+                super.touchesEnded(touches, with: event)
+            }
+            return
+        }
+
+        if let startPoint = focusTouchStartPoint,
+           let startTimestamp = focusTouchStartTimestamp
+        {
+            let point = touch.location(in: self)
+            let maximumMovement = max(
+                focusTouchMaximumMovement,
+                hypot(point.x - startPoint.x, point.y - startPoint.y)
+            )
+            let shouldToggle = focusTouchIsEligible
+                && TerminalFocusTapIntent.shouldToggle(
+                    duration: touch.timestamp - startTimestamp,
+                    maximumMovement: maximumMovement
+                )
+            resetFocusTouch()
+
+            if shouldToggle {
+                if wasFirstResponderBeforeCurrentTouch {
+                    resignFirstResponder()
+                } else {
+                    becomeFirstResponder()
+                }
+            }
+        } else {
+            resetFocusTouch()
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touches.contains(where: { $0 === focusTouch }) {
+            resetFocusTouch()
+            return
+        }
+        if !touches.contains(where: { $0.type == .direct }) {
+            super.touchesCancelled(touches, with: event)
+        }
+    }
+
+    @discardableResult
+    override func resignFirstResponder() -> Bool {
+        guard !preservesFirstResponderDuringSelection else { return false }
+        let result = super.resignFirstResponder()
+        if result {
+            focusChangeHandler?(false)
+        }
+        return result
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil else { return }
+
+        // A deliberate hold should select; even a small scroll should not.
+        // Keep Ghostty's recognizer, but tighten its movement tolerance so the
+        // vertical pan wins quickly when the finger is actually travelling.
+        for case let gesture as UILongPressGestureRecognizer in gestureRecognizers ?? []
+        where gesture.delegate === self {
+            gesture.minimumPressDuration = 0.58
+            gesture.allowableMovement = 7
+        }
+    }
+
     func setReplacementInputView(_ inputView: UIView?) {
         replacementInputView = inputView
+    }
+
+    func setPreservesFirstResponderDuringSelection(_ preserves: Bool) {
+        preservesFirstResponderDuringSelection = preserves
+    }
+
+    func setTouchScrollGestureEnabled(_ enabled: Bool) {
+        for case let gesture as UIPanGestureRecognizer in gestureRecognizers ?? []
+        where gesture.allowedTouchTypes.contains(
+            NSNumber(value: UITouch.TouchType.direct.rawValue)
+        ) {
+            gesture.isEnabled = enabled
+        }
+    }
+
+    private func resetFocusTouch() {
+        focusTouch = nil
+        focusTouchStartPoint = nil
+        focusTouchStartTimestamp = nil
+        focusTouchMaximumMovement = 0
+        focusTouchIsEligible = false
+    }
+}
+
+/// A terminal focus change is deliberately stricter than UIKit's long-press
+/// threshold. Anything slow or mobile belongs to selection/scroll gestures.
+enum TerminalFocusTapIntent {
+    static let maximumDuration: TimeInterval = 0.3
+    static let maximumMovement: CGFloat = 8
+
+    static func shouldToggle(duration: TimeInterval, maximumMovement: CGFloat) -> Bool {
+        duration >= 0
+            && duration <= maximumDuration
+            && maximumMovement <= Self.maximumMovement
+    }
+}
+
+enum TerminalSystemTextInput {
+    static func normalized(_ text: String) -> String {
+        text == "\n" ? "\r" : text
     }
 }

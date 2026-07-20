@@ -8,7 +8,6 @@ const PUSH_SURFACES = new Set([
 ]);
 
 export const MAX_JSON_BODY = 16 * 1024;
-export const HOST_STATE_TTL_SECONDS = 120;
 export const PAIRING_CODE_TTL_SECONDS = 15 * 60;
 export const SNAPSHOT_VERSION = 2;
 export const MAX_COMPUTERS = 128;
@@ -380,24 +379,20 @@ export async function deliverComputerRelayRevocation(env, computerId) {
 }
 
 export async function aggregateClientState(db, clientId, nowSeconds = Math.floor(Date.now() / 1000)) {
-  const cutoff = nowSeconds - HOST_STATE_TTL_SECONDS;
   const [bindings, deliveryResult] = await db.batch([
     db
       .prepare(
         `SELECT b.computer_id AS id,
                 COALESCE(NULLIF(s.host_name, ''), 'Mac ' || substr(b.computer_id, 1, 6)) AS name,
-                COALESCE(s.alive_tty_count, 0) AS reportedCount,
-                CASE
-                  WHEN s.online = 1 AND s.last_seen_at >= ?2 THEN 1
-                  ELSE 0
-                END AS online,
+                COALESCE(s.running_terminal_count, 0) AS reportedCount,
+                COALESCE(s.online, 0) AS online,
                 COALESCE(s.updated_at, 0) AS updatedAt
            FROM client_computers b
            LEFT JOIN computer_state s ON s.computer_id = b.computer_id
           WHERE b.client_id = ?1
           ORDER BY b.computer_id`,
       )
-      .bind(clientId, cutoff),
+      .bind(clientId),
     db
       .prepare(`SELECT sequence FROM client_delivery_state WHERE client_id = ?1`)
       .bind(clientId),
@@ -430,50 +425,44 @@ function isoDate(seconds) {
   return new Date(safeSeconds * 1000).toISOString().replace(".000Z", "Z");
 }
 
-export async function writeComputerState(
+export async function writeDirectoryProjection(
   env,
   computerId,
   {
     online,
-    aliveTTYCount = undefined,
+    runningTerminalCount,
     hostName = undefined,
-    heartbeat = false,
-    expireBefore = undefined,
   },
 ) {
   const db = env.DB;
   const now = Math.floor(Date.now() / 1000);
-  if (expireBefore !== undefined && !Number.isFinite(expireBefore)) {
-    throw new TypeError("expireBefore must be finite");
+  if (
+    typeof online !== "boolean" ||
+    !Number.isSafeInteger(runningTerminalCount) ||
+    runningTerminalCount < 0 ||
+    runningTerminalCount > 255
+  ) {
+    throw new TypeError("invalid terminal directory projection");
   }
 
-  // The cron lease sweeper and the per-computer Durable Object can update D1
-  // concurrently. Revision-based optimistic retries prevent a late expiry
-  // from overwriting a fresh heartbeat (and prevent that heartbeat from
-  // mistakenly leaving the row offline).
+  // Multiple socket callbacks can finish D1 work out of order. Revision-based
+  // optimistic retries keep the Durable Object's latest projection intact.
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const current = await db
       .prepare(
-        `SELECT alive_tty_count AS aliveTTYCount, host_name AS hostName, online,
-                revision, last_seen_at AS lastSeenAt
+        `SELECT running_terminal_count AS runningTerminalCount,
+                host_name AS hostName, online, revision
            FROM computer_state
           WHERE computer_id = ?1`,
       )
       .bind(computerId)
       .first();
     if (!current) return false;
-    if (
-      expireBefore !== undefined &&
-      (Number(current.online) !== 1 || Number(current.lastSeenAt) >= expireBefore)
-    ) {
-      return false;
-    }
-
-    const nextCount = aliveTTYCount ?? Number(current.aliveTTYCount);
+    const nextCount = online ? runningTerminalCount : 0;
     const nextHostName = hostName ?? current.hostName;
     const nextOnline = online ? 1 : 0;
     const changed =
-      nextCount !== Number(current.aliveTTYCount) ||
+      nextCount !== Number(current.runningTerminalCount) ||
       nextHostName !== current.hostName ||
       nextOnline !== Number(current.online);
 
@@ -482,16 +471,14 @@ export async function writeComputerState(
       const results = await db.batch([
         db.prepare(
           `UPDATE computer_state
-              SET alive_tty_count = ?2,
+              SET running_terminal_count = ?2,
                   host_name = ?3,
                   online = ?4,
                   revision = revision + 1,
-                  mutation_id = ?8,
-                  last_seen_at = CASE WHEN ?4 = 1 THEN ?5 ELSE last_seen_at END,
+                  mutation_id = ?7,
                   updated_at = ?5
             WHERE computer_id = ?1
-              AND revision = ?6
-              AND (?7 IS NULL OR (online = 1 AND last_seen_at < ?7))`,
+              AND revision = ?6`,
         ).bind(
           computerId,
           nextCount,
@@ -499,7 +486,6 @@ export async function writeComputerState(
           nextOnline,
           now,
           Number(current.revision),
-          expireBefore ?? null,
           mutationId,
         ),
         db.prepare(
@@ -530,17 +516,6 @@ export async function writeComputerState(
       return true;
     }
 
-    if (heartbeat || online) {
-      const result = await db
-        .prepare(
-          `UPDATE computer_state
-              SET last_seen_at = ?2
-            WHERE computer_id = ?1 AND revision = ?3`,
-        )
-        .bind(computerId, now, Number(current.revision))
-        .run();
-      if (Number(result.meta?.changes ?? 0) === 0) continue;
-    }
     return false;
   }
   throw new Error("computer state update contention");

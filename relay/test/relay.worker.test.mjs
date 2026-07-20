@@ -11,7 +11,6 @@ import { handleApi } from "../src/api.mjs";
 import {
   collectOrphans,
   drainRelayRevocations,
-  expireStaleComputers,
   reconcilePendingPushes,
 } from "../src/worker.mjs";
 import {
@@ -28,6 +27,7 @@ import {
   CLIENT_SOURCE_ENVELOPE_BYTES,
   CLIENT_SOURCE_ENVELOPE_VERSION,
   CLIENT_SOURCE_PRINCIPAL_BYTES,
+  HOST_DIRECTORY_LEASE_MS,
   MAX_BINARY_BYTES,
   MAX_CLIENT_ACTIVE_CHANNELS,
 } from "../src/relay-channel.mjs";
@@ -105,12 +105,28 @@ function observe(ws) {
     nextBinary: (timeout) => binary.next(timeout),
     nextText: (timeout) => text.next(timeout),
     nextClose: (timeout) => close.next(timeout),
-    async nextPresence(timeout) {
+    async nextDirectory(timeout) {
       const value = JSON.parse(await text.next(timeout));
-      expect(value.type).toBe("presence");
+      expect(value.type).toBe("terminal-directory");
+      return value;
+    },
+    async nextChannelState(timeout) {
+      const value = JSON.parse(await text.next(timeout));
+      expect(value.type).toBe("channel-state");
       return value;
     },
   };
+}
+
+function hostSnapshot(hostName, sessions) {
+  return JSON.stringify({ type: "host-snapshot", hostName, sessions });
+}
+
+function runningSessions(count, start = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: start + index,
+    alive: true,
+  }));
 }
 
 async function api(path, { method = "GET", token, body, rawBody, headers = {} } = {}) {
@@ -1110,14 +1126,14 @@ describe("Pedals v2 Worker API", () => {
     const coordinator = env.PUSH_COORDINATOR.getByName(client.clientId);
     try {
       host.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: 3, hostName: "Busy Mac" }),
+        hostSnapshot("Busy Mac", runningSessions(3)),
       );
       const positive = await waitFor(async () => {
         const snapshot = await state(client);
         return snapshot.totalRunning === 3 ? snapshot : null;
       });
       while (await runDurableObjectAlarm(coordinator)) {
-        // Drain the host-state invalidation that ran before an endpoint existed.
+        // Drain the directory invalidation that ran before an endpoint existed.
       }
 
       expect(
@@ -1183,7 +1199,7 @@ describe("Pedals v2 Worker API", () => {
     const coordinator = env.PUSH_COORDINATOR.getByName(client.clientId);
     try {
       host.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: 2, hostName: "Push Mac" }),
+        hostSnapshot("Push Mac", runningSessions(2)),
       );
       const online = await waitFor(async () => {
         const snapshot = await state(client);
@@ -1217,8 +1233,8 @@ describe("Pedals v2 Worker API", () => {
         )
         .bind(client.clientId)
         .first();
-      expect(Number(pendingStart.lastSequence)).toBe(-1);
-      expect(Number(pendingStart.lastTotal)).toBe(0);
+      expect([-1, online.sequence]).toContain(Number(pendingStart.lastSequence));
+      expect([0, 2]).toContain(Number(pendingStart.lastTotal));
 
       await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
       const delivered = await env.DB
@@ -1265,7 +1281,7 @@ describe("Pedals v2 Worker API", () => {
       expect(Number(startBaseline.lastTotal)).toBe(2);
       await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
 
-      host.ws.close(1000, "offline");
+      host.ws.send(JSON.stringify({ type: "host-offline" }));
       await waitFor(async () => ((await state(client)).totalRunning === 0 ? true : null));
       await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
       const ended = await env.DB
@@ -1338,11 +1354,7 @@ describe("Pedals v2 Worker API", () => {
       let previousSequence = (await state(client)).sequence;
       for (let cycle = 0; cycle < 10; cycle += 1) {
         host.ws.send(
-          JSON.stringify({
-            type: "host-state",
-            aliveTTYCount: 1,
-            hostName: "Cycling Mac",
-          }),
+          hostSnapshot("Cycling Mac", runningSessions(1, cycle + 1)),
         );
         const online = await waitFor(async () => {
           const snapshot = await state(client);
@@ -1379,11 +1391,7 @@ describe("Pedals v2 Worker API", () => {
         ).toBe(1);
 
         host.ws.send(
-          JSON.stringify({
-            type: "host-state",
-            aliveTTYCount: 0,
-            hostName: "Cycling Mac",
-          }),
+          hostSnapshot("Cycling Mac", []),
         );
         const offline = await waitFor(async () => {
           const snapshot = await state(client);
@@ -1612,8 +1620,12 @@ describe("Pedals authenticated v2 relay", () => {
     const first = (await connect(computer.computerId, firstIdentity.clientToken)).peer;
     const second = (await connect(computer.computerId, secondIdentity.clientToken)).peer;
     try {
-      expect(await first.nextPresence()).toEqual({ type: "presence", online: true });
-      expect(await second.nextPresence()).toEqual({ type: "presence", online: true });
+      expect(await first.nextDirectory()).toMatchObject({
+        type: "terminal-directory", online: false, sessions: [],
+      });
+      expect(await second.nextDirectory()).toMatchObject({
+        type: "terminal-directory", online: false, sessions: [],
+      });
       const down = bytes(64 * 1024, 7);
       host.ws.send(down);
       expect(asBytes(await first.nextBinary())).toEqual(down);
@@ -1652,7 +1664,7 @@ describe("Pedals authenticated v2 relay", () => {
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     const client = (await connect(computer.computerId, identity.clientToken)).peer;
     try {
-      await client.nextPresence();
+      await client.nextDirectory();
       const maximum = bytes(MAX_BINARY_BYTES, 67);
       client.ws.send(maximum);
       const forwarded = decodeClientSourceEnvelope(await host.nextBinary());
@@ -1678,7 +1690,11 @@ describe("Pedals authenticated v2 relay", () => {
     const client1 = (await connect(computer.computerId, identity.clientToken, "session", 1)).peer;
     const client2 = (await connect(computer.computerId, identity.clientToken, "session", 2)).peer;
     try {
-      await Promise.all([client1.nextPresence(), client2.nextPresence()]);
+      const [firstState, secondState] = await Promise.all([
+        client1.nextChannelState(), client2.nextChannelState(),
+      ]);
+      expect(firstState.online).toBe(true);
+      expect(secondState.online).toBe(false);
       const message = bytes(64, 29);
       host1.ws.send(message);
       expect(asBytes(await client1.nextBinary())).toEqual(message);
@@ -1731,14 +1747,14 @@ describe("Pedals authenticated v2 relay", () => {
     }
   });
 
-  test("new host replaces old host without a presence flap", async () => {
+  test("new host replaces old host without a directory flap", async () => {
     const computer = await createComputer();
     const identity = await createClient();
     expect((await bind(identity, computer)).status).toBe(201);
     const host1 = (await connect(computer.computerId, computer.hostToken)).peer;
     const client = (await connect(computer.computerId, identity.clientToken)).peer;
     try {
-      await client.nextPresence();
+      await client.nextDirectory();
       const host2 = (await connect(computer.computerId, computer.hostToken)).peer;
       try {
         expect((await host1.nextClose()).code).toBe(4000);
@@ -1764,7 +1780,7 @@ describe("Pedals authenticated v2 relay", () => {
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     const client = (await connect(computer.computerId, identity.clientToken)).peer;
     try {
-      await client.nextPresence();
+      await client.nextDirectory();
       await evictDurableObject(
         env.RELAY_CHANNELS.getByName(computer.computerId),
       );
@@ -1782,17 +1798,32 @@ describe("Pedals authenticated v2 relay", () => {
     }
   });
 
-  test("control host-state drives aggregate count and disconnect marks offline", async () => {
+  test("DO terminal directory drives aggregate count and explicit offline clearing", async () => {
     const computer = await createComputer();
     const identity = await createClient();
     expect((await bind(identity, computer)).status).toBe(201);
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     const client = (await connect(computer.computerId, identity.clientToken)).peer;
     try {
-      await client.nextPresence();
+      await client.nextDirectory();
       host.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: 3, hostName: "Studio Mac" }),
+        hostSnapshot("Studio Mac", [
+          { id: 1, alive: true },
+          { id: 2, alive: false },
+          { id: 3, alive: true },
+          { id: 4, alive: true },
+        ]),
       );
+      expect(await client.nextDirectory()).toMatchObject({
+        online: true,
+        hostName: "Studio Mac",
+        sessions: [
+          { id: 1, alive: true },
+          { id: 2, alive: false },
+          { id: 3, alive: true },
+          { id: 4, alive: true },
+        ],
+      });
       const online = await waitFor(async () => {
         const snapshot = await state(identity);
         return snapshot.totalRunning === 3 && snapshot.computers[0]?.online
@@ -1805,8 +1836,11 @@ describe("Pedals authenticated v2 relay", () => {
         online: true,
       });
 
-      host.ws.close(1000, "offline");
-      expect(await client.nextPresence()).toEqual({ type: "presence", online: false });
+      host.ws.send(JSON.stringify({ type: "host-offline" }));
+      expect(await client.nextDirectory()).toMatchObject({
+        type: "terminal-directory", online: false, sessions: [],
+        reason: "host-requested",
+      });
       const offline = await waitFor(async () => {
         const snapshot = await state(identity);
         return snapshot.computers[0]?.online === false ? snapshot : null;
@@ -1819,12 +1853,16 @@ describe("Pedals authenticated v2 relay", () => {
     }
   });
 
-  test("invalid host-state closes only the authenticated host", async () => {
+  test("invalid host snapshot closes only the authenticated host", async () => {
     const computer = await createComputer();
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     try {
       host.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: -1, hostName: "Bad Mac" }),
+        JSON.stringify({
+          type: "host-snapshot",
+          hostName: "Bad Mac",
+          sessions: [{ id: 2, alive: true }, { id: 1, alive: true }],
+        }),
       );
       expect((await host.nextClose()).code).toBe(1008);
     } finally {
@@ -1832,15 +1870,15 @@ describe("Pedals authenticated v2 relay", () => {
     }
   });
 
-  test("a close queued behind host-state cannot leave a ghost online lease", async () => {
+  test("explicit offline queued behind a snapshot cannot leave a ghost directory", async () => {
     const computer = await createComputer();
     const client = await createClient();
     expect((await bind(client, computer)).status).toBe(201);
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     host.ws.send(
-      JSON.stringify({ type: "host-state", aliveTTYCount: 9, hostName: "Race Mac" }),
+      hostSnapshot("Race Mac", runningSessions(9)),
     );
-    host.ws.close(1000, "immediate close");
+    host.ws.send(JSON.stringify({ type: "host-offline" }));
     const offline = await waitFor(async () => {
       const snapshot = await state(client);
       return snapshot.computers[0]?.online === false && snapshot.sequence >= 3
@@ -1853,7 +1891,54 @@ describe("Pedals authenticated v2 relay", () => {
   });
 });
 
-describe("host aggregation and expiry", () => {
+describe("terminal directory aggregation and expiry", () => {
+  test("host reconnect inside the weak-network grace preserves the directory", async () => {
+    const client = await createClient();
+    const computer = await createComputer();
+    expect((await bind(client, computer)).status).toBe(201);
+    const stub = env.RELAY_CHANNELS.getByName(computer.computerId);
+    const host1 = (await connect(computer.computerId, computer.hostToken)).peer;
+    const controlClient = (await connect(computer.computerId, client.clientToken)).peer;
+    let host2;
+    try {
+      await controlClient.nextDirectory();
+      const snapshot = hostSnapshot("Roaming Mac", runningSessions(2));
+      host1.ws.send(snapshot);
+      const initial = await controlClient.nextDirectory();
+      const initialState = await waitFor(async () => {
+        const value = await state(client);
+        return value.totalRunning === 2 ? value : null;
+      });
+
+      host1.ws.close(1000, "network handoff");
+      await waitFor(async () => runInDurableObject(stub, async (_instance, durableState) => {
+        const value = await durableState.storage.get("terminal-directory");
+        return value?.reason === "connection-lost" ? true : null;
+      }));
+      await expectNoEvent(controlClient.nextText, 100);
+
+      host2 = (await connect(computer.computerId, computer.hostToken)).peer;
+      host2.ws.send(snapshot);
+      await waitFor(async () => runInDurableObject(stub, async (_instance, durableState) => {
+        const value = await durableState.storage.get("terminal-directory");
+        return value?.online && value.reason === null &&
+          value.deadlineAt >= Date.now() + HOST_DIRECTORY_LEASE_MS - 2_000
+          ? value
+          : null;
+      }));
+      await expectNoEvent(controlClient.nextText, 150);
+      const recovered = await state(client);
+      expect(recovered.totalRunning).toBe(2);
+      expect(recovered.sequence).toBe(initialState.sequence);
+      const persisted = await runInDurableObject(stub, async (_instance, durableState) => (
+        durableState.storage.get("terminal-directory")
+      ));
+      expect(persisted.revision).toBe(initial.revision);
+    } finally {
+      closeAll(host1, host2, controlClient);
+    }
+  });
+
   test("aggregates only online computers across a client's binding set", async () => {
     const client = await createClient();
     const first = await createComputer();
@@ -1865,10 +1950,10 @@ describe("host aggregation and expiry", () => {
     const host2 = (await connect(second.computerId, second.hostToken)).peer;
     try {
       host1.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: 2, hostName: "First" }),
+        hostSnapshot("First", runningSessions(2)),
       );
       host2.ws.send(
-        JSON.stringify({ type: "host-state", aliveTTYCount: 5, hostName: "Second" }),
+        hostSnapshot("Second", runningSessions(5)),
       );
       const combined = await waitFor(async () => {
         const snapshot = await state(client);
@@ -1876,7 +1961,7 @@ describe("host aggregation and expiry", () => {
       });
       expect(combined.computers.filter((computer) => computer.online)).toHaveLength(2);
 
-      host2.ws.close(1000, "offline");
+      host2.ws.send(JSON.stringify({ type: "host-offline" }));
       const oneOnline = await waitFor(async () => {
         const snapshot = await state(client);
         return snapshot.totalRunning === 2 &&
@@ -1893,42 +1978,40 @@ describe("host aggregation and expiry", () => {
     }
   });
 
-  test("scheduled expiry removes stale host counts from current total", async () => {
+  test("DO alarm clears a disconnected host after the weak-network grace", async () => {
     const client = await createClient();
     const computer = await createComputer();
     expect((await bind(client, computer)).status).toBe(201);
-    await env.DB
-      .prepare(
-        `UPDATE computer_state
-            SET online = 1, alive_tty_count = 4, last_seen_at = 1, updated_at = 1
-          WHERE computer_id = ?1`,
-      )
-      .bind(computer.computerId)
-      .run();
-    expect((await state(client)).totalRunning).toBe(0);
+    const stub = env.RELAY_CHANNELS.getByName(computer.computerId);
+    const host = (await connect(computer.computerId, computer.hostToken)).peer;
+    const controlClient = (await connect(computer.computerId, client.clientToken)).peer;
+    try {
+      await controlClient.nextDirectory();
+      host.ws.send(hostSnapshot("Grace Mac", runningSessions(4)));
+      expect((await controlClient.nextDirectory()).online).toBe(true);
+      await waitFor(async () => ((await state(client)).totalRunning === 4 ? true : null));
 
-    await expireStaleComputers(env);
-    const row = await env.DB
-      .prepare(`SELECT online FROM computer_state WHERE computer_id = ?1`)
-      .bind(computer.computerId)
-      .first();
-    expect(row.online).toBe(0);
+      host.ws.close(1000, "network lost");
+      await expectNoEvent(controlClient.nextText, 150);
+      expect((await state(client)).totalRunning).toBe(4);
 
-    await env.DB
-      .prepare(
-        `UPDATE computer_state
-            SET online = 1, last_seen_at = ?2, revision = revision + 1
-          WHERE computer_id = ?1`,
-      )
-      .bind(computer.computerId, Math.floor(Date.now() / 1000))
-      .run();
-    await expireStaleComputers(env);
-    expect(
-      await env.DB
-        .prepare(`SELECT online FROM computer_state WHERE computer_id = ?1`)
-        .bind(computer.computerId)
-        .first("online"),
-    ).toBe(1);
+      await runInDurableObject(stub, async (_instance, durableState) => {
+        const directory = await durableState.storage.get("terminal-directory");
+        await durableState.storage.put("terminal-directory", {
+          ...directory,
+          deadlineAt: Date.now() - 1,
+          reason: "connection-lost",
+        });
+        await durableState.storage.setAlarm(Date.now() - 1);
+      });
+      await runDurableObjectAlarm(stub);
+      expect(await controlClient.nextDirectory()).toMatchObject({
+        online: false, sessions: [], reason: "connection-lost",
+      });
+      await waitFor(async () => ((await state(client)).totalRunning === 0 ? true : null));
+    } finally {
+      closeAll(host, controlClient);
+    }
   });
 });
 

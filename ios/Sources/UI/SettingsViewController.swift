@@ -133,13 +133,13 @@ final class SettingsViewController: UITableViewController {
     }
 
     private func statusText(for computer: ComputerConnection) -> String {
+        if computer.directoryKnown, !computer.hostOnline { return "Offline" }
         switch computer.linkState {
         case .idle:
             return "Disconnected"
         case .connecting(let attempt):
             return attempt == 0 ? "Connecting…" : "Reconnecting (attempt \(attempt))…"
         case .connected:
-            guard computer.hostOnline else { return "Waiting for host…" }
             let rtt = computer.roundTripTime.map { " · \(Int(($0 * 1000).rounded())) ms" } ?? ""
             return "Connected · E2EE" + rtt
         }

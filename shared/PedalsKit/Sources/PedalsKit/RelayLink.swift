@@ -37,9 +37,9 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     /// Every decrypted frame, including the peer's `hello` ctl.
     public var onFrame: (@Sendable (Frame) -> Void)?
     public var onState: (@Sendable (State) -> Void)?
-    /// Relay presence notification (§1): whether the peer role currently has a
-    /// live socket on this channel. Delivered on connect and on peer changes.
-    public var onPeerPresence: (@Sendable (Bool) -> Void)?
+    /// Authenticated relay control-plane metadata. The Durable Object owns the
+    /// terminal directory; peer terminal content remains in binary E2EE frames.
+    public var onMetadata: (@Sendable (RelayMetadata) -> Void)?
     /// WebSocket ping RTT samples (seconds), roughly every 10 s while connected.
     public var onRoundTrip: (@Sendable (TimeInterval) -> Void)?
 
@@ -157,10 +157,9 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Sends authenticated relay metadata outside the E2EE frame stream.
-    /// Only the daemon uses this on its control link to publish aggregate,
-    /// non-terminal state such as the number of alive TTYs.
-    public func sendRelayText(_ text: String) {
+    /// Sends server-visible metadata outside the E2EE frame stream.
+    public func sendMetadata(_ metadata: RelayMetadata) {
+        guard let text = try? metadata.jsonText() else { return }
         queue.async { [self] in
             guard let socket, case .connected = _state else { return }
             let generation = self.generation
@@ -172,6 +171,28 @@ public final class RelayLink: NSObject, @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Best-effort ordered shutdown notification. Unlike ordinary metadata,
+    /// this waits briefly for URLSession to hand the frame to the WebSocket so
+    /// an app termination or sleep transition does not immediately cancel it.
+    @discardableResult
+    public func sendMetadataSynchronously(
+        _ metadata: RelayMetadata,
+        timeout: TimeInterval = 0.5
+    ) -> Bool {
+        guard let text = try? metadata.jsonText() else { return false }
+        let result = SynchronousRelaySend()
+        queue.async { [self] in
+            guard let socket, case .connected = _state else {
+                result.finish(false)
+                return
+            }
+            socket.send(.string(text)) { error in
+                result.finish(error == nil)
+            }
+        }
+        return result.wait(timeout: timeout)
     }
 
     // MARK: - Connection (all on `queue`)
@@ -346,21 +367,12 @@ public final class RelayLink: NSObject, @unchecked Sendable {
 
     // MARK: - Receive (on `queue`)
 
-    /// Plaintext relay→peer metadata (§1). Only `presence` exists today.
-    private struct RelayNotice: Decodable {
-        let type: String
-        let online: Bool?
-    }
-
     private func handleLocked(message: URLSessionWebSocketTask.Message) {
         if case .string(let text) = message {
             // Text frames are relay link metadata, never peer payload.
-            guard let notice = try? JSONDecoder().decode(
-                RelayNotice.self, from: Data(text.utf8)
-            ), notice.type == "presence", let online = notice.online
-            else { return }
-            if let onPeerPresence {
-                callbackQueue.async { onPeerPresence(online) }
+            guard let metadata = try? RelayMetadata(jsonText: text) else { return }
+            if let onMetadata {
+                callbackQueue.async { onMetadata(metadata) }
             }
             return
         }
@@ -633,6 +645,26 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         if let onState {
             callbackQueue.async { onState(state) }
         }
+    }
+}
+
+private final class SynchronousRelaySend: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var succeeded = false
+
+    func finish(_ succeeded: Bool) {
+        lock.lock()
+        self.succeeded = succeeded
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func wait(timeout: TimeInterval) -> Bool {
+        guard semaphore.wait(timeout: .now() + timeout) == .success else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return succeeded
     }
 }
 

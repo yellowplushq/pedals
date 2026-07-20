@@ -13,6 +13,8 @@ final class ComputerConnection {
         case exit(id: Int, code: Int)
         /// Daemon-reported failure; `req` ties it to one of our creates.
         case error(msg: String, req: UInt32?)
+        /// The DO expired or explicitly cleared this computer's directory.
+        case offline(removedTerminalCount: Int)
     }
 
     let binding: ComputerBinding
@@ -22,10 +24,9 @@ final class ComputerConnection {
     var id: String { binding.computerID }
 
     @Published private(set) var linkState: RelayLink.State = .idle
-    /// Daemon machine name from its `hello`; sticky across reconnects.
+    /// Daemon machine name from the server-authoritative directory.
     @Published private(set) var hostName: String?
-    /// The daemon's socket is attached at the relay (presence notice), or —
-    /// before the first notice arrives — any decrypted host frame was seen.
+    /// True only when the Durable Object's terminal directory is online.
     @Published private(set) var hostOnline = false
     @Published private(set) var sessions: [SessionInfo] = []
     @Published private(set) var roundTripTime: TimeInterval?
@@ -33,10 +34,15 @@ final class ComputerConnection {
     let events = PassthroughSubject<Event, Never>()
 
     private let control: RelayLink
+    private var directoryRevision: UInt64?
+    private var directoryEntries: [Int: Bool] = [:]
+    private var peerSessions: [SessionInfo] = []
 
     var displayName: String {
         hostName ?? "Computer \(binding.computerID.prefix(6))"
     }
+
+    var directoryKnown: Bool { directoryRevision != nil }
 
     init(binding: ComputerBinding, clientID: String, clientToken: String) {
         self.binding = binding
@@ -54,7 +60,6 @@ final class ComputerConnection {
                 guard let self else { return }
                 self.linkState = state
                 if case .connecting = state {
-                    self.hostOnline = false
                     self.roundTripTime = nil
                 }
             }
@@ -65,13 +70,8 @@ final class ComputerConnection {
         control.onRoundTrip = { [weak self] rtt in
             MainActor.assumeIsolated { self?.roundTripTime = rtt }
         }
-        // The relay pushes host attach/detach for our channel; without it a
-        // dead daemon would look online forever (our own socket stays up).
-        control.onPeerPresence = { [weak self] online in
-            MainActor.assumeIsolated {
-                guard let self, self.hostOnline != online else { return }
-                self.hostOnline = online
-            }
+        control.onMetadata = { [weak self] metadata in
+            MainActor.assumeIsolated { self?.handle(metadata: metadata) }
         }
     }
 
@@ -98,13 +98,6 @@ final class ComputerConnection {
         control.send(.close(id: id))
     }
 
-    /// Reconcile against the host after a per-session socket disappears.
-    /// Control and session channels are separate WebSockets, so their notices
-    /// can arrive in either order when a terminal is closed remotely.
-    func requestSessions() {
-        control.send(.requestSessions)
-    }
-
     /// A fresh (not yet started) data link for one of this computer's sessions.
     func makeSessionLink(sid: Int) -> RelayLink {
         RelayLink(
@@ -119,35 +112,69 @@ final class ComputerConnection {
     // MARK: - Control frames
 
     private func handle(frame: Frame) {
-        // Any frame that decrypts with the host's key proves the host is
-        // online, even when we joined after its hello (the relay never queues).
-        // Guard the assignment: @Published emits on every set, so an
-        // unconditional `= true` would republish on every control frame and, e.g.,
-        // rebuild the Settings list (cancelling an in-progress swipe) constantly.
-        if !hostOnline { hostOnline = true }
         guard frame.type == .ctl, let message = try? frame.controlMessage() else { return }
         switch message {
         case .hello(let who, _, _, _, _, let host):
             guard who == .host else { break }
             if let host, !host.isEmpty { hostName = host }
         case .sessions(let list):
-            sessions = list
+            peerSessions = list
+            applyDirectory()
         case .created(let id, let req):
             events.send(.created(id: id, req: req))
         case .title(let id, let title):
             // The daemon also rebroadcasts `sessions` on title changes; this
             // just applies it without waiting for the full list.
-            guard let index = sessions.firstIndex(where: { $0.id == id }) else { break }
-            sessions[index].title = title
+            guard let index = peerSessions.firstIndex(where: { $0.id == id }) else { break }
+            peerSessions[index].title = title
+            applyDirectory()
         case .exit(let id, let code):
-            if let index = sessions.firstIndex(where: { $0.id == id }) {
-                sessions[index].alive = false
+            if let index = peerSessions.firstIndex(where: { $0.id == id }) {
+                peerSessions[index].alive = false
             }
+            applyDirectory()
             events.send(.exit(id: id, code: code))
         case .err(let msg, let req):
             events.send(.error(msg: msg, req: req))
-        case .create, .close, .ready, .requestReplay, .requestSessions:
+        case .create, .close, .ready, .requestReplay:
             break // client→host only; ignore if mirrored back
+        }
+    }
+
+    private func handle(metadata: RelayMetadata) {
+        guard case .terminalDirectory(let directory) = metadata else { return }
+        if let directoryRevision, directory.revision <= directoryRevision { return }
+
+        let wasOnline = hostOnline
+        let removedCount = sessions.count
+        directoryRevision = directory.revision
+        hostOnline = directory.online
+        if let name = directory.hostName, !name.isEmpty { hostName = name }
+        directoryEntries = directory.online
+            ? Dictionary(uniqueKeysWithValues: directory.sessions.map { ($0.id, $0.alive) })
+            : [:]
+
+        if directory.online {
+            applyDirectory()
+        } else {
+            peerSessions.removeAll(keepingCapacity: true)
+            sessions = []
+            if wasOnline {
+                events.send(.offline(removedTerminalCount: removedCount))
+            }
+        }
+    }
+
+    private func applyDirectory() {
+        guard hostOnline else {
+            sessions = []
+            return
+        }
+        sessions = peerSessions.compactMap { session in
+            guard let alive = directoryEntries[session.id] else { return nil }
+            var current = session
+            current.alive = alive
+            return current
         }
     }
 }

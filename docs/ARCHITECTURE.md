@@ -31,10 +31,12 @@ The Worker at `https://pedals.air.build` owns four distinct responsibilities:
    latest signed GitHub release.
 
 D1 stores token and eight-digit pairing-code hashes, ephemeral public keys,
-encrypted pairing envelopes, the binding graph, host leases/counts, APNs
-endpoints, and delivery fingerprints. It does not store E2EE secrets,
-ephemeral private keys, or terminal data. Host/client roles are derived from
-bearer credentials; the public relay route has no role parameter.
+encrypted pairing envelopes, the binding graph, the DO-derived online/name/alive
+count projection, APNs endpoints, and delivery fingerprints. Each computer DO
+owns the current privacy-safe `{sessionId,alive}` directory. Neither store holds
+E2EE secrets, ephemeral private keys, titles, working directories, or terminal
+bytes. Host/client roles are derived from bearer credentials; the public relay
+route has no role parameter.
 
 Computer reset and client unbind commit a relay-revocation outbox entry in the
 same D1 transaction that removes authorization. The Worker eagerly asks the
@@ -78,10 +80,13 @@ a fresh 15-minute, eight-digit pairing code; closing it revokes the current
 code. The headless CLI provides the same pairing behavior, and `--reset` rotates
 the server identity, host bearer, and E2EE secret.
 
-`RelayHostClient` publishes only `sessions.filter(\.alive).count` and the local
-host name as authenticated relay metadata. It reports on control-link connect,
-count changes, and a 45-second heartbeat. Titles, cwd, replay data, stdin, and
-stdout remain encrypted peer frames.
+`RelayHostClient` publishes the complete privacy-safe `{id,alive}` session
+directory and local host name on control-link connect, every list change, and a
+30-second heartbeat. The DO owns its revision and online state, gives unexpected
+disconnects a 20-second recovery grace, and enforces a 90-second snapshot lease.
+The desktop reports offline before sleep or orderly exit and republishes the
+complete local list after wake. Titles, cwd, replay data, stdin, and stdout
+remain encrypted peer frames.
 
 ## iPhone app
 
@@ -92,16 +97,18 @@ PedalsKit for transport and E2EE.
   `ComputerBinding` values in the Keychain. It persists an E2EE secret only
   after the desktop completes the ephemeral Curve25519 exchange and the Worker
   commits the binding.
-- `TerminalManager` owns every bound `ComputerConnection`, merges session lists,
-  and pools per-terminal session links.
+- `TerminalManager` owns every bound `ComputerConnection`, intersects private
+  encrypted descriptors with the DO-authoritative directory, removes offline
+  tabs with a toast, and pools per-terminal session links. Settings reports each
+  computer's directory-backed online/offline state.
 - `AppServices` is created once by `AppDelegate`, shared by scenes, and owns the
   status-surface lifecycle. It installs the client status credential in the app
   group, refreshes server state, updates Live Activity, reloads the Widget, and
   sends the latest context to Watch.
 - The app-group identifier is `group.air.build.pedals`.
 
-The app supports multiple bound computers, but only their aggregate alive TTY
-count leaves the encrypted terminal path.
+The app supports multiple bound computers. Only session IDs and alive flags
+leave the encrypted terminal path; titles, cwd, dimensions, and bytes do not.
 
 ## Widget and Live Activity
 
@@ -157,7 +164,7 @@ sandbox APNs; Release builds use production APNs.
   isolation, replay rejection, and cross-language crypto vectors.
 - `swift test` in `desktop/PedalsDaemon` checks PTY lifecycle and local control.
 - `npm test` in `relay` checks D1 enrollment/bindings, authenticated relay,
-  host-state aggregation, APNs JWT/payload/error handling, and push delivery.
+  terminal-directory leases, APNs JWT/payload/error handling, and push delivery.
 - Generate Apple projects with `xcodegen` from `ios/project.yml`; do not edit the
   generated `.xcodeproj` by hand.
 - `scripts/deploy-relay.sh` applies D1 migrations, deploys the Worker, and waits

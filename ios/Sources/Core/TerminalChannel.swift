@@ -35,10 +35,6 @@ final class TerminalChannel {
     var onPhase: ((Phase) -> Void)?
     var onReplay: ((Data) -> Void)?
     var onStdout: ((Data) -> Void)?
-    /// The session's host socket disappeared. The owner should refresh the
-    /// authoritative session list before treating this as a network outage.
-    var onHostUnavailable: (() -> Void)?
-
     /// LRU stamp for the connection pool.
     private(set) var lastActivated = Date()
 
@@ -55,8 +51,11 @@ final class TerminalChannel {
         link.onFrame = { [weak self] frame in
             MainActor.assumeIsolated { self?.handle(frame: frame) }
         }
-        link.onPeerPresence = { [weak self] online in
-            MainActor.assumeIsolated { self?.handle(hostPresent: online) }
+        link.onMetadata = { [weak self] metadata in
+            MainActor.assumeIsolated {
+                guard case .channelState(let online) = metadata else { return }
+                self?.handle(hostPresent: online)
+            }
         }
         link.start()
     }
@@ -103,7 +102,7 @@ final class TerminalChannel {
         }
     }
 
-    /// Relay presence: the daemon's socket for this channel appeared/vanished.
+    /// Relay channel state: the daemon's socket appeared/vanished.
     /// Our own link can be healthy while the host end is gone (daemon quit) —
     /// without this the terminal would freeze with no overlay.
     private func handle(hostPresent: Bool) {
@@ -114,12 +113,9 @@ final class TerminalChannel {
         }
         guard phase == .live, peerLossTask == nil else { return }
 
-        // A deliberate remote close stops this session socket immediately,
-        // while the authoritative list travels over a separate control socket.
-        // Ask for that list now and suppress the misleading reconnect overlay
-        // for a brief reconciliation window. A real outage still surfaces
-        // promptly when no list arrives.
-        onHostUnavailable?()
+        // The authoritative DO directory travels over the control socket. Give
+        // it one render beat to remove a deliberately closed session before
+        // showing a reconnect overlay for a real per-channel outage.
         peerLossTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled, let self, self.phase == .live else { return }

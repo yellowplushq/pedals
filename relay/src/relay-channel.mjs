@@ -1,14 +1,21 @@
 import { DurableObject } from "cloudflare:workers";
-import { isId, writeComputerState } from "./core.mjs";
+import { isId, writeDirectoryProjection } from "./core.mjs";
 
 const HOST_TAG = "role:host";
 const CLIENT_TAG = "role:client";
 const CLOSE_REPLACED = 4000;
 const CLOSE_BINDING_REVOKED = 4003;
 const CLOSE_COMPUTER_REVOKED = 4004;
+const CLOSE_DIRECTORY_LEASE_EXPIRED = 4005;
 const OPEN = 1;
 const HOST_NAME_MAX_LENGTH = 128;
-const MAX_TEXT_BYTES = 512;
+const MAX_TEXT_BYTES = 16 * 1024;
+const MAX_DIRECTORY_SESSIONS = 255;
+const UINT32_MAX = 4_294_967_295;
+const DIRECTORY_STORAGE_KEY = "terminal-directory";
+const PROJECTION_RETRY_MS = 5_000;
+export const HOST_DIRECTORY_LEASE_MS = 90_000;
+export const HOST_DISCONNECT_GRACE_MS = 20_000;
 export const MAX_BINARY_BYTES = 1024 * 1024;
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 export const CLIENT_SOURCE_ENVELOPE_VERSION = 0x02;
@@ -32,7 +39,7 @@ function validHostName(value) {
 function attachmentOf(ws) {
   try {
     const value = ws.deserializeAttachment();
-    if (!value || value.v !== 2 || !isId(value.computerId)) return null;
+    if (!value || value.v !== 3 || !isId(value.computerId)) return null;
     if (typeof value.channel !== "string" || !isId(value.principalId)) return null;
     if (value.role === "client") return value;
     if (value.role === "host" && typeof value.active === "boolean") return value;
@@ -40,6 +47,79 @@ function attachmentOf(ws) {
     // A socket without a valid serialized identity is never trusted.
   }
   return null;
+}
+
+function canonicalDirectorySessions(value) {
+  if (!Array.isArray(value) || value.length > MAX_DIRECTORY_SESSIONS) return null;
+  const result = [];
+  let previous = -1;
+  for (const entry of value) {
+    if (
+      !entry ||
+      Array.isArray(entry) ||
+      Object.keys(entry).length !== 2 ||
+      !Number.isSafeInteger(entry.id) ||
+      entry.id < 0 ||
+      entry.id > UINT32_MAX ||
+      typeof entry.alive !== "boolean" ||
+      entry.id <= previous
+    ) {
+      return null;
+    }
+    result.push({ id: entry.id, alive: entry.alive });
+    previous = entry.id;
+  }
+  return result;
+}
+
+function sameSessions(lhs, rhs) {
+  return lhs.length === rhs.length && lhs.every(
+    (entry, index) => entry.id === rhs[index].id && entry.alive === rhs[index].alive,
+  );
+}
+
+function emptyDirectory() {
+  return {
+    computerId: null,
+    revision: 0,
+    online: false,
+    hostName: null,
+    sessions: [],
+    updatedAt: 0,
+    deadlineAt: null,
+    reason: null,
+    projectionPending: false,
+  };
+}
+
+function normalizedDirectory(value) {
+  if (!value || typeof value !== "object") return emptyDirectory();
+  const sessions = canonicalDirectorySessions(value.sessions);
+  if (
+    sessions === null ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 0 ||
+    typeof value.online !== "boolean" ||
+    (value.hostName !== null && !validHostName(value.hostName)) ||
+    !Number.isSafeInteger(value.updatedAt) ||
+    value.updatedAt < 0 ||
+    (value.deadlineAt !== null && (!Number.isSafeInteger(value.deadlineAt) || value.deadlineAt < 0)) ||
+    typeof value.projectionPending !== "boolean" ||
+    (value.computerId !== null && !isId(value.computerId))
+  ) {
+    return emptyDirectory();
+  }
+  return {
+    computerId: value.computerId,
+    revision: value.revision,
+    online: value.online,
+    hostName: value.hostName,
+    sessions: value.online ? sessions : [],
+    updatedAt: value.updatedAt,
+    deadlineAt: value.online ? value.deadlineAt : null,
+    reason: typeof value.reason === "string" ? value.reason : null,
+    projectionPending: value.projectionPending,
+  };
 }
 
 function parseTrustedUpgrade(request) {
@@ -103,7 +183,7 @@ function authenticatedClientEnvelope(principalId, payload) {
 
 export class RelayChannel extends DurableObject {
   retiredSockets = new WeakSet();
-  stateWriteTail = Promise.resolve();
+  directoryTaskTail = Promise.resolve();
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -127,7 +207,7 @@ export class RelayChannel extends DurableObject {
       if (!(await this.identityStillAuthorized(identity))) {
         return new Response("unauthorized", { status: 401 });
       }
-      return this.acceptConnection(identity);
+      return await this.acceptConnection(identity);
     });
   }
 
@@ -155,7 +235,7 @@ export class RelayChannel extends DurableObject {
     return Boolean(row);
   }
 
-  acceptConnection(identity) {
+  async acceptConnection(identity) {
     const channelLimit =
       identity.role === "client" ? MAX_CLIENT_ACTIVE_CHANNELS : MAX_HOST_ACTIVE_CHANNELS;
     const activeChannels = this.activeChannelsForPrincipal(identity);
@@ -168,7 +248,7 @@ export class RelayChannel extends DurableObject {
 
     const [client, server] = Object.values(new WebSocketPair());
     const baseAttachment = {
-      v: 2,
+      v: 3,
       role: identity.role,
       computerId: identity.computerId,
       channel: identity.channel,
@@ -195,7 +275,12 @@ export class RelayChannel extends DurableObject {
       for (const previous of previousHosts) {
         this.safeClose(previous, CLOSE_REPLACED, "replaced by new connection");
       }
-      if (!wasOnline) this.notifyClients(identity.channel, true);
+      if (identity.channel !== "control" && !wasOnline) {
+        this.notifyChannelClients(identity.channel, true);
+      }
+      if (identity.channel === "control") {
+        await this.extendDirectoryForHostHandshake();
+      }
     } else {
       // One socket per logical client/channel bounds amplification while still
       // allowing the control channel and independent session channels.
@@ -210,7 +295,11 @@ export class RelayChannel extends DurableObject {
         this.safeClose(server, 1011, "relay state unavailable");
         return new Response(null, { status: 101, webSocket: client });
       }
-      this.safeSend(server, this.presence(this.hasActiveHostSlot(identity.channel)));
+      if (identity.channel === "control") {
+        this.safeSend(server, this.directoryMessage(await this.loadDirectory()));
+      } else {
+        this.safeSend(server, this.channelState(this.hasActiveHostSlot(identity.channel)));
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -232,7 +321,7 @@ export class RelayChannel extends DurableObject {
         return;
       }
       if (state.role === "host" && state.active && state.channel === "control") {
-        this.handleHostState(ws, state, message);
+        this.handleHostMetadata(ws, state, message);
       }
       return;
     }
@@ -274,47 +363,170 @@ export class RelayChannel extends DurableObject {
     this.safeClose(ws, 1011, "websocket error");
   }
 
-  handleHostState(ws, state, message) {
+  handleHostMetadata(ws, state, message) {
     let value;
     try {
       value = JSON.parse(message);
     } catch {
-      this.retireSocket(ws, 1008, "invalid host state");
+      this.retireSocket(ws, 1008, "invalid host metadata");
       return;
     }
-    if (
-      !value ||
-      Array.isArray(value) ||
-      Object.keys(value).length !== 3 ||
-      value.type !== "host-state" ||
-      !Number.isSafeInteger(value.aliveTTYCount) ||
-      value.aliveTTYCount < 0 ||
-      value.aliveTTYCount > 10_000 ||
-      !validHostName(value.hostName)
-    ) {
-      this.retireSocket(ws, 1008, "invalid host state");
+    if (!value || Array.isArray(value) || typeof value.type !== "string") {
+      this.retireSocket(ws, 1008, "invalid host metadata");
       return;
     }
+    if (value.type === "host-snapshot") {
+      const sessions = canonicalDirectorySessions(value.sessions);
+      if (
+        Object.keys(value).length !== 3 ||
+        !validHostName(value.hostName) ||
+        sessions === null
+      ) {
+        this.retireSocket(ws, 1008, "invalid host snapshot");
+        return;
+      }
+      this.enqueueDirectoryTask(() => this.applyHostSnapshot(ws, state, value.hostName, sessions));
+      return;
+    }
+    if (value.type === "host-offline" && Object.keys(value).length === 1) {
+      this.enqueueDirectoryTask(() => this.markDirectoryOffline(
+        ws,
+        state,
+        "host-requested",
+      ));
+      return;
+    }
+    this.retireSocket(ws, 1008, "unsupported host metadata");
+  }
 
-    this.enqueueStateWrite(state.computerId, {
+  enqueueDirectoryTask(operation) {
+    const task = this.directoryTaskTail.then(operation, operation);
+    this.directoryTaskTail = task.catch(() => undefined);
+    this.ctx.waitUntil(
+      task.catch((error) => {
+        console.error("terminal directory update failed", error instanceof Error ? error.message : error);
+      }),
+    );
+  }
+
+  async loadDirectory() {
+    return normalizedDirectory(await this.ctx.storage.get(DIRECTORY_STORAGE_KEY));
+  }
+
+  async storeDirectory(directory) {
+    await this.ctx.storage.put(DIRECTORY_STORAGE_KEY, directory);
+    if (directory.projectionPending) {
+      const retryAt = Date.now() + PROJECTION_RETRY_MS;
+      await this.ctx.storage.setAlarm(
+        directory.online && directory.deadlineAt !== null
+          ? Math.min(retryAt, directory.deadlineAt)
+          : retryAt,
+      );
+    } else if (directory.online && directory.deadlineAt !== null) {
+      await this.ctx.storage.setAlarm(directory.deadlineAt);
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  async extendDirectoryForHostHandshake() {
+    const current = await this.loadDirectory();
+    if (!current.online) return;
+    const deadlineAt = Date.now() + HOST_DISCONNECT_GRACE_MS;
+    await this.storeDirectory({ ...current, deadlineAt });
+  }
+
+  async applyHostSnapshot(ws, state, hostName, sessions) {
+    if (!this.isActiveHostSlot(ws) || this.activeHostForSend("control") !== ws) return;
+    const current = await this.loadDirectory();
+    const changed =
+      !current.online ||
+      current.hostName !== hostName ||
+      !sameSessions(current.sessions, sessions);
+    const next = {
+      computerId: state.computerId,
+      revision: changed ? current.revision + 1 : current.revision,
       online: true,
-      aliveTTYCount: value.aliveTTYCount,
-      hostName: value.hostName,
-      heartbeat: true,
+      hostName,
+      sessions,
+      updatedAt: changed ? Math.floor(Date.now() / 1000) : current.updatedAt,
+      deadlineAt: Date.now() + HOST_DIRECTORY_LEASE_MS,
+      reason: null,
+      projectionPending: changed || current.projectionPending,
+    };
+    await this.storeDirectory(next);
+    if (changed) this.notifyControlClients(next);
+    if (next.projectionPending) await this.reconcileDirectoryProjection(next);
+  }
+
+  async markDirectoryOffline(ws, state, reason) {
+    if (ws && (!this.isActiveHostSlot(ws) || this.activeHostForSend("control") !== ws)) return;
+    const current = await this.loadDirectory();
+    if (!current.online && current.sessions.length === 0) {
+      if (current.projectionPending) await this.reconcileDirectoryProjection(current);
+      return;
+    }
+    const next = {
+      computerId: state.computerId,
+      revision: current.revision + 1,
+      online: false,
+      hostName: current.hostName,
+      sessions: [],
+      updatedAt: Math.floor(Date.now() / 1000),
+      deadlineAt: null,
+      reason,
+      projectionPending: true,
+    };
+    await this.storeDirectory(next);
+    this.notifyControlClients(next);
+    await this.reconcileDirectoryProjection(next);
+  }
+
+  async reconcileDirectoryProjection(directory) {
+    if (!isId(directory.computerId)) return;
+    await writeDirectoryProjection(this.env, directory.computerId, {
+      online: directory.online,
+      runningTerminalCount: directory.online
+        ? directory.sessions.filter((entry) => entry.alive).length
+        : 0,
+      hostName: directory.hostName ?? undefined,
+    });
+    await this.storeDirectory({ ...directory, projectionPending: false });
+  }
+
+  async scheduleDisconnectGrace(state) {
+    if (this.hasActiveHostSlot("control")) return;
+    const current = await this.loadDirectory();
+    if (!current.online) return;
+    await this.storeDirectory({
+      ...current,
+      deadlineAt: Date.now() + HOST_DISCONNECT_GRACE_MS,
+      reason: "connection-lost",
     });
   }
 
-  enqueueStateWrite(computerId, update) {
-    const task = this.stateWriteTail.then(
-      () => writeComputerState(this.env, computerId, update),
-      () => writeComputerState(this.env, computerId, update),
-    );
-    this.stateWriteTail = task.catch(() => undefined);
-    this.ctx.waitUntil(
-      task.catch((error) => {
-        console.error("host state write failed", error instanceof Error ? error.message : error);
-      }),
-    );
+  async alarm() {
+    await this.directoryTaskTail.catch(() => undefined);
+    let current = await this.loadDirectory();
+    if (current.projectionPending) {
+      try {
+        await this.reconcileDirectoryProjection(current);
+      } catch (error) {
+        await this.ctx.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+        throw error;
+      }
+      current = await this.loadDirectory();
+    }
+    if (!current.online || current.deadlineAt === null) return;
+    if (Date.now() < current.deadlineAt) {
+      await this.ctx.storage.setAlarm(current.deadlineAt);
+      return;
+    }
+    const host = this.activeHostForSend("control");
+    const state = host ? attachmentOf(host) : { computerId: current.computerId };
+    if (!isId(state?.computerId)) return;
+    if (host) this.retireSocket(host, CLOSE_DIRECTORY_LEASE_EXPIRED, "directory lease expired");
+    await this.markDirectoryOffline(null, state, host ? "lease-expired" : "connection-lost");
   }
 
   socketsFor(tag, channel) {
@@ -368,15 +580,16 @@ export class RelayChannel extends DurableObject {
     this.retiredSockets.add(ws);
     this.safeSerialize(ws, { ...state, active: false });
     if (!this.hasActiveHostSlot(state.channel, ws)) {
-      this.notifyClients(state.channel, false);
       if (state.channel === "control") {
-        this.enqueueStateWrite(state.computerId, { online: false });
+        this.enqueueDirectoryTask(() => this.scheduleDisconnectGrace(state));
+      } else {
+        this.notifyChannelClients(state.channel, false);
       }
     }
     return true;
   }
 
-  applyRevocation(action) {
+  async applyRevocation(action) {
     let closed = 0;
     for (const ws of [
       ...this.ctx.getWebSockets(HOST_TAG),
@@ -395,6 +608,10 @@ export class RelayChannel extends DurableObject {
         this.safeClose(ws, CLOSE_COMPUTER_REVOKED, "computer revoked");
       }
       closed += 1;
+    }
+    if (action.type === "computer") {
+      await this.ctx.storage.delete(DIRECTORY_STORAGE_KEY);
+      await this.ctx.storage.deleteAlarm();
     }
     return new Response(null, {
       status: 204,
@@ -439,12 +656,31 @@ export class RelayChannel extends DurableObject {
     }
   }
 
-  presence(online) {
-    return JSON.stringify({ type: "presence", online });
+  channelState(online) {
+    return JSON.stringify({ type: "channel-state", online });
   }
 
-  notifyClients(channel, online) {
-    const notice = this.presence(online);
+  directoryMessage(directory) {
+    return JSON.stringify({
+      type: "terminal-directory",
+      revision: directory.revision,
+      online: directory.online,
+      hostName: directory.hostName,
+      sessions: directory.online ? directory.sessions : [],
+      updatedAt: directory.updatedAt,
+      ...(directory.reason === null ? {} : { reason: directory.reason }),
+    });
+  }
+
+  notifyControlClients(directory) {
+    const notice = this.directoryMessage(directory);
+    for (const client of this.socketsFor(CLIENT_TAG, "control")) {
+      this.safeSend(client, notice);
+    }
+  }
+
+  notifyChannelClients(channel, online) {
+    const notice = this.channelState(online);
     for (const client of this.socketsFor(CLIENT_TAG, channel)) {
       this.safeSend(client, notice);
     }

@@ -40,6 +40,8 @@ final class MainViewController: UIViewController {
     private var visibleId: TerminalID?
 
     private let tabStrip = TabStripView()
+    private let toastView = TerminalToastView()
+    private var toastTask: Task<Void, Never>?
     private let toolbar = TerminalToolbar()
     private let terminalKeyboard = TerminalKeyboardView()
     private var isTerminalKeyboardEnabled = false
@@ -114,6 +116,11 @@ final class MainViewController: UIViewController {
         tabStrip.onCreate = { [weak self] in self?.createOnOnlyComputer() }
         view.addSubview(tabStrip)
 
+        toastView.translatesAutoresizingMaskIntoConstraints = false
+        toastView.alpha = 0
+        toastView.transform = CGAffineTransform(translationX: 0, y: -10)
+        view.addSubview(toastView)
+
         noSessionsView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(noSessionsView)
         buildNoSessionsHint()
@@ -143,6 +150,15 @@ final class MainViewController: UIViewController {
             tabStrip.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
             tabStrip.heightAnchor.constraint(equalToConstant: TabStripView.height),
 
+            toastView.topAnchor.constraint(equalTo: tabStrip.bottomAnchor, constant: 10),
+            toastView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            toastView.leadingAnchor.constraint(
+                greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20
+            ),
+            toastView.trailingAnchor.constraint(
+                lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20
+            ),
+
             toolbar.leadingAnchor.constraint(
                 equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12
             ),
@@ -165,6 +181,10 @@ final class MainViewController: UIViewController {
 
         panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         panGesture.delegate = self
+        panGesture.minimumNumberOfTouches = 1
+        panGesture.maximumNumberOfTouches = 1
+        panGesture.delaysTouchesBegan = false
+        panGesture.delaysTouchesEnded = false
         pagesContainer.addGestureRecognizer(panGesture)
     }
 
@@ -255,6 +275,10 @@ final class MainViewController: UIViewController {
             .sink { [weak self] message in self?.presentError(message) }
             .store(in: &cancellables)
 
+        manager.notices
+            .sink { [weak self] message in self?.showToast(message) }
+            .store(in: &cancellables)
+
         NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.manager.kickAll() }
@@ -310,6 +334,10 @@ final class MainViewController: UIViewController {
             page.host.onModifierStateChange = { [weak self] state in
                 guard let self, visibleId == id else { return }
                 toolbar.setModifierState(state)
+            }
+            page.host.onFocusChange = { [weak self] focused in
+                guard let self, !focused, visibleId == id else { return }
+                exitTerminalKeyboardMode()
             }
             pages[id] = page
 
@@ -391,6 +419,17 @@ final class MainViewController: UIViewController {
         }
     }
 
+    /// Closing the expanded keyboard is also an exit from that mode. Without
+    /// this reset, the pinned button remains selected and the next terminal
+    /// focus unexpectedly opens the expanded keyboard again.
+    private func exitTerminalKeyboardMode() {
+        guard isTerminalKeyboardEnabled else { return }
+        isTerminalKeyboardEnabled = false
+        toolbar.setTerminalKeyboardEnabled(false)
+        guard let id = visibleId, let page = pages[id] else { return }
+        page.host.setReplacementInputView(nil)
+    }
+
     private func updateTerminalChromeVisibility(hasTerminals: Bool) {
         let shouldShow = hasTerminals && computerCount > 0
         toolbar.isHidden = !shouldShow
@@ -457,6 +496,29 @@ final class MainViewController: UIViewController {
         )
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+
+    private func showToast(_ message: String) {
+        toastTask?.cancel()
+        toastView.setMessage(message)
+        view.bringSubviewToFront(toastView)
+        UIView.animate(
+            withDuration: 0.28,
+            delay: 0,
+            usingSpringWithDamping: 0.86,
+            initialSpringVelocity: 0.2
+        ) {
+            self.toastView.alpha = 1
+            self.toastView.transform = .identity
+        }
+        toastTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, let self else { return }
+            UIView.animate(withDuration: 0.2) {
+                self.toastView.alpha = 0
+                self.toastView.transform = CGAffineTransform(translationX: 0, y: -8)
+            }
+        }
     }
 
     /// Menu listing every bound computer; rebuilt each presentation so names
@@ -624,13 +686,79 @@ final class MainViewController: UIViewController {
     }
 }
 
+/// A transient overlay rather than a layout row, so terminal geometry never
+/// shifts when a computer goes offline.
+private final class TerminalToastView: UIView {
+    private let glass = GlassView(interactive: false)
+    private let label = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+
+        glass.cornerRadius = 16
+        glass.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(glass)
+
+        let icon = UIImageView(image: UIImage(systemName: "wifi.slash"))
+        icon.tintColor = .secondaryLabel
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+
+        label.font = .preferredFont(forTextStyle: .subheadline).bold()
+        label.textColor = .label
+        label.numberOfLines = 2
+
+        let stack = UIStackView(arrangedSubviews: [icon, label])
+        stack.axis = .horizontal
+        stack.alignment = .center
+        stack.spacing = 9
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        glass.contentView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            glass.topAnchor.constraint(equalTo: topAnchor),
+            glass.bottomAnchor.constraint(equalTo: bottomAnchor),
+            glass.leadingAnchor.constraint(equalTo: leadingAnchor),
+            glass.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -10),
+            stack.leadingAnchor.constraint(equalTo: glass.contentView.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: glass.contentView.trailingAnchor, constant: -14),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func setMessage(_ message: String) {
+        label.text = message
+        accessibilityLabel = message
+    }
+}
+
+private extension UIFont {
+    func bold() -> UIFont {
+        let descriptor = fontDescriptor.withSymbolicTraits(.traitBold) ?? fontDescriptor
+        return UIFont(descriptor: descriptor, size: pointSize)
+    }
+}
+
 extension MainViewController: UIGestureRecognizerDelegate {
     /// Claim only clearly-horizontal pans; everything else stays with the
     /// terminal (vertical scrollback, taps, long-press selection).
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === panGesture else { return true }
+        guard let id = visibleId,
+              let index = orderedIds.firstIndex(of: id),
+              let page = pages[id]
+        else { return false }
         let velocity = panGesture.velocity(in: pagesContainer)
-        return abs(velocity.x) > abs(velocity.y) * 1.4
+        return TerminalPagingIntent.shouldBegin(
+            velocity: velocity,
+            currentIndex: index,
+            pageCount: orderedIds.count,
+            selectionActive: page.host.isTextSelectionActive
+        )
     }
 
     /// The terminal's own recognizers (touch scroll, taps) must wait for the
@@ -642,5 +770,30 @@ extension MainViewController: UIGestureRecognizerDelegate {
     ) -> Bool {
         gestureRecognizer === panGesture
             && otherGestureRecognizer.view?.isDescendant(of: pagesContainer) == true
+    }
+}
+
+/// Keeps a diagonal terminal scroll from being mistaken for page navigation.
+/// The boundary check also prevents a one-page/boundary rubber-band from
+/// stealing a scroll that cannot possibly switch terminals.
+enum TerminalPagingIntent {
+    static func shouldBegin(
+        velocity: CGPoint,
+        currentIndex: Int,
+        pageCount: Int,
+        selectionActive: Bool
+    ) -> Bool {
+        guard !selectionActive, pageCount > 1,
+              currentIndex >= 0, currentIndex < pageCount
+        else { return false }
+
+        let horizontal = abs(velocity.x)
+        let vertical = abs(velocity.y)
+        guard horizontal > vertical * 1.75 else { return false }
+
+        // Positive x reveals the previous page; negative x reveals the next.
+        if velocity.x > 0, currentIndex == 0 { return false }
+        if velocity.x < 0, currentIndex == pageCount - 1 { return false }
+        return velocity.x != 0
     }
 }

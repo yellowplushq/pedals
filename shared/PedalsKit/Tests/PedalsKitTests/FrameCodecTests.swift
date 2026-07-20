@@ -117,7 +117,6 @@ final class FrameCodecTests: XCTestCase {
             .ready(who: .host, echoNonce: clientNonce),
             .ready(who: .client, echoNonce: hostNonce),
             .requestReplay,
-            .requestSessions,
             .sessions(list: [session]),
             .sessions(list: []),
             .create(cwd: "/tmp", cols: 80, rows: 24, req: 0xCAFE),
@@ -179,7 +178,6 @@ final class FrameCodecTests: XCTestCase {
         let messages: [ControlMessage] = [
             .ready(who: .client, echoNonce: nonce),
             .requestReplay,
-            .requestSessions,
         ]
 
         for message in messages {
@@ -206,12 +204,6 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(replayObject["t"] as? String, "requestReplay")
         XCTAssertEqual(replayObject.count, 1)
 
-        let sessionsObject = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: messages[2].jsonData())
-                as? [String: Any]
-        )
-        XCTAssertEqual(sessionsObject["t"] as? String, "requestSessions")
-        XCTAssertEqual(sessionsObject.count, 1)
     }
 
     func testCreateEncodesNilCwdAsJSONNull() throws {

@@ -26,7 +26,7 @@ public final class RelayHostClient: @unchecked Sendable {
     /// live stdout at or below it is not re-sent (bytes would double after the
     /// splice, see PROTOCOL.md §4).
     private var replayedThrough: [Int: UInt64] = [:]
-    private var lastReportedAliveCount: Int?
+    private var lastReportedDirectory: [RelayMetadata.DirectoryEntry]?
 
     private var _state: State = .stopped
     /// A client hello arrived on the current control connection.
@@ -84,15 +84,27 @@ public final class RelayHostClient: @unchecked Sendable {
 
     public func stop() {
         queue.sync {
+            reportOfflineLocked()
             started = false
             teardownLocked()
             _state = .stopped
         }
     }
 
+    /// Sleep keeps every PTY alive locally while withdrawing its remote
+    /// directory immediately. `start()` republishes the complete snapshot.
+    public func suspend() {
+        stop()
+    }
+
+    public func resume() {
+        start()
+    }
+
     /// Rotates the computer identity, E2EE secret, and host credential.
     public func update(identity: HostIdentity) {
         queue.async { [self] in
+            reportOfflineLocked()
             self.identity = identity
             guard started else { return }
             teardownLocked()
@@ -110,7 +122,7 @@ public final class RelayHostClient: @unchecked Sendable {
         for link in sessionLinks.values { link.stop() }
         sessionLinks.removeAll()
         replayedThrough.removeAll()
-        lastReportedAliveCount = nil
+        lastReportedDirectory = nil
         _clientSeen = false
     }
 
@@ -136,8 +148,8 @@ public final class RelayHostClient: @unchecked Sendable {
         switch state {
         case .connected:
             _state = .connected
+            reportDirectoryLocked(force: true)
             control?.send(.sessions(list: sessions.list()))
-            reportHostStateLocked(force: true)
         case .connecting:
             _state = .connecting
             _clientSeen = false
@@ -184,8 +196,6 @@ public final class RelayHostClient: @unchecked Sendable {
             guard who == .client else { return }
             _clientSeen = true
             control?.send(.sessions(list: sessions.list()))
-        case .requestSessions:
-            control?.send(.sessions(list: sessions.list()))
         case .create(let cwd, let cols, let rows, let req):
             do {
                 let id = try sessions.create(cwd: cwd, cols: cols, rows: rows)
@@ -225,8 +235,6 @@ public final class RelayHostClient: @unchecked Sendable {
                 requestsReplay = who == .client
             case .requestReplay:
                 requestsReplay = true
-            case .requestSessions:
-                requestsReplay = false
             default:
                 requestsReplay = false
             }
@@ -252,9 +260,9 @@ public final class RelayHostClient: @unchecked Sendable {
         guard started else { return }
         switch event {
         case .sessionsChanged(let list):
+            reportDirectoryLocked(force: false, sessions: list)
             control?.send(.sessions(list: list))
             reconcileSessionLinksLocked(with: list)
-            reportHostStateLocked(force: false, sessions: list)
         case .output(let id, let data, let offset):
             guard let link = sessionLinks[id] else { return }
             let covered = replayedThrough[id] ?? 0
@@ -269,33 +277,31 @@ public final class RelayHostClient: @unchecked Sendable {
         }
     }
 
-    // MARK: - Host state metadata (on `queue`)
-
-    private struct HostState: Encodable {
-        let type = "host-state"
-        let aliveTTYCount: Int
-        let hostName: String
-    }
+    // MARK: - Durable Object terminal directory (on `queue`)
 
     private func startHeartbeatLocked() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 45, repeating: 45)
+        timer.schedule(deadline: .now() + 30, repeating: 30)
         timer.setEventHandler { [weak self] in
-            self?.reportHostStateLocked(force: true)
+            self?.reportDirectoryLocked(force: true)
         }
         timer.resume()
         heartbeatTimer?.cancel()
         heartbeatTimer = timer
     }
 
-    private func reportHostStateLocked(force: Bool, sessions list: [SessionInfo]? = nil) {
-        let count = (list ?? sessions.list()).lazy.filter(\.alive).count
-        guard force || count != lastReportedAliveCount else { return }
-        guard let data = try? JSONEncoder().encode(
-            HostState(aliveTTYCount: count, hostName: hostName)
-        ), let text = String(data: data, encoding: .utf8)
-        else { return }
-        control?.sendRelayText(text)
-        lastReportedAliveCount = count
+    private func reportDirectoryLocked(force: Bool, sessions list: [SessionInfo]? = nil) {
+        let directory = (list ?? sessions.list()).map {
+            RelayMetadata.DirectoryEntry(id: $0.id, alive: $0.alive)
+        }
+        guard force || directory != lastReportedDirectory else { return }
+        control?.sendMetadata(.hostSnapshot(hostName: hostName, sessions: directory))
+        lastReportedDirectory = directory
+    }
+
+    private func reportOfflineLocked() {
+        guard started else { return }
+        control?.sendMetadataSynchronously(.hostOffline)
+        lastReportedDirectory = nil
     }
 }

@@ -135,8 +135,8 @@ async function createComputer(request, env) {
     ).bind(computerId, hash, now, MAX_COMPUTERS),
     env.DB.prepare(
       `INSERT INTO computer_state
-         (computer_id, revision, host_name, alive_tty_count, online, last_seen_at, updated_at)
-       SELECT ?1, 0, NULL, 0, 0, ?2, ?2
+         (computer_id, revision, host_name, running_terminal_count, online, updated_at)
+       SELECT ?1, 0, NULL, 0, 0, ?2
         WHERE EXISTS (SELECT 1 FROM computers WHERE id = ?1)`,
     ).bind(computerId, now),
   ]);

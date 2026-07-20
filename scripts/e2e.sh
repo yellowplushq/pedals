@@ -14,6 +14,7 @@ ARTIFACTS="$ROOT/.artifacts"
 RELAY_PORT="${RELAY_PORT:-8787}"
 SERVICE_URL="http://127.0.0.1:$RELAY_PORT"
 SIM_DEVICE="${SIM_DEVICE:-iPhone 17 Pro}"
+SIM_UDID="${SIM_UDID:-}"
 BUNDLE_ID="air.build.pedals"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
@@ -110,13 +111,21 @@ node "$ROOT/scripts/e2e-status-client.mjs" wait "$STATUS_CREDENTIAL" 0
 log "generating and building the iOS, Widget, Live Activity, and Watch targets"
 (cd "$ROOT/ios" && xcodegen generate --quiet)
 
-SIM_UDID="$(xcrun simctl list devices available --json | node -e '
-  const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
-  const all = Object.values(data.devices).flat();
-  const match = all.find((device) => device.name === process.argv[1]);
-  if (!match) process.exit(1);
-  process.stdout.write(match.udid);
-' "$SIM_DEVICE")" || fail "no available simulator named '$SIM_DEVICE'"
+if [[ -z "$SIM_UDID" ]]; then
+  SIM_UDID="$(xcrun simctl list devices available --json | node -e '
+    const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    const all = Object.values(data.devices).flat();
+    const match = all.find((device) => device.name === process.argv[1]);
+    if (!match) process.exit(1);
+    process.stdout.write(match.udid);
+  ' "$SIM_DEVICE")" || fail "no available simulator named '$SIM_DEVICE'"
+else
+  xcrun simctl list devices available --json | node -e '
+    const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    const all = Object.values(data.devices).flat();
+    if (!all.some((device) => device.udid === process.argv[1])) process.exit(1);
+  ' "$SIM_UDID" || fail "simulator '$SIM_UDID' is not available"
+fi
 xcrun simctl bootstatus "$SIM_UDID" -b >/dev/null
 
 xcodebuild \
@@ -219,7 +228,27 @@ tap_accessibility_label "pedals.pairing.submit"
 
 log "waiting for the iOS client to prove the E2EE relay handshake"
 CLIENT_STATE="none"
-for _ in $(seq 1 80); do
+for attempt in $(seq 1 3); do
+  for _ in $(seq 1 8); do
+    CLIENT_STATE="$("$PEDALS_BIN" status | sed -n 's/^client: //p')"
+    [[ "$CLIENT_STATE" == "connected" ]] && break 2
+    sleep 0.5
+  done
+
+  # Simulator HID can also acknowledge the submit tap without UIKit receiving
+  # it. Retry only while the pairing button is still on screen; after a real
+  # submit it is disabled and repeated taps are harmless, and after success it
+  # disappears entirely.
+  SUBMIT_UI_JSON="$PEDALS_E2E_HOME/submit-ui.json"
+  baguette describe-ui --udid "$SIM_UDID" --output "$SUBMIT_UI_JSON" >/dev/null 2>&1
+  if grep -q '"identifier":"pedals.pairing.submit"' "$SUBMIT_UI_JSON"; then
+    tap_accessibility_label "pedals.pairing.submit"
+  else
+    break
+  fi
+done
+for _ in $(seq 1 56); do
+  [[ "$CLIENT_STATE" == "connected" ]] && break
   CLIENT_STATE="$("$PEDALS_BIN" status | sed -n 's/^client: //p')"
   [[ "$CLIENT_STATE" == "connected" ]] && break
   sleep 0.5

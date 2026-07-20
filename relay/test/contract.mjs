@@ -187,8 +187,12 @@ try {
   host = await connect(computer.computerId, computer.hostToken);
   clientSocket = await connect(computer.computerId, client.clientToken);
   assert.deepEqual(JSON.parse(await clientSocket.nextText()), {
-    type: "presence",
-    online: true,
+    type: "terminal-directory",
+    revision: 0,
+    online: false,
+    hostName: null,
+    sessions: [],
+    updatedAt: 0,
   });
 
   const down = Uint8Array.from([0, 2, 4, 8, 16, 32, 64, 128, 255]);
@@ -201,10 +205,17 @@ try {
   assert.deepEqual(forwarded.wire, up);
 
   host.ws.send(JSON.stringify({
-    type: "host-state",
-    aliveTTYCount: 1,
+    type: "host-snapshot",
     hostName: "Contract Mac",
+    sessions: [{ id: 1, alive: true }],
   }));
+  const directory = JSON.parse(await clientSocket.nextText());
+  assert.equal(directory.type, "terminal-directory");
+  assert.equal(directory.revision, 1);
+  assert.equal(directory.online, true);
+  assert.equal(directory.hostName, "Contract Mac");
+  assert.deepEqual(directory.sessions, [{ id: 1, alive: true }]);
+  assert.ok(Number.isSafeInteger(directory.updatedAt) && directory.updatedAt > 0);
   const state = await waitForState(
     client.statusToken,
     (value) => value.version === 2 && value.totalRunning === 1,

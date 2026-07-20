@@ -3,6 +3,20 @@ import PedalsDaemonCore
 import PedalsKit
 import SwiftUI
 
+private final class NotificationObserverToken: @unchecked Sendable {
+    private let center: NotificationCenter
+    private let token: any NSObjectProtocol
+
+    init(center: NotificationCenter, token: any NSObjectProtocol) {
+        self.center = center
+        self.token = token
+    }
+
+    deinit {
+        center.removeObserver(token)
+    }
+}
+
 enum RelayState: Equatable {
     case starting
     case connecting
@@ -40,7 +54,9 @@ final class AppModel: ObservableObject {
     private var startupTask: Task<Void, Never>?
     private var monitoringTask: Task<Void, Never>?
     private var pairingTask: Task<Void, Never>?
-    private var terminationObserver: (any NSObjectProtocol)?
+    private var terminationObserver: NotificationObserverToken?
+    private var sleepObserver: NotificationObserverToken?
+    private var wakeObserver: NotificationObserverToken?
 
     init() {
         let defaults = UserDefaults.standard
@@ -52,7 +68,7 @@ final class AppModel: ObservableObject {
         }
         defaults.removeObject(forKey: "daemonBinaryPath")
 
-        terminationObserver = NotificationCenter.default.addObserver(
+        let terminationToken = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
             queue: .main
@@ -64,6 +80,27 @@ final class AppModel: ObservableObject {
                 self?.service?.shutdown()
             }
         }
+        terminationObserver = NotificationObserverToken(
+            center: .default, token: terminationToken
+        )
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        let sleepToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.service?.suspend() }
+        }
+        sleepObserver = NotificationObserverToken(center: workspaceCenter, token: sleepToken)
+        let wakeToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.service?.resume() }
+        }
+        wakeObserver = NotificationObserverToken(center: workspaceCenter, token: wakeToken)
 
         startService()
     }

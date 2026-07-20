@@ -1,9 +1,10 @@
 # Pedals service protocol v2
 
 This Worker is the only Pedals server. It combines an authenticated WebSocket
-relay, the device-to-computer binding registry, current TTY counts, and APNs
-delivery. Terminal frames remain end-to-end encrypted; D1 never stores the
-pairing encryption secret, terminal bytes, titles, or working directories.
+relay, the device-to-computer binding registry, a Durable Object-owned terminal
+directory, and APNs delivery. Terminal frames remain end-to-end encrypted; D1
+never stores the pairing encryption secret, terminal bytes, titles, or working
+directories.
 
 The public origin is `https://pedals.air.build`. All API responses are JSON with
 `Cache-Control: no-store`. JSON request bodies are limited to 16 KiB. Errors use:
@@ -140,8 +141,9 @@ racing the deletion is re-authorized inside the same actor and cannot survive.
 
 ### `GET /v2/clients/me/state`
 
-Status `statusToken` required. `totalRunning` sums only computers with a fresh online
-host lease. An offline computer always reports a zero `runningTTYCount`.
+Status `statusToken` required. `totalRunning` sums the alive entries in each
+online computer's current Durable Object directory projection. An offline
+computer always reports a zero `runningTTYCount`.
 
 ```json
 {
@@ -196,7 +198,7 @@ active host, and absent-peer frames are dropped. One client socket is retained
 per logical client/channel. A client principal may hold at most 16 active
 logical channels for one computer, and a host may hold at most 256. Reconnecting
 an existing channel replaces its old socket without consuming another slot.
-Binary frames above 1 MiB and relay metadata above 512 bytes are closed rather
+Binary frames above 1 MiB and relay metadata above 16 KiB are closed rather
 than amplified.
 
 Before forwarding a client binary frame to the host, the Durable Object adds a
@@ -213,26 +215,49 @@ Frames whose source does not own the tag are dropped before decryption and
 before replay counters advance. The 1 MiB limit applies to the original peer
 wire, so the largest delivered host message is 1 MiB plus 33 bytes.
 
-Clients receive plaintext relay metadata:
+The active host sends a complete privacy-safe directory on the control socket
+after connect, on each session-list change, and every 30 seconds:
 
 ```json
-{"type":"presence","online":true}
+{
+  "type":"host-snapshot",
+  "hostName":"Studio Mac",
+  "sessions":[{"id":1,"alive":true},{"id":2,"alive":false}]
+}
 ```
 
-On the authenticated **control** socket, the host sends this plaintext server
-metadata immediately after connect, whenever the number changes, and every
-45–60 seconds:
+Only the current authenticated host may mutate it. The Hub stores at most 255
+ordered unique `{id,alive}` entries and assigns a revision. Every control client
+receives the current value immediately on connect and after changes:
 
 ```json
-{"type":"host-state","aliveTTYCount":3,"hostName":"Studio Mac"}
+{
+  "type":"terminal-directory",
+  "revision":12,
+  "online":true,
+  "hostName":"Studio Mac",
+  "sessions":[{"id":1,"alive":true},{"id":2,"alive":false}],
+  "updatedAt":1784512800
+}
 ```
 
-`aliveTTYCount` is `sessions.filter(\.alive).count` and must be an integer from
-0 through 10,000. `hostName` is a trimmed, nonempty string of at most 128 UTF-16
-code units. The frame is consumed by the relay and never forwarded. Other peer
-text frames are ignored. Closing the active control host marks the computer
-offline; the scheduled lease sweep also expires state after 120 seconds
-without a valid host-state heartbeat.
+`hostName` is trimmed, nonempty, and at most 128 UTF-16 code units. Titles, cwd,
+dimensions, and bytes remain E2EE. Clients intersect the encrypted descriptor
+list with this directory; a late encrypted frame therefore cannot resurrect a
+removed terminal.
+
+`{"type":"host-offline"}` before sleep or orderly exit clears the remote
+directory immediately without touching local PTYs. An unexpected control-socket
+loss gets a 20-second grace period for weak-network reconnection. A connected
+host snapshot has a 90-second lease as a silent-stall backstop. Expiry publishes
+an offline directory with an empty session list and a reason. Session-channel
+clients separately receive `{"type":"channel-state","online":...}` for
+transport feedback; it is not directory authority.
+
+D1 holds only the serialized DO transition's online/name/alive-count projection,
+so `/state`, WidgetKit, Live Activities, and Watch all use exactly the same
+server-authoritative count. Unchanged heartbeats renew only DO storage and do
+not produce redundant APNs work.
 
 Binary terminal frames continue to use the Pedals v2 E2EE format and HKDF salt
 `pedals-v2`.

@@ -44,6 +44,8 @@ final class TerminalManager {
     /// Daemon-reported failures of *our* requests (e.g. a create that failed),
     /// for the UI to surface.
     let errors = PassthroughSubject<String, Never>()
+    /// Transient, non-blocking app-level feedback.
+    let notices = PassthroughSubject<String, Never>()
 
     static let maxLiveChannels = 6
     /// How long to hold an unidentified new session off the tab list while our
@@ -196,9 +198,6 @@ final class TerminalManager {
         channel.onPhase = { [weak self] phase in
             self?.phases[id] = phase
         }
-        channel.onHostUnavailable = { [weak self] in
-            self?.computer(id: id.computerID)?.requestSessions()
-        }
         phases[id] = channel.phase
         channels[id] = channel
         evictBeyondPoolLimit()
@@ -296,6 +295,13 @@ final class TerminalManager {
             // Only failures of requests *this* device made are ours to show.
             guard let req, pendingCreates.removeValue(forKey: req) != nil else { break }
             errors.send(msg)
+        case .offline(let removedTerminalCount):
+            pendingCreates = pendingCreates.filter { $0.value != connection.id }
+            heldAppends = heldAppends.filter { $0.key.computerID != connection.id }
+            placeAsOwnWhenSeen = placeAsOwnWhenSeen.filter { $0.computerID != connection.id }
+            guard removedTerminalCount > 0 else { break }
+            let suffix = removedTerminalCount == 1 ? "terminal was" : "terminals were"
+            notices.send("\(connection.displayName) went offline. \(removedTerminalCount) \(suffix) hidden.")
         }
     }
 

@@ -1,7 +1,8 @@
 # Pedals Protocol Specification v2
 
-Pedals exposes encrypted remote terminals while publishing only an aggregate,
-non-terminal status graph for widgets and Live Activities.
+Pedals exposes encrypted remote terminals while keeping a privacy-safe terminal
+directory in each computer's Durable Object for clients, widgets, and Live
+Activities.
 
 ```text
 iPhone / Watch ── HTTPS ──> Cloudflare Worker + D1 ── APNs ──> system surfaces
@@ -9,9 +10,10 @@ iPhone / Watch ── HTTPS ──> Cloudflare Worker + D1 ── APNs ──> s
        └──── E2EE over WSS ─────┴──── E2EE over WSS ──── desktop daemon
 ```
 
-The service stores computer/client identifiers, explicit bindings, online
-leases, host names, and alive TTY counts. It never receives the E2EE secret,
-terminal titles, working directories, stdin, stdout, or replay buffers.
+The service stores computer/client identifiers, explicit bindings, host names,
+terminal IDs plus their alive flags, and the derived alive count. It never
+receives the E2EE secret, terminal titles, working directories, stdin, stdout,
+or replay buffers.
 
 ## 1. Identities and authorization
 
@@ -112,7 +114,8 @@ GET /v2/relay/:computerId?channel=session&sid=<u32>
   go to the active host.
 - Messages are never queued. A reconnecting session channel requests a fresh
   replay snapshot from the daemon.
-- Relay text notices are metadata; encrypted peer frames are binary.
+- Relay text messages are the server-owned control plane; encrypted peer frames
+  are binary.
 
 Client-to-host binary delivery has a fixed relay-authenticated source envelope:
 
@@ -128,17 +131,67 @@ host-role `RelayLink` requires version `0x02`; client-role links receive the
 unchanged host E2EE wire. The 1 MiB peer-frame limit applies before this
 33-byte envelope is added.
 
-The relay sends clients `{"type":"presence","online":true|false}` on host
-attach/detach. On its authenticated control socket the host sends:
+### 3.1 Server-authoritative terminal directory
+
+The host and every bound client keep their authenticated `control` WebSocket
+open continuously. Immediately after connecting, whenever a session is
+created, closed, or exits, and every 30 seconds as a full-snapshot heartbeat,
+the active host sends:
 
 ```json
-{"type":"host-state","aliveTTYCount":3,"hostName":"MacBook Pro"}
+{
+  "type":"host-snapshot",
+  "hostName":"MacBook Pro",
+  "sessions":[{"id":7,"alive":true},{"id":9,"alive":false}]
+}
 ```
 
-It sends this on connect, on alive-count changes, and every 45 seconds. The
-Worker accepts it only from the active control host, updates the D1 lease, and
-notifies the push coordinator. A scheduled sweep marks leases stale after 120
-seconds.
+This is an idempotent complete snapshot, not a delta. The Durable Object accepts
+it only from the current active control host, canonicalizes at most 255 ordered
+unique terminal IDs, renews a 90-second lease, and stores the directory in DO
+storage. Repeating an unchanged snapshot only renews the lease; it does not
+increment the revision or send duplicate push updates.
+
+Every control client receives the current directory as soon as its WebSocket is
+accepted and again whenever the directory changes:
+
+```json
+{
+  "type":"terminal-directory",
+  "revision":12,
+  "online":true,
+  "hostName":"MacBook Pro",
+  "sessions":[{"id":7,"alive":true},{"id":9,"alive":false}],
+  "updatedAt":1784512800
+}
+```
+
+The client accepts the initial directory and then only strictly newer revisions;
+equal duplicates and older deliveries are ignored. This directory decides
+which terminal tabs exist and whether each is alive. The separate encrypted
+`sessions` frame supplies private display fields such as title, cwd, and size;
+the client intersects it with the DO directory, so delayed encrypted frames can
+never resurrect a terminal that the server has removed.
+
+Before sleep or orderly process exit, the desktop sends
+`{"type":"host-offline"}` and briefly waits for WebSocket delivery. The DO
+immediately publishes an offline directory with an empty session list and the
+reason `host-requested`. A lost control socket instead starts a 20-second grace
+period: reconnecting and sending a fresh full snapshot within that period keeps
+the directory online, which prevents ordinary weak-network handoffs from
+flashing every terminal away. If it does not recover, the DO alarm publishes
+`connection-lost`; if a nominally connected socket stops sending snapshots for
+90 seconds, the alarm closes it and publishes `lease-expired`.
+
+Going offline changes only remote visibility. Sleep or a transient network loss
+does not close local PTYs; a reconnect republishes the full live local list. D1
+stores only the DO's derived `online`, host name, and alive count projection,
+which is updated in the same serialized directory transition used to notify
+widgets and APNs.
+
+On a session-channel WebSocket, clients receive
+`{"type":"channel-state","online":true|false}` for transport feedback. It
+never controls tab visibility; only `terminal-directory` does.
 
 ## 4. End-to-end encryption and connection handshake
 
@@ -255,7 +308,6 @@ Handshake control frames use `sessionId = 0` on every WebSocket channel:
 After `ready` promotes the tag, the control channel accepts:
 
 - `sessions {list:[{id,title,cwd,rows,cols,createdAt,alive}]}`
-- `requestSessions {}` asks the host to resend that authoritative list
 - `create {cwd,cols,rows,req?}` / `created {id,req?}`
 - `close {id}`, `title {id,title}`, `exit {id,code}`
 - `err {msg,req?}`
@@ -266,8 +318,10 @@ this is how a reconnect recovers output because the relay never queues it.
 `stdin`, `stdout`, `resize`, and `replay` frames carry the authenticated URL's
 session ID and are rejected if it differs.
 
-Terminal titles, paths, and contents exist only inside these encrypted frames.
-The daemon counts running TTYs exclusively as `sessions.filter(\.alive).count`.
+Terminal titles, paths, dimensions, and contents exist only inside these
+encrypted frames. Session IDs and alive flags are deliberately duplicated into
+the privacy-safe DO directory so every client and widget uses one authoritative
+online state.
 
 ## 6. Status state and APNs endpoints
 
@@ -296,8 +350,8 @@ GET /v2/clients/me/state
 }
 ```
 
-Offline/stale computers contribute zero to `totalRunning`; their last terminal
-count is never presented as current.
+Offline computers contribute zero to `totalRunning`; their last terminal count
+is never presented as current.
 
 WidgetKit and ActivityKit tokens are registered with:
 
@@ -329,5 +383,7 @@ registers a new computer identity and rotates the host token and E2EE secret
 before requesting the code.
 
 The daemon launches interactive login shells in PTYs, keeps a 256 KiB raw
-replay buffer per session, parses OSC 0/2 titles locally, and persists a session
-ID high-water mark so a terminal channel key is never reused.
+replay buffer per session, parses OSC 0/2 titles locally, limits the directory
+to 255 sessions, and persists a session ID high-water mark so a terminal channel
+key is never reused. It reports offline before macOS sleep and `SIGINT`/`SIGTERM`,
+then publishes a complete snapshot after wake or reconnect.

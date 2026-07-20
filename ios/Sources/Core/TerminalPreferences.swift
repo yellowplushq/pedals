@@ -3,6 +3,20 @@ import GhosttyTerminal
 import GhosttyTheme
 import UIKit
 
+enum TerminalCanvasLayout {
+    static let horizontalPadding = 6
+    static let verticalPadding = 4
+
+    static var contentInsets: UIEdgeInsets {
+        UIEdgeInsets(
+            top: CGFloat(verticalPadding),
+            left: CGFloat(horizontalPadding),
+            bottom: CGFloat(verticalPadding),
+            right: CGFloat(horizontalPadding)
+        )
+    }
+}
+
 /// User-adjustable terminal appearance (Settings): font size + Ghostty theme.
 @MainActor
 final class TerminalPreferences {
@@ -73,6 +87,8 @@ final class TerminalPreferences {
     func terminalConfiguration() -> TerminalConfiguration {
         TerminalConfiguration {
             $0.withFontSize(fontSize)
+            $0.withWindowPaddingX(TerminalCanvasLayout.horizontalPadding)
+            $0.withWindowPaddingY(TerminalCanvasLayout.verticalPadding)
             // Pure-black canvas regardless of the chosen theme's background.
             $0.withBackground("#000000")
         }

@@ -87,6 +87,30 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(allocated.value, 8)
     }
 
+    func testDirectoryCapacityIsEnforcedBeforeAllocatingAnotherPTY() throws {
+        var options = testOptions()
+        options.maximumSessions = 1
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        _ = try manager.create(cwd: nil, cols: 80, rows: 24)
+        XCTAssertThrowsError(try manager.create(cwd: nil, cols: 80, rows: 24)) { error in
+            XCTAssertEqual(error as? SessionManager.SessionError, .capacityReached(1))
+        }
+        XCTAssertEqual(manager.list().count, 1)
+    }
+
+    func testSessionIDCannotExceedRelayUInt32Space() {
+        var options = testOptions()
+        options.firstSessionId = Int(UInt32.max) + 1
+        let manager = SessionManager(options: options)
+
+        XCTAssertThrowsError(try manager.create(cwd: nil, cols: 80, rows: 24)) { error in
+            XCTAssertEqual(error as? SessionManager.SessionError, .idSpaceExhausted)
+        }
+        XCTAssertTrue(manager.list().isEmpty)
+    }
+
     func testReplaySnapshotContainsPastOutput() throws {
         let manager = SessionManager(options: testOptions())
         defer { manager.closeAll() }

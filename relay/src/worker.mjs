@@ -1,6 +1,5 @@
 import { handleApi } from "./api.mjs";
 import {
-  HOST_STATE_TTL_SECONDS,
   ORPHAN_CLIENT_RETENTION_SECONDS,
   ORPHAN_COMPUTER_RETENTION_SECONDS,
   apiError,
@@ -14,7 +13,6 @@ import {
   notifyPushCoordinator,
   rateLimitKey,
   touchClient,
-  writeComputerState,
 } from "./core.mjs";
 import { PushCoordinator } from "./push-coordinator.mjs";
 import { RelayChannel } from "./relay-channel.mjs";
@@ -80,26 +78,6 @@ async function handleRelayUpgrade(request, env, url) {
   return env.RELAY_CHANNELS.getByName(computerId).fetch(
     trustedRelayRequest(request, identity, computerId, channel),
   );
-}
-
-async function expireStaleComputers(env) {
-  const cutoff = Math.floor(Date.now() / 1000) - HOST_STATE_TTL_SECONDS;
-  const stale = await env.DB
-    .prepare(
-      `SELECT computer_id AS computerId
-         FROM computer_state
-        WHERE online = 1 AND last_seen_at < ?1`,
-    )
-    .bind(cutoff)
-    .all();
-  for (const row of stale.results) {
-    if (isId(row.computerId)) {
-      await writeComputerState(env, row.computerId, {
-        online: false,
-        expireBefore: cutoff,
-      });
-    }
-  }
 }
 
 async function reconcilePendingPushes(env) {
@@ -309,12 +287,6 @@ const worker = {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(
       Promise.all([
-        expireStaleComputers(env).catch((error) => {
-          console.error(
-            "stale host cleanup failed",
-            error instanceof Error ? error.message : error,
-          );
-        }),
         reconcilePendingPushes(env).catch((error) => {
           console.error(
             "push reconciliation failed",
@@ -349,6 +321,5 @@ export {
   collectOrphans,
   drainRelayRevocations,
   expireResetTombstones,
-  expireStaleComputers,
   reconcilePendingPushes,
 };

@@ -52,13 +52,9 @@ final class AppServices {
 
     func makeTerminalController() -> TerminalController {
         let controller = TerminalController(
-            configuration: TerminalConfiguration(startingFrom: .default) { builder in
-                builder.withWindowPaddingX(6)
-                builder.withWindowPaddingY(4)
-            },
+            configuration: preferences.terminalConfiguration(),
             theme: preferences.terminalTheme()
         )
-        controller.setTerminalConfiguration(preferences.terminalConfiguration())
         liveControllers.add(controller)
         return controller
     }

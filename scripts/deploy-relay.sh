@@ -14,8 +14,10 @@ cd "$RELAY_DIR"
 npm ci
 npm test
 
-# Fail before touching remote D1 when APNs cannot be configured. The schema
-# migration is additive, but a preflight keeps a failed deploy fully read-only.
+# Fail before touching remote D1 when APNs cannot be configured, then compile
+# the exact Worker bundle. Migration 0005 intentionally removes the retired
+# host-heartbeat columns, so an invalid bundle must never be discovered only
+# after that breaking schema migration has started.
 SECRET_NAMES="$(npx wrangler secret list --format json | node -e '
   const entries = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
   process.stdout.write(entries.map((entry) => entry.name).join("\n"));
@@ -27,6 +29,7 @@ for required in APNS_PRIVATE_KEY_P8 APNS_KEY_ID APNS_TEAM_ID; do
   }
 done
 
+npm run deploy:dry-run
 npm run db:migrate:remote
 
 # Wrangler may report a 100% deployment before every edge serving the custom

@@ -1,4 +1,5 @@
 import ArgumentParser
+import AppKit
 import Darwin
 import Foundation
 import PedalsDaemonCore
@@ -57,8 +58,21 @@ struct Serve: ParsableCommand {
         signal(SIGPIPE, SIG_IGN)
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        let sleepObserver = workspaceCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in daemon.suspend() }
+        let wakeObserver = workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in daemon.resume() }
         for source in [sigint, sigterm] {
             source.setEventHandler {
+                workspaceCenter.removeObserver(sleepObserver)
+                workspaceCenter.removeObserver(wakeObserver)
                 daemon.shutdown()
                 Foundation.exit(0)
             }

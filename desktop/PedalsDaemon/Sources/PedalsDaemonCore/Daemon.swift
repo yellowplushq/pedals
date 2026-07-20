@@ -131,6 +131,16 @@ public final class Daemon: @unchecked Sendable {
         sessions.closeAll()
     }
 
+    /// Withdraw remote visibility before system sleep without touching PTYs.
+    public func suspend() {
+        relay.suspend()
+    }
+
+    /// Reconnect after wake and republish the complete terminal directory.
+    public func resume() {
+        relay.resume()
+    }
+
     // MARK: - In-process app API
 
     public func snapshot() -> Snapshot {
