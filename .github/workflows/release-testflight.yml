@@ -132,9 +132,12 @@ jobs:
           cd ios
           xcodegen generate
           cd ..
-          count="$(rg -c "CURRENT_PROJECT_VERSION = $release_build;" \
+          build_count="$(rg -c "CURRENT_PROJECT_VERSION = $release_build;" \
             ios/Pedals.xcodeproj/project.pbxproj)"
-          [[ "$count" == "4" ]]
+          version_count="$(rg -c "MARKETING_VERSION = $release_version;" \
+            ios/Pedals.xcodeproj/project.pbxproj)"
+          [[ "$build_count" == "8" ]]
+          [[ "$version_count" == "8" ]]
           git diff --check
 
       - name: Run protocol and service tests
