@@ -51,6 +51,7 @@ final class AppServices {
         TTYLiveActivityController.shared.startObservingPushTokens()
         PushEndpointRegistrar.requestFlush()
         installSharedCredential()
+        reconcileBindings()
         scheduleStatusRefresh(immediate: true)
     }
 
@@ -58,8 +59,17 @@ final class AppServices {
         // Foregrounding is a durable retry opportunity after an extension was
         // suspended or a prior endpoint registration hit a transient failure.
         PushEndpointRegistrar.requestFlush()
+        reconcileBindings()
         synchronizeWatchTerminalContext()
         scheduleStatusRefresh(immediate: true)
+    }
+
+    /// Retries server-side convergence to the phone's authoritative binding
+    /// list, covering any unbind whose reconcile did not reach the service.
+    private func reconcileBindings() {
+        Task { @MainActor [pairingStore] in
+            await pairingStore.reconcile()
+        }
     }
 
     func makeTerminalController() -> TerminalController {
