@@ -128,6 +128,97 @@ final class SessionManagerTests: XCTestCase {
         let text = String(decoding: snapshot.data, as: UTF8.self)
         XCTAssertTrue(text.contains("replay-me"), "ring buffer must hold past output")
         XCTAssertEqual(snapshot.coversUpTo, UInt64(snapshot.data.count))
+        XCTAssertEqual(snapshot.cols, 80)
+        XCTAssertEqual(snapshot.rows, 24)
+    }
+
+    func testResizeEventPrecedesOutputFromForegroundJobSIGWINCH() throws {
+        let options = SessionManager.Options(
+            shell: "/bin/zsh",
+            shellArguments: ["-f"],
+            extraEnvironment: ["PS1": "$ "]
+        )
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let collected = OutputCollector()
+        let ordered = ResizeOutputOrderCollector(marker: "ORDERED-WINCH")
+        manager.onEvent = { event in
+            ordered.accept(event)
+            if case .output(_, let data, _) = event { collected.append(data) }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        manager.write(
+            id: id,
+            data: Data(
+                #"/bin/sh -c "trap 'printf ORDERED-WINCH\\n' WINCH; printf ORDERED-READY\\n; while :; do sleep 1; done""#.appending("\n").utf8
+            )
+        )
+        try collected.wait(for: "ORDERED-READY", timeout: 10)
+
+        // The PTY echoes the command itself, including the marker text. Start
+        // the ordering observation only after the foreground job is armed.
+        ordered.reset()
+        manager.resize(id: id, cols: 91, rows: 33)
+        try ordered.wait(timeout: 3)
+
+        XCTAssertEqual(ordered.values, ["resize:91x33", "output"])
+    }
+
+    func testSpawnedShellHasAControllingTerminal() throws {
+        let options = SessionManager.Options(
+            shell: "/bin/zsh",
+            shellArguments: ["-f"],
+            extraEnvironment: ["PS1": "$ "]
+        )
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let collected = OutputCollector()
+        manager.onEvent = { event in
+            if case .output(_, let data, _) = event { collected.append(data) }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        manager.write(
+            id: id,
+            data: Data(
+                "if [ \"$(ps -o tpgid= -p $$ | tr -d ' ')\" -gt 0 ]; then result=CONTROLLING; else result=NO-CONTROLLING; fi; printf '%s%s\\n' \"$result\" -TTY\n".utf8
+            )
+        )
+
+        try collected.wait(for: "\r\nCONTROLLING-TTY\r\n", timeout: 10)
+        XCTAssertFalse(collected.text.contains("\r\nNO-CONTROLLING-TTY\r\n"))
+    }
+
+    func testRepeatedResizeSignalsForegroundJobLaunchedByZsh() throws {
+        let options = SessionManager.Options(
+            shell: "/bin/zsh",
+            shellArguments: ["-f"],
+            extraEnvironment: ["PS1": "$ "]
+        )
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let collected = OutputCollector()
+        manager.onEvent = { event in
+            if case .output(_, let data, _) = event { collected.append(data) }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        manager.write(
+            id: id,
+            data: Data(
+                #"/bin/sh -c "trap 'printf \"ZSH-CHILD-WINCH:%s\\n\" \"\$(stty size)\"' WINCH; printf 'ZSH-CHILD-ARMED\n'; while :; do sleep 1; done""#.appending("\n").utf8
+            )
+        )
+        try collected.wait(for: "ZSH-CHILD-ARMED", timeout: 10)
+
+        for (cols, rows) in [(91, 33), (77, 18), (100, 42)] {
+            manager.resize(id: id, cols: UInt16(cols), rows: UInt16(rows))
+            try collected.wait(for: "ZSH-CHILD-WINCH:\(rows) \(cols)", timeout: 2)
+        }
     }
 
     func testLiveCwdFollowsShellChdir() throws {
@@ -253,5 +344,52 @@ final class LockedBox<Value>: @unchecked Sendable {
             stored = newValue
             lock.unlock()
         }
+    }
+}
+
+final class ResizeOutputOrderCollector: @unchecked Sendable {
+    private let marker: Data
+    private let lock = NSLock()
+    private var stored: [String] = []
+
+    init(marker: String) {
+        self.marker = Data(marker.utf8)
+    }
+
+    func accept(_ event: SessionEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch event {
+        case .resized(_, let cols, let rows):
+            stored.append("resize:\(cols)x\(rows)")
+        case .output(_, let data, _) where data.range(of: marker) != nil:
+            stored.append("output")
+        default:
+            break
+        }
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func reset() {
+        lock.lock()
+        stored.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    func wait(timeout: TimeInterval) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if values.count >= 2 { return }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw NSError(
+            domain: "ResizeOutputOrderCollector", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "timed out waiting for resize/output: \(values)"]
+        )
     }
 }

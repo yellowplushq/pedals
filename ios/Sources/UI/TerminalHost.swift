@@ -18,8 +18,13 @@ final class TerminalHost {
     /// Focus follows UIKit's first responder state, including a terminal tap
     /// that dismisses either the system or Pedals keyboard.
     var onFocusChange: ((Bool) -> Void)?
-    /// Grid size changes (view layout / font size), to be sent as `resize` frames.
+    /// Grid size changes, to be sent as `resize` frames. Fired only once the
+    /// emulator has applied the grid, so a TUI repaint triggered by the frame
+    /// can never be parsed against a smaller, stale grid.
     var onResize: ((_ cols: UInt16, _ rows: UInt16) -> Void)?
+    /// The grid the emulator has applied — the only size safe to hand to the
+    /// daemon. During a layout change this lags `viewport` by one emulator
+    /// resize round trip.
     private(set) var cols: UInt16?
     private(set) var rows: UInt16?
     private var viewport: InMemoryTerminalViewport?
@@ -53,9 +58,13 @@ final class TerminalHost {
             write: { data in
                 Task { @MainActor in relay.host?.handleInput(data) }
             },
-            resize: { viewport in
-                Task { @MainActor in relay.host?.handleResize(viewport) }
-            }
+            // Ghostty fires this callback while a grid resize is still queued
+            // for its termio thread, i.e. *before* the grid is applied to
+            // terminal state. Announcing such a grid to the daemon would let
+            // the TUI's repaint race the local resize (the original stale-grid
+            // corruption), so this event is deliberately unused; applied grids
+            // arrive as mode 2048 in-band size reports through `write` instead.
+            resize: { _ in }
         )
 
         view = PedalsTerminalView(frame: .zero)
@@ -196,7 +205,20 @@ final class TerminalHost {
         muteInputUntil = Date().addingTimeInterval(0.5)
         session.receive(Data("\u{1b}c\u{1b}[3J".utf8))
         session.receive(data)
+        // Both the RIS above and any reset inside the replayed history clear
+        // mode 2048, which the applied-resize pipeline depends on. Re-arming
+        // also makes the emulator re-report its current grid, refreshing the
+        // daemon after the replay.
+        armSizeReports()
         kickRender()
+    }
+
+    /// Enable mode 2048 in-band size reports. Ghostty then reports each
+    /// applied grid resize through the host input channel — from the same
+    /// critical section that mutates terminal state — plus one immediate
+    /// report for the current grid. Idempotent.
+    private func armSizeReports() {
+        session.receive(TerminalSizeReport.enableSequence)
     }
 
     /// Surface the remote process exit inside the emulator.
@@ -205,27 +227,22 @@ final class TerminalHost {
         kickRender()
     }
 
-    /// This libghostty build never emits GHOSTTY_ACTION_RENDER for
-    /// host-managed writes, so nothing schedules a redraw when remote bytes
-    /// land (verified via TerminalDebugLog: writes reach the surface, zero
-    /// render callbacks follow). fitToSize() ends in requestImmediateTick,
-    /// making "remote data → one render pass" deterministic. The emulator
-    /// digests writes on a serial queue; the async hop orders the kick after
-    /// the enqueue without blocking the feed path.
     func kickRender() {
         DispatchQueue.main.async { [weak view] in
-            guard let view else { return }
-            view.fitToSize()
-            if ProcessInfo.processInfo.environment["PEDALS_GHOSTTY_DEBUG"] != nil {
-                let layers = (view.layer.sublayers ?? []).map {
-                    "\(type(of: $0)) f=\($0.frame) hid=\($0.isHidden) op=\($0.opacity)"
-                }
-                print("[pedals-dbg] view f=\(view.frame) hid=\(view.isHidden) win=\(view.window != nil) sublayers=\(layers)")
-            }
+            view?.fitToSize()
         }
     }
 
     private func handleInput(_ data: Data) {
+        // Mode 2048 size reports ride the input channel but are addressed to
+        // this host, not the remote pty: each one certifies that the emulator
+        // has applied the grid it describes.
+        let (data, reports) = TerminalSizeReport.extract(from: data)
+        for report in reports {
+            handleAppliedResize(report.viewport)
+        }
+        guard !data.isEmpty else { return }
+
         if let until = muteInputUntil {
             if Date() < until {
                 // Drop only the emulator's query replies. Keyboard input can
@@ -274,16 +291,29 @@ final class TerminalHost {
         }
     }
 
-    private func handleResize(_ viewport: InMemoryTerminalViewport) {
+    /// The emulator applied `viewport` to its grid (mode 2048 size report).
+    /// Only now is it safe to announce the size to the daemon: the repaint a
+    /// TUI answers with is guaranteed to be parsed against this grid, never a
+    /// stale smaller one that would clamp its cursor addressing.
+    private func handleAppliedResize(_ viewport: InMemoryTerminalViewport) {
         guard viewport.columns > 0, viewport.rows > 0 else { return }
 
+        noteViewportGeometry(viewport)
+
+        guard cols != viewport.columns || rows != viewport.rows else { return }
+        cols = viewport.columns
+        rows = viewport.rows
+        onResize?(viewport.columns, viewport.rows)
+    }
+
+    private func noteViewportGeometry(_ viewport: InMemoryTerminalViewport) {
         let previous = self.viewport
         self.viewport = viewport
 
         // A selection is tied to the exact Ghostty grid that produced its
         // snapshot. Reflowing it onto a different grid would make the boxes
         // drift from the glyphs, so end only genuinely geometry-changing
-        // selections. An identical session resize callback is harmless.
+        // selections. An identical resize notification is harmless.
         if let previous,
            previous.columns != viewport.columns
             || previous.rows != viewport.rows
@@ -292,11 +322,6 @@ final class TerminalHost {
         {
             selectionOverlay?.finish()
         }
-
-        guard cols != viewport.columns || rows != viewport.rows else { return }
-        cols = viewport.columns
-        rows = viewport.rows
-        onResize?(viewport.columns, viewport.rows)
     }
 
     private func beginTextSelection(_ request: TerminalTextSelectionRequest) {
@@ -365,14 +390,26 @@ final class TerminalHost {
 }
 
 extension TerminalHost: TerminalSurfaceGridResizeDelegate,
+    TerminalSurfaceLifecycleDelegate,
     TerminalSurfaceTextSelectionRequestDelegate
 {
+    func terminalDidAttachSurface(_ surface: TerminalSurface) {
+        // Arm as early as possible so the very first grid announcement to the
+        // daemon is already an applied one (the enable answers with a report
+        // of the surface's creation grid).
+        armSizeReports()
+    }
+
+    func terminalDidDetachSurface() {}
+
     func terminalDidResize(_ size: TerminalGridMetrics) {
-        // Unlike the in-memory session callback (which hops through Task), the
-        // delegate receives the surface's current metrics synchronously. This
-        // prevents a long press during keyboard/layout animation from starting
-        // against a stale grid.
-        handleResize(InMemoryTerminalViewport(
+        // The delegate reports the grid projected from the new view layout
+        // synchronously, before the emulator has applied it. That is exactly
+        // right for view-side geometry (a long press during a keyboard
+        // animation must not select against a stale grid), and exactly wrong
+        // for the daemon: `onResize` waits for the applied-resize report.
+        guard size.columns > 0, size.rows > 0 else { return }
+        noteViewportGeometry(InMemoryTerminalViewport(
             columns: size.columns,
             rows: size.rows,
             widthPixels: size.widthPixels,
@@ -380,6 +417,12 @@ extension TerminalHost: TerminalSurfaceGridResizeDelegate,
             cellWidthPixels: size.cellWidthPixels,
             cellHeightPixels: size.cellHeightPixels
         ))
+        // Self-heal: if anything (e.g. a reset in remote output) disabled
+        // mode 2048, re-arming here guarantees the grid this layout produces
+        // is eventually reported. Every enable also answers with a report of
+        // the applied grid, so no resize can be lost regardless of how this
+        // write interleaves with the pending grid application.
+        armSizeReports()
     }
 
     func terminalDidRequestTextSelection(_ request: TerminalTextSelectionRequest) {
@@ -400,10 +443,89 @@ final class PedalsTerminalView: TerminalView {
     private var focusTouchStartTimestamp: TimeInterval?
     private var focusTouchMaximumMovement: CGFloat = 0
     private var focusTouchIsEligible = false
+    /// KVO tokens watching Ghostty's IOSurface sublayers, keyed by layer
+    /// identity. See `syncSurfaceLayerScaleGuards()`.
+    private var surfaceLayerScaleGuards: [ObjectIdentifier: NSKeyValueObservation] = [:]
     var softwareKeyboardReturnHandler: (() -> Void)?
     var focusChangeHandler: ((Bool) -> Void)?
 
     override var inputView: UIView? { replacementInputView }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        // A resize can momentarily leave the IOSurface sublayer larger than
+        // the view; never let stale rows bleed outside the terminal area.
+        clipsToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        syncSurfaceLayerScaleGuards()
+    }
+
+    // MARK: - IOSurface layer scale ownership
+
+    /// Ghostty's IOSurfaceLayer rewrites its own `contentsScale` when an
+    /// asynchronously rendered frame lands after this view has resized (it
+    /// stretches the stale frame to fit rather than dropping it). Its
+    /// renderer then derives the next frame size from bounds × that adjusted
+    /// scale, so one late frame parks the surface in a self-consistently
+    /// mis-scaled state — the historic "shrunken canvas" — with no event left
+    /// to heal it.
+    ///
+    /// This view owns the display scale. Observe external writes and answer
+    /// each one by re-asserting the native scale and requesting a render
+    /// pass, which replaces the stale frame at the correct size.
+    private func syncSurfaceLayerScaleGuards() {
+        let sublayers = layer.sublayers ?? []
+        var seen = Set<ObjectIdentifier>()
+        for sublayer in sublayers {
+            let id = ObjectIdentifier(sublayer)
+            seen.insert(id)
+            guard surfaceLayerScaleGuards[id] == nil else { continue }
+            surfaceLayerScaleGuards[id] = sublayer.observe(
+                \.contentsScale
+            ) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.correctExternalSurfaceLayerMutation()
+                }
+            }
+        }
+        for id in surfaceLayerScaleGuards.keys where !seen.contains(id) {
+            surfaceLayerScaleGuards[id]?.invalidate()
+            surfaceLayerScaleGuards.removeValue(forKey: id)
+        }
+    }
+
+    private func correctExternalSurfaceLayerMutation() {
+        let scale = window?.screen.nativeScale
+            ?? max(1, traitCollection.displayScale)
+        guard let sublayers = layer.sublayers,
+              sublayers.contains(where: {
+                  $0.contentsScale != scale || $0.frame != bounds
+              })
+        else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for sublayer in sublayers {
+            if sublayer.contentsScale != scale {
+                sublayer.contentsScale = scale
+            }
+            if sublayer.frame != bounds {
+                sublayer.frame = bounds
+            }
+        }
+        CATransaction.commit()
+        // Redraw so the corrected geometry shows current content instead of
+        // the stale frame that triggered the adjustment.
+        fitToSize()
+    }
 
     override func insertText(_ text: String) {
         // `ghostty_surface_text` is a text/paste path, not a key path. Even if
@@ -562,6 +684,7 @@ final class PedalsTerminalView: TerminalView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         guard window != nil else { return }
+        syncSurfaceLayerScaleGuards()
 
         // A deliberate hold should select; even a small scroll should not.
         // Keep Ghostty's recognizer, but tighten its movement tolerance so the

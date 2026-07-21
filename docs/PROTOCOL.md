@@ -24,11 +24,12 @@ or replay buffers.
 host token.
 
 `POST /v2/clients` creates one installation identity and returns `clientId`,
-`clientToken`, and an independently generated `statusToken`. iOS keeps the
+`clientToken`, and an independently generated `statusToken`. iOS keeps its
 full `ClientIdentity` in the Keychain:
 
 - `clientToken` authorizes binding mutations and relay access. It stays in the
-  containing iPhone app and is never copied to an extension or Watch.
+  containing app and is never copied to an extension. The paired Watch uses a
+  separately registered client identity, never the iPhone's relay principal.
 - `statusToken` is a least-privilege credential for `/state` and push-endpoint
   registration. Only `clientId`, the service origin, and this token are copied
   to the app group and companion Watch.
@@ -91,6 +92,29 @@ encryption key material. `DELETE
 a client-targeted socket-revocation outbox row before the local key is removed.
 The Worker attempts closure immediately and cron retries transient Durable
 Object failures, so established sockets cannot outlive an unbind indefinitely.
+
+For terminal viewing, the iPhone registers an independent Watch client and
+reconciles its server-side edges through:
+
+```http
+PUT /v2/clients/me/delegated-bindings
+Authorization: Bearer <iphone-clientToken>
+Content-Type: application/json
+
+{"clientId":"<watch-clientId>","clientToken":"<watch-clientToken>"}
+```
+
+The Worker verifies both opaque client credentials, rejects self-delegation,
+records one `watch-terminal` child relationship, and makes the Watch client's
+binding set exactly equal to the iPhone client's current set. Removed edges
+commit client-targeted socket revocations in the same transaction. A later
+iPhone unbind removes the same computer edge from both principals atomically.
+Replacing a lost Watch identity revokes the prior identity and its sockets.
+The request contains no computer secret. After it succeeds,
+the iPhone transfers the independent Watch identity and its locally held E2EE
+`ComputerBinding` values over WatchConnectivity; the Watch stores them in its
+own Keychain. Thus simultaneous iPhone and Watch relay sockets have distinct
+principals and cannot replace one another.
 
 Neither the code nor either ephemeral private key is persisted. Pairing session
 rows contain only code hashes, public keys, ciphertext, identities, and expiry
@@ -297,7 +321,7 @@ frame = type(u8) || sessionId(u32 LE) || payload
 | `0x00` | ctl | both | UTF-8 control JSON |
 | `0x01` | stdin | client to host | raw PTY bytes |
 | `0x02` | stdout | host to client | raw PTY bytes |
-| `0x03` | resize | client to host | cols u16 LE, rows u16 LE |
+| `0x03` | resize | both | cols u16 LE, rows u16 LE |
 | `0x04` | replay | host to client | raw replay-buffer snapshot |
 
 Handshake control frames use `sessionId = 0` on every WebSocket channel:
@@ -317,6 +341,13 @@ ctl frame with `sessionId = 0`. The host answers with a current `replay` frame;
 this is how a reconnect recovers output because the relay never queues it.
 `stdin`, `stdout`, `resize`, and `replay` frames carry the authenticated URL's
 session ID and are rejected if it differs.
+
+After applying a client resize to the PTY, the host sends the authoritative
+`resize` frame back on the session channel before any `stdout` caused by the
+resulting `SIGWINCH`. The host also sends the current size immediately before a
+requested `replay`. Small renderers such as the Watch projection therefore
+update their grid before parsing cursor-addressed output, without relying on
+ordering from the separate control channel's `sessions` message.
 
 Terminal titles, paths, dimensions, and contents exist only inside these
 encrypted frames. Session IDs and alive flags are deliberately duplicated into

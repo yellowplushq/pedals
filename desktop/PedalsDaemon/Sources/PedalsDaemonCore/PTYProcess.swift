@@ -1,10 +1,11 @@
+import CPedalsPTY
 import Darwin
 import Foundation
 
 /// One shell process attached to a pseudo-terminal (PROTOCOL.md §6).
 ///
-/// The child is spawned with `posix_spawn` in a new session (`POSIX_SPAWN_SETSID`);
-/// opening the slave device by path as fd 0 makes it the controlling terminal.
+/// The child is spawned with `forkpty`, which creates a new session and makes
+/// the slave device its controlling terminal before executing the shell.
 /// Output and exit are delivered as callbacks on the queue passed to `init`.
 public final class PTYProcess: @unchecked Sendable {
     public enum PTYError: Error, CustomStringConvertible {
@@ -51,37 +52,7 @@ public final class PTYProcess: @unchecked Sendable {
         self.queue = queue
 
         var master: Int32 = -1
-        var slave: Int32 = -1
         var size = winsize(ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0)
-        guard openpty(&master, &slave, nil, nil, &size) == 0 else {
-            throw PTYError.openptyFailed(errno: errno)
-        }
-        defer { close(slave) }
-
-        guard let slavePathPointer = ttyname(slave) else {
-            close(master)
-            throw PTYError.openptyFailed(errno: ENOTTY)
-        }
-        let slavePath = String(cString: slavePathPointer)
-
-        var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
-        defer { posix_spawn_file_actions_destroy(&fileActions) }
-        // Opening the tty by path (as a fresh session leader) acquires it as
-        // the controlling terminal; a dup2 of an inherited fd would not.
-        posix_spawn_file_actions_addopen(&fileActions, 0, slavePath, O_RDWR, 0)
-        posix_spawn_file_actions_adddup2(&fileActions, 0, 1)
-        posix_spawn_file_actions_adddup2(&fileActions, 0, 2)
-        posix_spawn_file_actions_addclose(&fileActions, master)
-        posix_spawn_file_actions_addclose(&fileActions, slave)
-        posix_spawn_file_actions_addchdir_np(&fileActions, cwd)
-
-        var attributes: posix_spawnattr_t?
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        posix_spawnattr_setflags(
-            &attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
-        )
 
         var environment = ProcessInfo.processInfo.environment
         environment["TERM"] = "xterm-256color"
@@ -100,18 +71,34 @@ public final class PTYProcess: @unchecked Sendable {
         // deliberately owns this value so callers cannot re-enable the mark.
         environment["PROMPT_EOL_MARK"] = ""
 
-        let argv = ([shell] + arguments).map { strdup($0) } + [nil]
-        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        var argv = ([shell] + arguments).map { strdup($0) } + [nil]
+        var envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
         defer {
             argv.forEach { free($0) }
             envp.forEach { free($0) }
         }
 
-        var childPid: pid_t = 0
-        let rc = posix_spawn(&childPid, shell, &fileActions, &attributes, argv, envp)
-        guard rc == 0 else {
-            close(master)
-            throw PTYError.spawnFailed(errno: rc)
+        var childErrno: Int32 = 0
+        let childPid = argv.withUnsafeMutableBufferPointer { argvBuffer in
+            envp.withUnsafeMutableBufferPointer { envpBuffer in
+                shell.withCString { shellPointer in
+                    cwd.withCString { cwdPointer in
+                        pedals_forkpty_exec(
+                            &master,
+                            &size,
+                            shellPointer,
+                            argvBuffer.baseAddress,
+                            envpBuffer.baseAddress,
+                            cwdPointer,
+                            &childErrno
+                        )
+                    }
+                }
+            }
+        }
+        guard childPid > 0 else {
+            if master >= 0 { close(master) }
+            throw PTYError.spawnFailed(errno: childErrno != 0 ? childErrno : errno)
         }
 
         pid = childPid
@@ -270,15 +257,15 @@ public final class PTYProcess: @unchecked Sendable {
     /// Every process' `p_comm` in the shell's process group, for the title
     /// fallback (PROTOCOL.md §6).
     ///
-    /// `tcgetpgrp` on the pty *master* fd is unreliable on macOS (returns -1),
-    /// so we query the group led by the shell pid directly. A command launched
-    /// from the interactive shell keeps the shell's own process group, so
-    /// scanning that group surfaces it alongside the shell. Must be called on
-    /// the queue passed to `init`.
+    /// The controlling terminal tracks the foreground job's process group, so
+    /// this follows commands launched by an interactive shell instead of
+    /// assuming they remain in the shell's own group. Must be called on the
+    /// queue passed to `init`.
     public func foregroundProcessNames() -> [String] {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !closed else { return [] }
-        let pgid = pid
+        let pgid = tcgetpgrp(masterFD)
+        guard pgid > 0 else { return [] }
 
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid]
         var size = 0

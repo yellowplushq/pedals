@@ -1,11 +1,14 @@
 import Foundation
 import WatchConnectivity
 
-/// Phone-side transport for a read-only status credential and the freshest
-/// cached count. Call `activate()` at launch and `sendCurrentContext()` after
-/// credential, binding, or snapshot changes.
+/// Phone-side transport for the freshest status plus the relay/E2EE context
+/// used by the paired Watch app. Call `activate()` at launch and
+/// `sendCurrentContext()` after credential, binding, or snapshot changes.
 public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     public static let shared = IOSWatchConnectivityBridge()
+
+    private let contextLock = NSLock()
+    private var terminalContext: WatchTerminalContext?
 
     private override init() {
         super.init()
@@ -19,19 +22,37 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
     }
 
     public func sendCurrentContext() {
-        guard WCSession.isSupported(),
-              let credential = StatusSharedStore.credential()
-        else { return }
+        guard WCSession.isSupported() else { return }
         let session = WCSession.default
         guard session.activationState == .activated,
               session.isPaired,
               session.isWatchAppInstalled
         else { return }
-        let context = WatchStatusContext(
-            credential: credential,
-            snapshot: StatusSharedStore.snapshot()
+
+        var applicationContext = WatchTerminalContext.applicationContext(
+            currentTerminalContext()
         )
-        try? session.updateApplicationContext(context.applicationContext)
+        if let credential = StatusSharedStore.credential() {
+            let context = WatchStatusContext(
+                credential: credential,
+                snapshot: StatusSharedStore.snapshot()
+            )
+            applicationContext.merge(context.applicationContext) { _, new in new }
+        }
+        try? session.updateApplicationContext(applicationContext)
+    }
+
+    public func setTerminalContext(_ context: WatchTerminalContext?) {
+        contextLock.lock()
+        terminalContext = context
+        contextLock.unlock()
+        sendCurrentContext()
+    }
+
+    private func currentTerminalContext() -> WatchTerminalContext? {
+        contextLock.lock()
+        defer { contextLock.unlock() }
+        return terminalContext
     }
 
     public func session(

@@ -15,11 +15,7 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         let session = WCSession.default
         session.delegate = self
         session.activate()
-        if let context = WatchStatusContext(
-            applicationContext: session.receivedApplicationContext
-        ) {
-            apply(context: context)
-        }
+        applyDecoded(applicationContext: session.receivedApplicationContext)
     }
 
     nonisolated func session(
@@ -28,11 +24,18 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         error: Error?
     ) {
         guard activationState == .activated, error == nil else { return }
-        guard let context = WatchStatusContext(
-            applicationContext: session.receivedApplicationContext
-        ) else { return }
+        let applicationContext = session.receivedApplicationContext
+        let statusContext = WatchStatusContext(applicationContext: applicationContext)
+        let carriesTerminalContext = applicationContext[
+            WatchTerminalContext.applicationContextPresenceKey
+        ] as? Bool == true
+        let terminalContext = WatchTerminalContext(applicationContext: applicationContext)
         Task { @MainActor [weak self] in
-            self?.apply(context: context)
+            self?.apply(
+                statusContext: statusContext,
+                carriesTerminalContext: carriesTerminalContext,
+                terminalContext: terminalContext
+            )
         }
     }
 
@@ -40,15 +43,40 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         _ session: WCSession,
         didReceiveApplicationContext applicationContext: [String: Any]
     ) {
-        guard let context = WatchStatusContext(applicationContext: applicationContext) else {
-            return
-        }
+        let statusContext = WatchStatusContext(applicationContext: applicationContext)
+        let carriesTerminalContext = applicationContext[
+            WatchTerminalContext.applicationContextPresenceKey
+        ] as? Bool == true
+        let terminalContext = WatchTerminalContext(applicationContext: applicationContext)
         Task { @MainActor [weak self] in
-            self?.apply(context: context)
+            self?.apply(
+                statusContext: statusContext,
+                carriesTerminalContext: carriesTerminalContext,
+                terminalContext: terminalContext
+            )
         }
     }
 
-    private func apply(context: WatchStatusContext) {
+    private func applyDecoded(applicationContext: [String: Any]) {
+        apply(
+            statusContext: WatchStatusContext(applicationContext: applicationContext),
+            carriesTerminalContext: applicationContext[
+                WatchTerminalContext.applicationContextPresenceKey
+            ] as? Bool == true,
+            terminalContext: WatchTerminalContext(applicationContext: applicationContext)
+        )
+    }
+
+    private func apply(
+        statusContext context: WatchStatusContext?,
+        carriesTerminalContext: Bool,
+        terminalContext: WatchTerminalContext?
+    ) {
+        if carriesTerminalContext {
+            WatchTerminalStore.shared.install(terminalContext)
+        }
+        guard let context else { return }
+
         // Render the companion's freshest snapshot immediately. Credential
         // installation and endpoint delivery use short durable transactions
         // off MainActor and must never stall the Watch UI on network I/O.

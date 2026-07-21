@@ -656,6 +656,153 @@ describe("Pedals v2 Worker API", () => {
     expect((await connect(computer.computerId, client.clientToken)).response.status).toBe(401);
   });
 
+  test("a delegated client receives exactly the source bindings", async () => {
+    const firstComputer = await createComputer();
+    const secondComputer = await createComputer();
+    const staleComputer = await createComputer();
+    const source = await createClient();
+    const delegated = await createClient();
+    expect((await bind(source, firstComputer)).status).toBe(201);
+    expect((await bind(source, secondComputer)).status).toBe(201);
+    expect((await bind(delegated, staleComputer)).status).toBe(201);
+
+    const staleControl = await connect(staleComputer.computerId, delegated.clientToken);
+    expect(staleControl.response.status).toBe(101);
+    const synchronized = await apiJson("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: {
+        clientId: delegated.clientId,
+        clientToken: delegated.clientToken,
+      },
+    });
+    expect(synchronized.response.status).toBe(200);
+    expect(synchronized.value).toEqual({ bindingCount: 2 });
+    expect((await staleControl.peer.nextClose()).code).toBe(4003);
+    expect((await connect(staleComputer.computerId, delegated.clientToken)).response.status).toBe(401);
+    const firstControl = await connect(firstComputer.computerId, delegated.clientToken);
+    expect(firstControl.response.status).toBe(101);
+    expect((await connect(secondComputer.computerId, delegated.clientToken)).response.status).toBe(101);
+
+    const delegatedState = await state(delegated);
+    expect(delegatedState.computers.map((computer) => computer.id)).toEqual([
+      firstComputer.computerId,
+      secondComputer.computerId,
+    ].sort());
+    expect(
+      Number(
+        await env.DB.prepare(
+          `SELECT COUNT(*) AS count
+             FROM relay_revocation_outbox
+            WHERE kind = 'client' AND principal_id = ?1`,
+        ).bind(delegated.clientId).first("count"),
+      ),
+    ).toBe(0);
+    expect(
+      await env.DB.prepare(
+        `SELECT delegate_client_id AS delegateClientId
+           FROM client_delegates
+          WHERE parent_client_id = ?1 AND kind = 'watch-terminal'`,
+      ).bind(source.clientId).first("delegateClientId"),
+    ).toBe(delegated.clientId);
+
+    expect((await api(`/v2/clients/me/bindings/${firstComputer.computerId}`, {
+      method: "DELETE",
+      token: source.clientToken,
+    })).status).toBe(204);
+    expect((await firstControl.peer.nextClose()).code).toBe(4003);
+    expect((await connect(firstComputer.computerId, source.clientToken)).response.status).toBe(401);
+    expect((await connect(firstComputer.computerId, delegated.clientToken)).response.status).toBe(401);
+    expect((await connect(secondComputer.computerId, delegated.clientToken)).response.status).toBe(101);
+  });
+
+  test("replacing a Watch delegate revokes the previous identity and sockets", async () => {
+    const computer = await createComputer();
+    const source = await createClient();
+    const previous = await createClient();
+    const replacement = await createClient();
+    expect((await bind(source, computer)).status).toBe(201);
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: { clientId: previous.clientId, clientToken: previous.clientToken },
+    })).status).toBe(200);
+    const previousControl = await connect(computer.computerId, previous.clientToken);
+    expect(previousControl.response.status).toBe(101);
+
+    const synchronized = await apiJson("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: { clientId: replacement.clientId, clientToken: replacement.clientToken },
+    });
+    expect(synchronized.response.status).toBe(200);
+    expect(synchronized.value).toEqual({ bindingCount: 1 });
+    expect((await previousControl.peer.nextClose()).code).toBe(4003);
+    expect((await connect(computer.computerId, previous.clientToken)).response.status).toBe(401);
+    expect((await connect(computer.computerId, replacement.clientToken)).response.status).toBe(101);
+    expect(
+      await env.DB.prepare(
+        `SELECT revoked_at AS revokedAt FROM clients WHERE id = ?1`,
+      ).bind(previous.clientId).first("revokedAt"),
+    ).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        `SELECT delegate_client_id AS delegateClientId
+           FROM client_delegates
+          WHERE parent_client_id = ?1`,
+      ).bind(source.clientId).first("delegateClientId"),
+    ).toBe(replacement.clientId);
+  });
+
+  test("delegated binding synchronization requires both client credentials", async () => {
+    const source = await createClient();
+    const delegated = await createClient();
+    const unrelated = await createClient();
+
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      body: { clientId: delegated.clientId, clientToken: delegated.clientToken },
+    })).status).toBe(401);
+    const wrongToken = await apiJson("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: { clientId: delegated.clientId, clientToken: unrelated.clientToken },
+    });
+    expect(wrongToken.response.status).toBe(403);
+    expect(wrongToken.value.error.code).toBe("invalid_delegate");
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: { clientId: source.clientId, clientToken: source.clientToken },
+    })).status).toBe(400);
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: {
+        clientId: delegated.clientId,
+        clientToken: delegated.clientToken,
+        computerSecret: "must-never-be-accepted",
+      },
+    })).status).toBe(400);
+
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: source.clientToken,
+      body: { clientId: delegated.clientId, clientToken: delegated.clientToken },
+    })).status).toBe(200);
+    const otherSource = await createClient();
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: otherSource.clientToken,
+      body: { clientId: delegated.clientId, clientToken: delegated.clientToken },
+    })).status).toBe(403);
+    expect((await api("/v2/clients/me/delegated-bindings", {
+      method: "PUT",
+      token: delegated.clientToken,
+      body: { clientId: unrelated.clientId, clientToken: unrelated.clientToken },
+    })).status).toBe(403);
+  });
+
   test("client socket revocation survives a transient Durable Object failure", async () => {
     const computer = await createComputer();
     const client = await createClient();

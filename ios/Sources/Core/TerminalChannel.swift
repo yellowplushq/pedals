@@ -33,6 +33,11 @@ final class TerminalChannel {
     }
 
     var onPhase: ((Phase) -> Void)?
+    /// The daemon's relay socket vanished and came back while our own link
+    /// stayed up. Client→host frames sent in that window were dropped by the
+    /// relay with no error, so the owner must re-announce idempotent state
+    /// (the applied grid size).
+    var onHostRestored: (() -> Void)?
     var onReplay: ((Data) -> Void)?
     var onStdout: ((Data) -> Void)?
     /// LRU stamp for the connection pool.
@@ -109,6 +114,16 @@ final class TerminalChannel {
         if hostPresent {
             peerLossTask?.cancel()
             peerLossTask = nil
+            guard everLive else { return }
+            // While the host socket was gone the relay dropped our frames
+            // without an error. A fresh replay resynchronizes the stream (and
+            // flips a stuck `.reconnecting` back to `.live` — stdout is
+            // discarded until a replay lands); `onHostRestored` lets the owner
+            // re-announce the applied grid for blips too short to change phase.
+            if phase != .live {
+                link.send(.requestReplay)
+            }
+            onHostRestored?()
             return
         }
         guard phase == .live, peerLossTask == nil else { return }
@@ -128,7 +143,7 @@ final class TerminalChannel {
         // Defense in depth: per-channel keys already stop cross-channel
         // ciphertext at decrypt, so a data frame whose sid isn't ours can only
         // be a bug — drop it rather than render another session's output here.
-        if (frame.type == .replay || frame.type == .stdout),
+        if (frame.type == .replay || frame.type == .stdout || frame.type == .resize),
            frame.sessionId != UInt32(terminalID.sid) {
             return
         }
@@ -147,7 +162,11 @@ final class TerminalChannel {
             onStdout?(frame.payload)
         case .ctl:
             break
-        case .stdin, .resize:
+        case .resize:
+            // The iPhone owns this renderer's grid. Host resize echoes are for
+            // passive observers such as Watch and are intentionally ignored.
+            break
+        case .stdin:
             break // client→host only; ignore if mirrored back
         }
     }

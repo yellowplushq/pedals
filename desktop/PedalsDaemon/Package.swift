@@ -16,8 +16,13 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CPedalsPTY",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "PedalsDaemonCore",
             dependencies: [
+                "CPedalsPTY",
                 .product(name: "PedalsKit", package: "PedalsKit")
             ]
         ),

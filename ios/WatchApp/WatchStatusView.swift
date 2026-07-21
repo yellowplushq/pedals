@@ -2,12 +2,15 @@ import Combine
 import SwiftUI
 
 struct WatchStatusView: View {
+    let openTerminal: (WatchTerminalDescriptor) -> Void
+
+    @Environment(WatchTerminalStore.self) private var terminalStore
     @State private var snapshot = StatusSharedStore.snapshot()
     @State private var refreshing = false
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 8) {
+            LazyVStack(spacing: 8) {
                 Image(systemName: "terminal.fill")
                     .font(.title2)
                     .foregroundStyle(PedalsTheme.content)
@@ -38,6 +41,8 @@ struct WatchStatusView: View {
                         .font(.caption2)
                         .foregroundStyle(PedalsTheme.secondaryContent)
                 }
+
+                terminalLinks
             }
             .frame(maxWidth: .infinity)
         }
@@ -47,6 +52,47 @@ struct WatchStatusView: View {
         .task { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: StatusSharedStore.didChange)) { _ in
             snapshot = StatusSharedStore.snapshot()
+        }
+    }
+
+    @ViewBuilder
+    private var terminalLinks: some View {
+        Divider()
+            .padding(.vertical, 4)
+
+        if !terminalStore.hasCredentials {
+            Label("Open Pedals on iPhone", systemImage: "iphone.and.arrow.forward")
+                .font(.caption)
+                .foregroundStyle(PedalsTheme.secondaryContent)
+                .multilineTextAlignment(.center)
+        } else if terminalStore.computers.allSatisfy({ $0.terminals.isEmpty }) {
+            Text("No terminals available")
+                .font(.caption)
+                .foregroundStyle(PedalsTheme.secondaryContent)
+        } else {
+            ForEach(terminalStore.computers) { computer in
+                if !computer.terminals.isEmpty {
+                    Text(computer.name)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(PedalsTheme.secondaryContent)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    ForEach(computer.terminals) { terminal in
+                        Button {
+                            openTerminal(terminal)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: terminal.alive ? "terminal.fill" : "xmark.circle")
+                                Text(terminal.title)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .font(.caption)
+                        }
+                        .accessibilityLabel("Open terminal \(terminal.title) on \(computer.name)")
+                    }
+                }
+            }
         }
     }
 
