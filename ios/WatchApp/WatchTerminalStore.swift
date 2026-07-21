@@ -39,15 +39,23 @@ final class WatchTerminalStore {
     @ObservationIgnored private var connections: [String: WatchTerminalComputerConnection] = [:]
     @ObservationIgnored private var terminalSessions: [WatchTerminalID: WatchTerminalSession] = [:]
     @ObservationIgnored private var started = false
+    /// Highest update revision applied so far; stale WatchConnectivity
+    /// deliveries (durable applicationContext racing a fresher reply) must not
+    /// regress or wipe the installed credential.
+    @ObservationIgnored private var revision: UInt64 = 0
+    @ObservationIgnored private var lastCredentialRefreshRequest: Date?
 
     private init() {
-        if let stored = try? WatchTerminalCredentialStore.load() {
+        if let stored = WatchTerminalCredentialStore.load() {
+            revision = stored.revision
             replaceContext(stored, persist: false)
         }
     }
 
-    func install(_ context: WatchTerminalContext?) {
-        replaceContext(context, persist: true)
+    func install(_ update: WatchTerminalContextUpdate) {
+        guard update.revision >= revision else { return }
+        revision = update.revision
+        replaceContext(update.context, persist: true)
     }
 
     func start() {
@@ -106,7 +114,7 @@ final class WatchTerminalStore {
         hasCredentials = context != nil
 
         if persist {
-            try? WatchTerminalCredentialStore.save(context)
+            WatchTerminalCredentialStore.save(context)
         }
 
         if let context {
@@ -118,11 +126,25 @@ final class WatchTerminalStore {
                 connection.onChange = { [weak self] in
                     self?.publishComputers()
                 }
+                connection.onUnauthorized = { [weak self] in
+                    self?.requestCredentialRefresh()
+                }
                 connections[binding.computerID] = connection
                 if started { connection.start() }
             }
         }
         publishComputers()
+    }
+
+    /// The relay rejected our bearer: the phone has re-provisioned or revoked
+    /// this delegate. Ask the phone for the current context (throttled — every
+    /// affected connection reports the same rejection on every retry).
+    private func requestCredentialRefresh() {
+        let now = Date()
+        if let last = lastCredentialRefreshRequest,
+           now.timeIntervalSince(last) < 30 { return }
+        lastCredentialRefreshRequest = now
+        WatchStatusBridge.shared.requestCurrentContext()
     }
 
     private func publishComputers() {
@@ -166,6 +188,7 @@ final class WatchTerminalStore {
 private final class WatchTerminalComputerConnection {
     let binding: ComputerBinding
     var onChange: (() -> Void)?
+    var onUnauthorized: (() -> Void)?
 
     private let identity: ClientIdentity
     private var control: RelayLink?
@@ -224,6 +247,9 @@ private final class WatchTerminalComputerConnection {
         }
         control.onMetadata = { [weak self] metadata in
             MainActor.assumeIsolated { self?.handle(metadata: metadata) }
+        }
+        control.onUnauthorized = { [weak self] in
+            MainActor.assumeIsolated { self?.onUnauthorized?() }
         }
         self.control = control
         control.start()

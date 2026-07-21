@@ -1,11 +1,20 @@
 import Foundation
 import Security
 
+/// Keychain persistence for the Watch's relay context.
+///
+/// Loading is self-healing: any value that cannot be decoded AND validated is
+/// destroyed and reported as absent. A poisoned credential must never survive
+/// a launch — it would otherwise wedge the app permanently, because the next
+/// good context can only arrive after the app lives long enough to receive it.
 enum WatchTerminalCredentialStore {
-    private static let service = "air.build.pedals.watch-terminal.v1"
+    private static let service = "air.build.pedals.watch-terminal.v2"
+    private static let legacyServices = ["air.build.pedals.watch-terminal.v1"]
     private static let account = "relay-context"
 
-    static func load() throws -> WatchTerminalContext? {
+    static func load() -> WatchTerminalContext? {
+        purgeLegacy()
+
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -13,37 +22,42 @@ enum WatchTerminalCredentialStore {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        guard let context = try? JSONDecoder().decode(
+            WatchTerminalContext.self, from: data
+        ) else {
+            _ = SecItemDelete(baseQuery as CFDictionary)
+            return nil
         }
-        return try JSONDecoder().decode(WatchTerminalContext.self, from: data)
+        return context
     }
 
-    static func save(_ context: WatchTerminalContext?) throws {
-        guard let context else {
-            let status = SecItemDelete(baseQuery as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
-            }
+    static func save(_ context: WatchTerminalContext?) {
+        guard let context, let data = try? JSONEncoder().encode(context) else {
+            _ = SecItemDelete(baseQuery as CFDictionary)
             return
         }
 
-        let data = try JSONEncoder().encode(context)
         var attributes = baseQuery
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         let status = SecItemAdd(attributes as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            let update = SecItemUpdate(
+            _ = SecItemUpdate(
                 baseQuery as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
             )
-            guard update == errSecSuccess else {
-                throw NSError(domain: NSOSStatusErrorDomain, code: Int(update))
-            }
-        } else if status != errSecSuccess {
-            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+    }
+
+    private static func purgeLegacy() {
+        for legacyService in legacyServices {
+            _ = SecItemDelete([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: legacyService,
+                kSecAttrAccount as String: account,
+            ] as CFDictionary)
         }
     }
 

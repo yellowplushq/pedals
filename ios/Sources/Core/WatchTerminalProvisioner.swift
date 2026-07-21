@@ -78,7 +78,11 @@ final class WatchTerminalProvisioner {
             _ = try await api.synchronizeBindings(from: source, to: resolvedDelegate)
         }
 
-        return WatchTerminalContext(identity: resolvedDelegate, bindings: bindings)
+        return WatchTerminalContext(
+            identity: resolvedDelegate,
+            bindings: bindings,
+            revision: WatchTerminalContext.currentRevision
+        )
     }
 
     #if DEBUG

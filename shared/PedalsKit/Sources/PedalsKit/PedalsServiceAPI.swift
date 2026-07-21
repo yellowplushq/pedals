@@ -273,7 +273,7 @@ public final class PedalsServiceAPI: @unchecked Sendable {
         let response: CreateClientResponse = try await send(
             method: "POST", path: "/v2/clients"
         )
-        return ClientIdentity(
+        return try ClientIdentity(
             serviceURL: serviceURL,
             clientID: response.clientId,
             clientToken: response.clientToken,

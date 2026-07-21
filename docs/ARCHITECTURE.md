@@ -136,9 +136,30 @@ main app; terminal mutations remain inside the authenticated terminal UI.
 
 `PedalsWatch` is a companion watchOS 26 SwiftUI app. The phone transfers the
 read-only status credential and last snapshot using `WCSession` application
-context; no E2EE terminal secret is copied to Watch. After that initial
-transfer, the Watch can refresh the Worker directly when the phone is
-unavailable.
+context. For terminal viewing it also transfers the Watch's independent
+delegate relay identity plus E2EE `ComputerBinding` secrets as a versioned
+`WatchTerminalContext` (v2) envelope. After a transfer, the Watch talks to the
+Worker and relay directly and works with the phone unavailable.
+
+The v2 envelope is designed so a bad credential can never wedge the Watch:
+
+- Every field is validated on decode (`ClientIdentity`/`ComputerBinding`
+  decode through their throwing initializers); an invalid payload fails
+  decoding instead of materializing a value that traps in the connect path.
+- The phone stamps each update with a monotonic `revision`. The Watch ignores
+  older updates, so a durable-but-stale `applicationContext` delivery cannot
+  regress or wipe a fresher credential, and an undecodable payload is never
+  interpreted as "clear credentials".
+- The Watch Keychain store is self-healing: an item that fails decoding or
+  validation is deleted and treated as absent, and the Watch re-requests the
+  current context from the phone.
+- The phone only clears the Watch credential when the installation is
+  authoritatively unpaired; transient Keychain or network failures keep the
+  last-known-good context (the relay remains the enforcement point for
+  anything revoked server-side).
+- When the relay rejects the Watch's bearer (HTTP 401/403), the Watch asks the
+  phone for a fresh context (throttled), and the phone re-runs delegate
+  provisioning whenever the Watch asks.
 
 `PedalsWatchWidgets` implements circular, corner, rectangular, and inline
 complications/Smart Stack families. Its own iOS 26 `WidgetPushHandler` registers

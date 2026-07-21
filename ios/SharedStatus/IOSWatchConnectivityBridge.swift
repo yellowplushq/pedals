@@ -8,7 +8,8 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
     public static let shared = IOSWatchConnectivityBridge()
 
     private let contextLock = NSLock()
-    private var terminalContext: WatchTerminalContext?
+    private var terminalUpdate: WatchTerminalContextUpdate?
+    private var terminalContextRequestHandler: (@Sendable () -> Void)?
 
     private override init() {
         super.init()
@@ -19,6 +20,15 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
         let session = WCSession.default
         session.delegate = self
         session.activate()
+    }
+
+    /// Invoked (on an arbitrary queue) whenever the Watch asks for the current
+    /// context. The app uses this to re-run watch provisioning so a Watch that
+    /// holds a rejected or missing credential converges without user action.
+    public func setTerminalContextRequestHandler(_ handler: (@Sendable () -> Void)?) {
+        contextLock.lock()
+        terminalContextRequestHandler = handler
+        contextLock.unlock()
     }
 
     public func sendCurrentContext() {
@@ -32,23 +42,21 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
         try? session.updateApplicationContext(currentApplicationContext())
     }
 
-    public func setTerminalContext(_ context: WatchTerminalContext?) {
+    public func setTerminalContext(_ update: WatchTerminalContextUpdate) {
         contextLock.lock()
-        terminalContext = context
+        terminalUpdate = update
         contextLock.unlock()
         sendCurrentContext()
     }
 
-    private func currentTerminalContext() -> WatchTerminalContext? {
+    private func currentTerminalUpdate() -> WatchTerminalContextUpdate? {
         contextLock.lock()
         defer { contextLock.unlock() }
-        return terminalContext
+        return terminalUpdate
     }
 
     private func currentApplicationContext() -> [String: Any] {
-        var applicationContext = WatchTerminalContext.applicationContext(
-            currentTerminalContext()
-        )
+        var applicationContext = currentTerminalUpdate()?.applicationContext ?? [:]
         if let credential = StatusSharedStore.credential() {
             let context = WatchStatusContext(
                 credential: credential,
@@ -88,5 +96,12 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
             return
         }
         replyHandler(currentApplicationContext())
+        // The Watch asking is a repair opportunity: if the last provisioning
+        // attempt failed (or its credential was revoked server-side), a fresh
+        // sync produces a newer update that a later push delivers.
+        contextLock.lock()
+        let handler = terminalContextRequestHandler
+        contextLock.unlock()
+        handler?()
     }
 }

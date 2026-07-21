@@ -42,16 +42,17 @@ final class WatchTerminalProvisionerTests: XCTestCase {
 
     func testCreatesIndependentIdentityAndReusesItForLaterSynchronization() async throws {
         let memory = MemoryState()
-        let delegate = identity("b")
+        let delegate = try identity("b")
         let api = MockAPI(identities: [delegate])
         let provisioner = makeProvisioner(memory: memory, api: api)
-        let source = identity("a")
+        let source = try identity("a")
         let binding = try computer("1")
 
         let first = try await provisioner.context(source: source, bindings: [binding])
         let second = try await provisioner.context(source: source, bindings: [binding])
 
-        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.identity, second.identity)
+        XCTAssertEqual(first.bindings, second.bindings)
         XCTAssertEqual(first.identity, delegate)
         XCTAssertNotEqual(first.identity.clientID, source.clientID)
         XCTAssertEqual(api.createCount, 1)
@@ -64,7 +65,7 @@ final class WatchTerminalProvisionerTests: XCTestCase {
     func testRejectedDelegateIsReplacedAndSynchronizationRetried() async throws {
         let memory = MemoryState()
         memory.data = try JSONEncoder().encode(identity("b"))
-        let replacement = identity("c")
+        let replacement = try identity("c")
         let api = MockAPI(identities: [replacement])
         api.syncErrors = [
             PedalsServiceAPI.APIError.rejected(status: 403, message: "invalid delegate"),
@@ -73,7 +74,7 @@ final class WatchTerminalProvisionerTests: XCTestCase {
         let provisioner = makeProvisioner(memory: memory, api: api)
 
         let context = try await provisioner.context(
-            source: identity("a"),
+            source: try identity("a"),
             bindings: [try computer("1")]
         )
 
@@ -88,9 +89,9 @@ final class WatchTerminalProvisionerTests: XCTestCase {
 
     func testSourceIdentityIsNeverReusedAsWatchIdentity() async throws {
         let memory = MemoryState()
-        let source = identity("a")
+        let source = try identity("a")
         memory.data = try JSONEncoder().encode(source)
-        let replacement = identity("b")
+        let replacement = try identity("b")
         let api = MockAPI(identities: [replacement])
         let provisioner = makeProvisioner(memory: memory, api: api)
 
@@ -104,12 +105,12 @@ final class WatchTerminalProvisionerTests: XCTestCase {
     func testCorruptReplaceableIdentityIsRecovered() async throws {
         let memory = MemoryState()
         memory.data = Data("not-json".utf8)
-        let replacement = identity("b")
+        let replacement = try identity("b")
         let api = MockAPI(identities: [replacement])
         let provisioner = makeProvisioner(memory: memory, api: api)
 
         let context = try await provisioner.context(
-            source: identity("a"),
+            source: try identity("a"),
             bindings: []
         )
 
@@ -132,9 +133,9 @@ final class WatchTerminalProvisionerTests: XCTestCase {
         )
     }
 
-    private func identity(_ marker: String) -> ClientIdentity {
+    private func identity(_ marker: String) throws -> ClientIdentity {
         let id = repeating(marker)
-        return ClientIdentity(
+        return try ClientIdentity(
             serviceURL: URL(string: "https://relay.test")!,
             clientID: id,
             clientToken: "client-\(id)",

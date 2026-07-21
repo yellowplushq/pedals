@@ -20,8 +20,8 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
 
     /// `applicationContext` is the durable fallback, but it can represent an
     /// intermediate phone state. While both apps are reachable, ask for the
-    /// phone's current value so a Watch reinstall or transient provisioning
-    /// failure cannot leave an empty terminal context installed indefinitely.
+    /// phone's current value so a Watch reinstall, transient provisioning
+    /// failure, or revoked credential cannot leave the Watch wedged.
     func requestCurrentContext() {
         guard WCSession.isSupported() else { return }
         let session = WCSession.default
@@ -33,17 +33,13 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
                 let statusContext = WatchStatusContext(
                     applicationContext: applicationContext
                 )
-                let carriesTerminalContext = applicationContext[
-                    WatchTerminalContext.applicationContextPresenceKey
-                ] as? Bool == true
-                let terminalContext = WatchTerminalContext(
+                let terminalUpdate = WatchTerminalContextUpdate(
                     applicationContext: applicationContext
                 )
                 Task { @MainActor [weak self] in
                     self?.apply(
                         statusContext: statusContext,
-                        carriesTerminalContext: carriesTerminalContext,
-                        terminalContext: terminalContext
+                        terminalUpdate: terminalUpdate
                     )
                 }
             },
@@ -59,16 +55,11 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         guard activationState == .activated, error == nil else { return }
         let applicationContext = session.receivedApplicationContext
         let statusContext = WatchStatusContext(applicationContext: applicationContext)
-        let carriesTerminalContext = applicationContext[
-            WatchTerminalContext.applicationContextPresenceKey
-        ] as? Bool == true
-        let terminalContext = WatchTerminalContext(applicationContext: applicationContext)
+        let terminalUpdate = WatchTerminalContextUpdate(
+            applicationContext: applicationContext
+        )
         Task { @MainActor [weak self] in
-            self?.apply(
-                statusContext: statusContext,
-                carriesTerminalContext: carriesTerminalContext,
-                terminalContext: terminalContext
-            )
+            self?.apply(statusContext: statusContext, terminalUpdate: terminalUpdate)
             self?.requestCurrentContext()
         }
     }
@@ -78,16 +69,11 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         didReceiveApplicationContext applicationContext: [String: Any]
     ) {
         let statusContext = WatchStatusContext(applicationContext: applicationContext)
-        let carriesTerminalContext = applicationContext[
-            WatchTerminalContext.applicationContextPresenceKey
-        ] as? Bool == true
-        let terminalContext = WatchTerminalContext(applicationContext: applicationContext)
+        let terminalUpdate = WatchTerminalContextUpdate(
+            applicationContext: applicationContext
+        )
         Task { @MainActor [weak self] in
-            self?.apply(
-                statusContext: statusContext,
-                carriesTerminalContext: carriesTerminalContext,
-                terminalContext: terminalContext
-            )
+            self?.apply(statusContext: statusContext, terminalUpdate: terminalUpdate)
         }
     }
 
@@ -101,20 +87,18 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
     private func applyDecoded(applicationContext: [String: Any]) {
         apply(
             statusContext: WatchStatusContext(applicationContext: applicationContext),
-            carriesTerminalContext: applicationContext[
-                WatchTerminalContext.applicationContextPresenceKey
-            ] as? Bool == true,
-            terminalContext: WatchTerminalContext(applicationContext: applicationContext)
+            terminalUpdate: WatchTerminalContextUpdate(
+                applicationContext: applicationContext
+            )
         )
     }
 
     private func apply(
         statusContext context: WatchStatusContext?,
-        carriesTerminalContext: Bool,
-        terminalContext: WatchTerminalContext?
+        terminalUpdate: WatchTerminalContextUpdate?
     ) {
-        if carriesTerminalContext {
-            WatchTerminalStore.shared.install(terminalContext)
+        if let terminalUpdate {
+            WatchTerminalStore.shared.install(terminalUpdate)
         }
         guard let context else { return }
 

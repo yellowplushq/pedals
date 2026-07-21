@@ -149,7 +149,7 @@ final class PairingStoreRecoveryTests: XCTestCase {
     func testCorruptStateIsNotTreatedAsAnEmptyInstallation() async throws {
         let memory = MemoryState()
         memory.data = Data("not-json".utf8)
-        let api = MockAPI(identities: [identity(id: repeating("c"))])
+        let api = MockAPI(identities: [try identity(id: repeating("c"))])
         let store = makeStore(memory: memory, api: api)
 
         do {
@@ -233,8 +233,8 @@ final class PairingStoreRecoveryTests: XCTestCase {
     private func seededFixture() async throws -> Fixture {
         let memory = MemoryState()
         let api = MockAPI(identities: [
-            identity(id: oldClientID),
-            identity(id: replacementClientID),
+            try identity(id: oldClientID),
+            try identity(id: replacementClientID),
         ])
         let store = makeStore(memory: memory, api: api)
         _ = try await store.bind(code: pairingCode("1"), serviceURL: serviceURL)
@@ -249,8 +249,8 @@ final class PairingStoreRecoveryTests: XCTestCase {
         )
     }
 
-    private func identity(id: String) -> ClientIdentity {
-        ClientIdentity(
+    private func identity(id: String) throws -> ClientIdentity {
+        try ClientIdentity(
             serviceURL: serviceURL,
             clientID: id,
             clientToken: "token-\(id)",

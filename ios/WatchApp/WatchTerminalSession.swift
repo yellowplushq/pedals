@@ -18,6 +18,9 @@ final class WatchTerminalSession {
 
     @ObservationIgnored private let binding: ComputerBinding
     @ObservationIgnored private let identity: ClientIdentity
+    /// nil when the directory carried an ID outside the protocol's u32 space;
+    /// such a session can never connect, but it must not trap either.
+    @ObservationIgnored private let sessionID: UInt32?
     @ObservationIgnored private var link: RelayLink?
     @ObservationIgnored private var pipeline: WatchTerminalParserPipeline?
     @ObservationIgnored private var everLive = false
@@ -30,6 +33,7 @@ final class WatchTerminalSession {
         self.descriptor = descriptor
         self.binding = binding
         self.identity = identity
+        sessionID = UInt32(exactly: descriptor.id.sessionID)
         snapshot = TerminalTextProjection(
             cols: descriptor.cols,
             rows: descriptor.rows
@@ -46,6 +50,7 @@ final class WatchTerminalSession {
     }
 
     func start() {
+        guard let sessionID else { return }
         guard link == nil else {
             link?.kick()
             return
@@ -65,7 +70,7 @@ final class WatchTerminalSession {
             authorization: identity.clientToken,
             role: .client,
             principalID: identity.clientID,
-            channel: .session(sid: UInt32(descriptor.id.sessionID))
+            channel: .session(sid: sessionID)
         )
         link.onState = { [weak self] state in
             MainActor.assumeIsolated { self?.handle(state: state) }
@@ -99,7 +104,7 @@ final class WatchTerminalSession {
 
     private func handle(frame: Frame) {
         if (frame.type == .replay || frame.type == .stdout || frame.type == .resize),
-           frame.sessionId != UInt32(descriptor.id.sessionID)
+           frame.sessionId != sessionID
         {
             return
         }

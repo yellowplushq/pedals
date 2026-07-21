@@ -2,6 +2,10 @@ import Foundation
 
 /// Long-lived E2EE material for one computer. The Worker stores the identity
 /// and binding edge, but never this secret.
+///
+/// Every instance is validated: the memberwise initializer throws, and
+/// `Decodable` routes through it, so persisted or transported data can never
+/// materialize a binding that later traps the connection layer.
 public struct ComputerBinding: Codable, Equatable, Sendable {
     public static let computerIDLength = 32
     public static let secretByteCount = 32
@@ -32,15 +36,39 @@ public struct ComputerBinding: Codable, Equatable, Sendable {
         self.secret = secret
     }
 
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        do {
+            try self.init(
+                serviceURL: container.decode(URL.self, forKey: .serviceURL),
+                computerID: container.decode(String.self, forKey: .computerID),
+                secret: container.decode(Data.self, forKey: .secret)
+            )
+        } catch let error as ValidationError {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath,
+                debugDescription: "invalid computer binding: \(error)"
+            ))
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case serviceURL
+        case computerID
+        case secret
+    }
+
     public var relayURL: URL {
-        var components = URLComponents(url: serviceURL, resolvingAgainstBaseURL: false)!
+        guard var components = URLComponents(
+            url: serviceURL, resolvingAgainstBaseURL: false
+        ) else { return serviceURL }
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         components.query = nil
         components.fragment = nil
-        return components.url!
+        return components.url ?? serviceURL
     }
 
-    private static func isAllowedService(_ url: URL) -> Bool {
+    static func isAllowedService(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(),
               let host = url.host?.lowercased(),
               url.user == nil,
@@ -63,7 +91,18 @@ public struct HostIdentity: Codable, Equatable, Sendable {
     }
 }
 
+/// A relay client principal. Like `ComputerBinding`, instances are validated
+/// on construction and on decode: a canonical 32-hex client ID and well-formed
+/// bearer tokens are guaranteed everywhere one of these values exists.
 public struct ClientIdentity: Codable, Equatable, Sendable {
+    public static let clientIDLength = 32
+
+    public enum ValidationError: Error, Equatable {
+        case invalidService(String)
+        case invalidClientID(String)
+        case invalidToken
+    }
+
     public let serviceURL: URL
     public let clientID: String
     public let clientToken: String
@@ -74,11 +113,66 @@ public struct ClientIdentity: Codable, Equatable, Sendable {
         clientID: String,
         clientToken: String,
         statusToken: String
-    ) {
+    ) throws {
+        guard ComputerBinding.isAllowedService(serviceURL) else {
+            throw ValidationError.invalidService(serviceURL.absoluteString)
+        }
+        let normalizedID = clientID.lowercased()
+        guard Self.isCanonicalID(normalizedID) else {
+            throw ValidationError.invalidClientID(clientID)
+        }
+        guard Self.isValidToken(clientToken), Self.isValidToken(statusToken) else {
+            throw ValidationError.invalidToken
+        }
         self.serviceURL = serviceURL
-        self.clientID = clientID.lowercased()
+        self.clientID = normalizedID
         self.clientToken = clientToken
         self.statusToken = statusToken
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        do {
+            try self.init(
+                serviceURL: container.decode(URL.self, forKey: .serviceURL),
+                clientID: container.decode(String.self, forKey: .clientID),
+                clientToken: container.decode(String.self, forKey: .clientToken),
+                statusToken: container.decode(String.self, forKey: .statusToken)
+            )
+        } catch let error as ValidationError {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath,
+                debugDescription: "invalid client identity: \(error)"
+            ))
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case serviceURL
+        case clientID
+        case clientToken
+        case statusToken
+    }
+
+    /// Canonical relay principal: exactly 32 lowercase hexadecimal characters.
+    /// Client IDs and computer IDs share this shape.
+    public static func isCanonicalID(_ value: String) -> Bool {
+        let bytes = value.utf8
+        return bytes.count == clientIDLength && bytes.allSatisfy { byte in
+            (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte)
+                || (UInt8(ascii: "a") ... UInt8(ascii: "f")).contains(byte)
+        }
+    }
+
+    static func isValidToken(_ value: String) -> Bool {
+        let bytes = value.utf8
+        return (16 ... 512).contains(bytes.count) && bytes.allSatisfy { byte in
+            (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte)
+                || (UInt8(ascii: "A") ... UInt8(ascii: "Z")).contains(byte)
+                || (UInt8(ascii: "a") ... UInt8(ascii: "z")).contains(byte)
+                || byte == UInt8(ascii: "-")
+                || byte == UInt8(ascii: "_")
+        }
     }
 }
 

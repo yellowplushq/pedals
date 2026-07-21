@@ -42,6 +42,11 @@ final class AppServices {
     }
 
     func startSystemSurfaces() {
+        IOSWatchConnectivityBridge.shared.setTerminalContextRequestHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.synchronizeWatchTerminalContext()
+            }
+        }
         IOSWatchConnectivityBridge.shared.activate()
         TTYLiveActivityController.shared.startObservingPushTokens()
         PushEndpointRegistrar.requestFlush()
@@ -98,14 +103,17 @@ final class AppServices {
         let identity: ClientIdentity
         do {
             guard let storedIdentity = try pairingStore.loadClientIdentity() else {
+                // Authoritative: this installation is unpaired.
                 StatusSharedStore.removeCredential()
-                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+                IOSWatchConnectivityBridge.shared.setTerminalContext(
+                    .init(clearedAtRevision: WatchTerminalContext.currentRevision)
+                )
                 return
             }
             identity = storedIdentity
         } catch {
-            StatusSharedStore.removeCredential()
-            IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+            // A transient Keychain read failure is not evidence of unpairing;
+            // keep the Watch's last-known-good credential.
             return
         }
         let credential = PedalsStatusCredential(
@@ -126,13 +134,19 @@ final class AppServices {
         let bindings: [ComputerBinding]
         do {
             guard let identity = try pairingStore.loadClientIdentity() else {
-                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+                // Authoritative: unpaired, so the Watch must not keep a
+                // credential either.
+                IOSWatchConnectivityBridge.shared.setTerminalContext(
+                    .init(clearedAtRevision: WatchTerminalContext.currentRevision)
+                )
                 return
             }
             source = identity
             bindings = try pairingStore.loadAll()
         } catch {
-            IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+            // Transient Keychain failure: keep the Watch's last-known-good
+            // credential. The relay is the enforcement point for anything the
+            // phone may since have revoked.
             return
         }
 
@@ -144,12 +158,12 @@ final class AppServices {
                     bindings: bindings
                 )
                 guard !Task.isCancelled else { return }
-                IOSWatchConnectivityBridge.shared.setTerminalContext(context)
+                IOSWatchConnectivityBridge.shared.setTerminalContext(.init(context: context))
             } catch {
-                guard !Task.isCancelled else { return }
-                // Never give the Watch a credential whose authorization set
-                // could not be reconciled with the iPhone's current bindings.
-                IOSWatchConnectivityBridge.shared.setTerminalContext(nil)
+                // Provisioning needs the network; a failure here (offline,
+                // service hiccup) must not revoke a Watch credential that
+                // still works. The next foreground/bindings change retries,
+                // and the relay rejects anything actually revoked.
             }
         }
     }

@@ -30,6 +30,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     private let channelKind: Channel
     /// host role only: machine name announced in `hello`.
     private let hostName: String?
+    private let principalIsValid: Bool
 
     private let queue = DispatchQueue(label: "air.build.pedals.relaylink")
     private let callbackQueue: DispatchQueue
@@ -40,6 +41,11 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     /// Authenticated relay control-plane metadata. The Durable Object owns the
     /// terminal directory; peer terminal content remains in binary E2EE frames.
     public var onMetadata: (@Sendable (RelayMetadata) -> Void)?
+    /// Fired when the relay rejects the bearer credential (HTTP 401/403) at
+    /// the WebSocket upgrade. The link keeps retrying with backoff — a relay
+    /// deploy can 401 transiently — but the owner should treat this as a
+    /// signal to re-provision its credential.
+    public var onUnauthorized: (@Sendable () -> Void)?
     /// WebSocket ping RTT samples (seconds), roughly every 10 s while connected.
     public var onRoundTrip: (@Sendable (TimeInterval) -> Void)?
 
@@ -95,7 +101,12 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         self.computer = computer
         self.authorization = authorization
         self.role = role
-        precondition(RelaySourceEnvelope.isCanonicalPrincipal(principalID.lowercased()))
+        // A non-canonical principal can only come from invalid persisted or
+        // transported credentials. It must never crash the process: the link
+        // simply refuses to connect, and the owner's credential-refresh path
+        // (auth failure handling) replaces the bad identity.
+        self.principalIsValid = ClientIdentity.isCanonicalID(principalID.lowercased())
+        assert(self.principalIsValid, "non-canonical relay principal")
         self.principalID = principalID.lowercased()
         self.channelKind = channel
         self.hostName = hostName
@@ -113,7 +124,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
 
     public func start() {
         queue.async { [self] in
-            guard !started else { return }
+            guard principalIsValid, !started else { return }
             started = true
             reconnectAttempt = 0
             connectLocked()
@@ -266,6 +277,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
                     self.handleLocked(message: message)
                     self.receiveNext(socket: socket, generation: generation)
                 case .failure:
+                    self.notifyIfUnauthorizedLocked(socket: socket)
                     self.scheduleReconnectLocked()
                 }
             }
@@ -320,6 +332,14 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         pendingPeerOrder.removeAll()
         localNonce.removeAll(keepingCapacity: false)
         pendingClientFrames.removeAll()
+    }
+
+    private func notifyIfUnauthorizedLocked(socket: URLSessionWebSocketTask) {
+        guard let status = (socket.response as? HTTPURLResponse)?.statusCode,
+              status == 401 || status == 403,
+              let onUnauthorized
+        else { return }
+        callbackQueue.async { onUnauthorized() }
     }
 
     private func scheduleReconnectLocked() {
