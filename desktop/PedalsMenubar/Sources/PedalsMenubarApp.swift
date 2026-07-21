@@ -9,6 +9,7 @@ struct PedalsMenubarApp: App {
         Settings {
             SettingsView()
                 .environmentObject(appDelegate.updater)
+                .environmentObject(appDelegate.permissions)
         }
     }
 }
@@ -17,10 +18,15 @@ struct PedalsMenubarApp: App {
 final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     let updater = UpdaterModel()
+    let permissions = PermissionsModel()
 
     private var statusItemController: StatusItemController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItemController = StatusItemController(model: model, updater: updater)
+        statusItemController = StatusItemController(
+            model: model,
+            updater: updater,
+            permissions: permissions
+        )
     }
 }

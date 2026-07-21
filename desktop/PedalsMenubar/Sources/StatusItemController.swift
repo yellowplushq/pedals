@@ -6,6 +6,7 @@ import SwiftUI
 final class StatusItemController: NSObject, NSPopoverDelegate, NSMenuDelegate {
     private let model: AppModel
     private let updater: UpdaterModel
+    private let permissions: PermissionsModel
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private let contextMenu = NSMenu()
@@ -23,9 +24,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSMenuDelegate {
         NSStatusBar.system.thickness
     }
 
-    init(model: AppModel, updater: UpdaterModel) {
+    init(model: AppModel, updater: UpdaterModel, permissions: PermissionsModel) {
         self.model = model
         self.updater = updater
+        self.permissions = permissions
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -201,6 +203,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSMenuDelegate {
         let root = MenuView()
             .environmentObject(model)
             .environmentObject(updater)
+            .environmentObject(permissions)
         let hostingController = NSHostingController(rootView: root)
         hostingController.sizingOptions = [.preferredContentSize]
 

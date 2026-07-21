@@ -5,6 +5,7 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var updater: UpdaterModel
+    @EnvironmentObject private var permissions: PermissionsModel
     @State private var showingPairingCode = false
 
     var body: some View {
@@ -17,6 +18,10 @@ struct MenuView: View {
                 if showingPairingCode {
                     Divider()
                     pairingSection
+                }
+                if !permissions.allGranted {
+                    Divider()
+                    permissionsReminder
                 }
                 if let error = model.lastError {
                     Divider()
@@ -33,6 +38,9 @@ struct MenuView: View {
         .font(PedalsTheme.text)
         .background(PedalsTheme.canvas)
         .tint(PedalsTheme.content)
+        .onAppear {
+            permissions.refresh()
+        }
         .onDisappear {
             showingPairingCode = false
             model.schedulePairingRevocationAfterDefocus()
@@ -112,6 +120,28 @@ struct MenuView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
         }
+    }
+
+    // MARK: Permissions
+
+    private var permissionsReminder: some View {
+        SettingsLink {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(PedalsTheme.warning)
+                    .frame(width: 16)
+                Text("Finish permission setup for remote sessions")
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(PedalsTheme.content)
+        .help("Grant permissions so remote sessions never hit approval prompts")
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     private var pairingSection: some View {
