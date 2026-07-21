@@ -151,6 +151,26 @@ final class TerminalTextProjectionTests: XCTestCase {
         )
     }
 
+    func testViewportLinesContainOnlyTheCurrentTTYScreen() {
+        var projection = TerminalTextProjection(cols: 8, rows: 2)
+        projection.feed(Data("one\ntwo\nthree\nfour".utf8))
+
+        XCTAssertEqual(projection.snapshot.lines.map(\.text), ["one", "two", "three", "four"])
+        XCTAssertEqual(projection.snapshot.viewportLines.map(\.text), ["three", "four"])
+    }
+
+    func testViewportLineCountRemainsBoundedAcrossRepeatedResizes() {
+        var projection = TerminalTextProjection(cols: 8, rows: 4)
+        projection.feed(Data("one\ntwo\nthree\nfour".utf8))
+
+        for _ in 0 ..< 20 {
+            projection.resize(cols: 8, rows: 2)
+            XCTAssertLessThanOrEqual(projection.snapshot.viewportLines.count, 2)
+            projection.resize(cols: 8, rows: 7)
+            XCTAssertLessThanOrEqual(projection.snapshot.viewportLines.count, 7)
+        }
+    }
+
     func testAlternateScreenFlagTracksDECMode() {
         var projection = TerminalTextProjection(cols: 80, rows: 24)
         projection.feed(Data("\u{1B}[?1049hvim".utf8))

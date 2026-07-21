@@ -50,6 +50,7 @@ private struct WatchTerminalContent: View {
     }
 
     private enum ScrollTarget: Hashable {
+        case blank(Int)
         case line(UInt64)
         case bottom
     }
@@ -64,10 +65,7 @@ private struct WatchTerminalContent: View {
     let phase: WatchTerminalSession.Phase
 
     @State private var pinnedToBottom = true
-    /// A stable row near the center of the visible Watch viewport. Projection
-    /// line IDs survive a TTY resize, so this keeps the same terminal content
-    /// in view when a column change also changes the scaled font and row height.
-    @State private var visibleResizeAnchor: ScrollTarget?
+    @State private var scrollPosition: ScrollTarget? = .bottom
 
     var body: some View {
         GeometryReader { geometry in
@@ -87,61 +85,62 @@ private struct WatchTerminalContent: View {
                 / CGFloat(max(snapshot.columns, 1))
                 / Self.monospacedCellWidthRatio
         )
+        let viewportLines = snapshot.viewportLines
+        let unmaterializedRows = max(0, snapshot.rows - viewportLines.count)
 
-        return ScrollViewReader { proxy in
-            ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(snapshot.lines) { line in
-                        TerminalGridLineView(
-                            line: line,
-                            fontSize: fontSize,
-                            width: contentWidth
-                        )
-                        .id(ScrollTarget.line(line.id))
-                    }
+        return ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(viewportLines) { line in
+                    TerminalGridLineView(
+                        line: line,
+                        fontSize: fontSize,
+                        width: contentWidth
+                    )
+                    .id(ScrollTarget.line(line.id))
+                }
 
-                    Color.clear
-                        .frame(height: 1)
-                        .id(ScrollTarget.bottom)
+                // A sparse shell screen may not have touched every row yet.
+                // Keep those rows as real vertical space so the Watch always
+                // represents exactly one `snapshot.rows`-high TTY viewport.
+                ForEach(0 ..< unmaterializedRows, id: \.self) { row in
+                    TerminalGridLineView(
+                        line: .init(id: 0, text: ""),
+                        fontSize: fontSize,
+                        width: contentWidth
+                    )
+                    .id(ScrollTarget.blank(row))
                 }
-                .padding(.horizontal, Self.horizontalPadding)
-                .scrollTargetLayout()
+
+                Color.clear
+                    .frame(height: 1)
+                    .id(ScrollTarget.bottom)
             }
-            .defaultScrollAnchor(.bottom)
-            .onScrollGeometryChange(for: ScrollState.self) { geometry in
-                return ScrollState(
-                    atBottom: geometry.contentSize.height <= geometry.containerSize.height + 1
-                        || geometry.visibleRect.maxY >= geometry.contentSize.height - 12
-                )
-            } action: { _, new in
-                pinnedToBottom = new.atBottom
-            }
-            .onScrollTargetVisibilityChange(
-                idType: ScrollTarget.self,
-                threshold: 0.5
-            ) { targets in
-                let visibleLines = targets.filter {
-                    if case .line = $0 { return true }
-                    return false
-                }
-                visibleResizeAnchor = visibleLines.isEmpty
-                    ? nil
-                    : visibleLines[visibleLines.count / 2]
-            }
-            .onChange(of: snapshot.revision) { _, _ in
-                guard pinnedToBottom else { return }
-                proxy.scrollTo(ScrollTarget.bottom, anchor: .bottom)
-            }
-            .onChange(of: GridDimensions(
-                columns: snapshot.columns,
-                rows: snapshot.rows
-            )) { _, _ in
-                if pinnedToBottom {
-                    proxy.scrollTo(ScrollTarget.bottom, anchor: .bottom)
-                } else if let visibleResizeAnchor {
-                    proxy.scrollTo(visibleResizeAnchor, anchor: .center)
-                }
-            }
+            .padding(.horizontal, Self.horizontalPadding)
+            .scrollTargetLayout()
+        }
+        .defaultScrollAnchor(.bottom)
+        .scrollPosition(id: $scrollPosition, anchor: .bottom)
+        .onScrollGeometryChange(for: ScrollState.self) { geometry in
+            return ScrollState(
+                atBottom: geometry.contentSize.height <= geometry.containerSize.height + 1
+                    || geometry.visibleRect.maxY >= geometry.contentSize.height - 12
+            )
+        } action: { _, new in
+            pinnedToBottom = new.atBottom
+        }
+        .onChange(of: snapshot.revision) { _, _ in
+            guard pinnedToBottom else { return }
+            scrollPosition = .bottom
+        }
+        .onChange(of: GridDimensions(
+            columns: snapshot.columns,
+            rows: snapshot.rows
+        )) { _, _ in
+            // A TTY resize changes the coordinate space for every terminal
+            // row. Always leave scrollback browsing and follow the newly
+            // resized active screen at its bottom.
+            pinnedToBottom = true
+            scrollPosition = .bottom
         }
     }
 

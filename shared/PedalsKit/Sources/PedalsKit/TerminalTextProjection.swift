@@ -92,6 +92,14 @@ public struct TerminalTextProjection: Sendable {
         public var text: String {
             lines.map(\.text).joined(separator: "\n")
         }
+
+        /// Materialized rows in the current TTY viewport. `lines` also keeps
+        /// bounded scrollback for clients that need it; a fixed-screen
+        /// renderer must use this suffix so repeated height changes never
+        /// accumulate older screens in its scrollable content.
+        public var viewportLines: [Line] {
+            Array(lines.suffix(rows))
+        }
     }
 
     private enum Cell: Equatable, Sendable {
