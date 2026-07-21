@@ -594,6 +594,8 @@ final class PedalsTerminalView: TerminalView {
             return
         }
 
+        feedPointerPosition(at: touch.location(in: self))
+
         // Ghostty normally focuses on touch-down, before its pan and long-press
         // recognizers know what the user intended. Defer focus until a short,
         // stationary touch ends so scrolling and selection never summon the
@@ -711,6 +713,26 @@ final class PedalsTerminalView: TerminalView {
         ) {
             gesture.isEnabled = enabled
         }
+    }
+
+    /// Ghostty encodes wheel reports at the last known mouse position, and on
+    /// touch devices nothing feeds that position — it stays at the (-1, -1)
+    /// sentinel and the core silently drops every wheel event once a TUI
+    /// enables mouse reporting. Desktop terminals always have a cursor over
+    /// the surface; mirror that by feeding the finger location on touch-down.
+    ///
+    /// `contextMenuInteraction(_:configurationForMenuAtLocation:)` is the one
+    /// public entry point that forwards a position to the emulator. Its menu
+    /// side is inert here: the interaction below is never attached to a view,
+    /// and the returned configuration (nil without a native Ghostty
+    /// selection) is discarded.
+    private lazy var pointerPositionInteraction = UIContextMenuInteraction(delegate: self)
+
+    private func feedPointerPosition(at point: CGPoint) {
+        _ = contextMenuInteraction(
+            pointerPositionInteraction,
+            configurationForMenuAtLocation: point
+        )
     }
 
     private func resetFocusTouch() {
