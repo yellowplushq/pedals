@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .library(name: "PedalsDaemonCore", targets: ["PedalsDaemonCore"]),
+        // Internal debugging only — not part of external releases.
         .executable(name: "pedals", targets: ["pedals"]),
     ],
     dependencies: [

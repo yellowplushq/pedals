@@ -79,7 +79,9 @@ Do not assume that enabling the `APP_GROUPS` capability proves assignment.
   and service tests.
 - `shared/PedalsKit/`: v2 frame codec, pairing invitation, E2EE, and shared
   service API types.
-- `desktop/PedalsDaemon/`: macOS daemon and `pedals` command-line client.
+- `desktop/PedalsDaemon/`: macOS daemon and `pedals` command-line client. The
+  `pedals` CLI is for internal debugging only — never ship it in external
+  releases; the menu bar app is the only released desktop frontend.
 - `desktop/PedalsMenubar/`: macOS menu bar UI.
 - `ios/`: iPhone app, iPhone widgets, Live Activity/Dynamic Island, Watch app,
   Watch widgets, shared status code, entitlements, and XcodeGen project source.
