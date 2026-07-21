@@ -72,7 +72,7 @@ final class SessionManagerTests: XCTestCase {
 
     func testSessionIdsStartAtConfiguredHighWaterMark() throws {
         // Session-channel keys are derived from (secret, sid); a restarted
-        // daemon must never hand out an old sid (PROTOCOL.md §3).
+        // daemon must never hand out an old sid (PROTOCOL.md §4.1).
         var options = testOptions()
         options.firstSessionId = 7
         let allocated = LockedBox<Int>()

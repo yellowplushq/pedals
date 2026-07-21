@@ -1,12 +1,12 @@
 import Foundation
 
-/// Peer role, as carried in `hello.who` and the relay `role` query parameter.
+/// Peer role, as carried in `hello.who`; selects the local E2EE direction keys.
 public enum PeerRole: String, Codable, Sendable {
     case host
     case client
 }
 
-/// One entry of the `sessions` list (PROTOCOL.md §4).
+/// One entry of the `sessions` list (PROTOCOL.md §5).
 public struct SessionInfo: Codable, Equatable, Sendable {
     public var id: Int
     public var title: String
@@ -31,7 +31,7 @@ public struct SessionInfo: Codable, Equatable, Sendable {
     }
 }
 
-/// ctl JSON messages (PROTOCOL.md §4). Wire form is `{"t":"<kind>", ...}`.
+/// ctl JSON messages (PROTOCOL.md §5). Wire form is `{"t":"<kind>", ...}`.
 ///
 /// ctl only flows on the control channel. Data channels (one WebSocket per
 /// attached session) carry stdin/stdout/resize/replay; connecting a data

@@ -103,8 +103,8 @@ cd ../../desktop/PedalsDaemon
 swift test
 ```
 
-The expected suites currently contain 16 Node tests, 39 Worker tests, 57
-PedalsKit tests, and 33 daemon tests. A changed count is not automatically a
+The expected suites currently contain 24 Node tests, 49 Worker tests, 86
+PedalsKit tests, and 41 daemon tests. A changed count is not automatically a
 failure, but every discovered test must pass.
 
 Check the deployed v2 contract separately; it creates temporary identities and
@@ -285,8 +285,8 @@ validation, or the service contract.
 
 The preferred integration test creates isolated temporary daemon and D1 state,
 starts a local Worker, registers and binds a client, verifies TTY aggregation,
-pairs the simulator through the deep link, proves the encrypted relay handshake,
-and saves a screenshot:
+pairs the simulator by driving the pairing UI (typing the eight-digit code),
+proves the encrypted relay handshake, and saves a screenshot:
 
 ```bash
 SIM_DEVICE='iPhone 17 Pro' ./scripts/e2e.sh

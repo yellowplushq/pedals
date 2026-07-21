@@ -1,6 +1,6 @@
 import Foundation
 
-/// Plaintext frame per PROTOCOL.md §4:
+/// Plaintext frame per PROTOCOL.md §5:
 ///
 ///     frame = type (u8) || sessionId (u32 LE) || payload (bytes)
 public struct Frame: Equatable, Sendable {

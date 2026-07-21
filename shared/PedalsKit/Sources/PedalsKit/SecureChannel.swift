@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-/// Seals/opens full WebSocket binary messages per PROTOCOL.md §3:
+/// Seals/opens full WebSocket binary messages per PROTOCOL.md §4:
 ///
 ///     message = seq (u64 LE) || ChaChaPoly.seal(plaintextFrame,
 ///                                               key=direction key, aad=seq bytes).combined
@@ -40,7 +40,7 @@ public struct SecureChannel: Sendable {
     private static let minimumMessageLength = 8 + 12 + 16
 
     /// Derives both direction keys from the pairing secret for the given local
-    /// role, bound to `channel` so ciphertext cannot cross channels (§3).
+    /// role, bound to `channel` so ciphertext cannot cross channels (§4.3).
     public init(
         secret: Data, role: PeerRole,
         channel: KeyDerivation.Channel = .control,

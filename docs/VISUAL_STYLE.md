@@ -25,8 +25,8 @@ shape, and opacity without relying on color alone.
 
 Terminal ANSI output and user-selected Ghostty themes are content controlled by
 the remote program or the user; they are not application chrome and may use
-color. Theme/background swatches may preview those choices. Camera preview and
-monochrome pairing-code panels retain maximum contrast for readability.
+color. Theme/background swatches may preview those choices. Monochrome
+pairing-code panels retain maximum contrast for readability.
 
 When adding a surface, prefer semantic roles from `PedalsTheme`. A new hue needs
 an information-bearing purpose and must not duplicate meaning already conveyed

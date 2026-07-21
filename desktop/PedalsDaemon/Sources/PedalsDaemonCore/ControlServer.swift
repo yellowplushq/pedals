@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Newline-delimited JSON request on the daemon's unix control socket
-/// (PROTOCOL.md §5): `{"cmd":"ls"|"kill"|"pair"|"status"|"new", "id":N?}`.
+/// (PROTOCOL.md §7): `{"cmd":"ls"|"kill"|"pair"|"cancelPair"|"status"|"new", "id":N?}`.
 /// `reset` extends `pair` for `pedals pair --reset`.
 public struct ControlRequest: Decodable, Sendable {
     public var cmd: String

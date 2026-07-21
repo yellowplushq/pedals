@@ -11,7 +11,8 @@ struct TerminalID: Hashable, Sendable {
 }
 
 /// One terminal's live data connection: a `session` channel WebSocket opened
-/// lazily when the terminal is activated (PROTOCOL.md §1). Connecting sends
+/// lazily when the terminal is activated (PROTOCOL.md §3, frames per §5).
+/// Connecting sends
 /// `hello`, which makes the host replay scrollback and stream stdout; stdin
 /// and resize go out on the same socket. Pooled by `TerminalManager` — the
 /// least recently activated channels are stopped ("asleep") when too many

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-/// Direction keys per PROTOCOL.md §2/§3:
+/// Direction keys per PROTOCOL.md §4.1–§4.3:
 ///
 ///     key_h2c = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="host->client"<chan>, 32)
 ///     key_c2h = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="client->host"<chan>, 32)

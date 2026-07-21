@@ -10,7 +10,7 @@ implementation (`relay/test/crypto-ref.mjs`). All values are lowercase hex unles
 |--------|-------|
 | secret | 32 bytes of `0x42` — `4242…42` (×32) |
 
-## HKDF-SHA256 direction keys (PROTOCOL.md §2)
+## HKDF-SHA256 direction keys (PROTOCOL.md §4.1)
 
 `salt = "pedals-v2"` (UTF-8, 9 bytes), output length 32 bytes.
 
@@ -28,7 +28,7 @@ const key = Buffer.from(
   crypto.hkdfSync('sha256', secret, Buffer.from('pedals-v2'), Buffer.from('host->client'), 32));
 ```
 
-## Sealed message (PROTOCOL.md §3, direction host→client, key_h2c)
+## Sealed message (PROTOCOL.md §4, direction host→client, key_h2c)
 
 Nonces are random on the wire. This vector's nonce was **fixed once at generation time**
 (the ASCII string `pedals-nonce`, exactly 12 bytes) so both implementations can assert the
@@ -43,11 +43,16 @@ exact same blob; tests must *decrypt* this embedded message, never re-seal and c
 | ciphertext (10 bytes) | `94d3740a19c7dc465ace` |
 | Poly1305 tag (16 bytes) | `5279fe452d7a661383a99da076062944` |
 | combined (nonce ‖ ct ‖ tag) | `706564616c732d6e6f6e636594d3740a19c7dc465ace5279fe452d7a661383a99da076062944` |
-| **full WebSocket message** (seq ‖ combined) | `0100000000000000706564616c732d6e6f6e636594d3740a19c7dc465ace5279fe452d7a661383a99da076062944` |
+| **sealed message** (seq ‖ combined) | `0100000000000000706564616c732d6e6f6e636594d3740a19c7dc465ace5279fe452d7a661383a99da076062944` |
+
+This is the sealed message without its 16-byte routing-tag prefix, sealed with
+an empty AAD tag context (AAD = seq only). On the v2 wire (PROTOCOL.md §4),
+`RelayLink` prepends the routing tag and includes it in the AAD:
+`wire = routingTag(16) ‖ seq ‖ combined` with `AAD = routingTag ‖ seq`.
 
 Expected assertions in both suites:
 
-1. Opening the full message with `key_h2c` and AAD `0100000000000000` yields the plaintext
+1. Opening the sealed message with `key_h2c` and AAD `0100000000000000` yields the plaintext
    frame `000000000068656c6c6f` (ctl, sessionId 0, payload `hello`).
 2. Opening the same message a second time on the same channel fails (seq 1 is not
    strictly greater than the last accepted seq 1 — replay rejection).

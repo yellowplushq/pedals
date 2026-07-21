@@ -97,17 +97,20 @@ all bindings, then closes every live host/client WebSocket for that computer.
 Returns `204`. A seven-day hashed reset tombstone makes retrying the same reset
 with the same host token idempotent. The deletion transaction also commits a
 durable revocation outbox entry. The Worker attempts socket closure immediately
-and cron retries with bounded backoff until the per-computer Hub acknowledges
-it, so a transient Durable Object failure cannot strand access after reset.
+and cron retries with bounded backoff until the per-computer RelayChannel
+acknowledges it, so a transient Durable Object failure cannot strand access
+after reset.
 
 ### `DELETE /v2/clients/me/bindings/:computerId`
 
 Client control bearer required. The binding deletion and a client-targeted
 relay revocation outbox row commit in one D1 transaction. The Worker closes
-that client's existing control/session sockets immediately when possible; cron
-retries transient Durable Object failures until the Hub acknowledges closure.
-Repeating the deletion is idempotent. A later successful rebind clears any
-stale retry row before new relay access is authorized.
+that client's existing control/session sockets immediately when possible with
+code `4003`; a handshake racing the deletion is re-authorized inside the same
+actor and cannot survive. Cron retries transient Durable Object failures until
+the RelayChannel acknowledges closure. Repeating the deletion is idempotent. A
+later successful rebind clears any stale retry row before new relay access is
+authorized.
 
 ### `POST /v2/clients`
 
@@ -151,12 +154,6 @@ identity and its live sockets. The response is
 `{"bindingCount":<number>}`. The iPhone uses this for an independent Watch
 relay principal, then transfers the corresponding E2EE bindings directly with
 WatchConnectivity.
-
-### `DELETE /v2/clients/me/bindings/:computerId`
-
-Control `clientToken` required. Idempotent `204`. The per-computer Hub closes
-all of that client's control and session sockets with code `4003`; a handshake
-racing the deletion is re-authorized inside the same actor and cannot survive.
 
 ## Current state
 
@@ -211,7 +208,8 @@ computer. A client token grants the client role only while its D1 binding
 exists. Unknown query parameters, leading-zero session IDs, and IDs above
 `UInt32.max` are rejected.
 
-Each computer maps to one hibernatable Hub Durable Object; channel ownership is
+Each computer maps to one hibernatable RelayChannel Durable Object; channel
+ownership is
 kept in serialized socket attachments. This lets an unbind/reset revoke every
 live channel immediately. The newest host per channel replaces its predecessor;
 host binary frames broadcast only within that channel, client frames go to its
@@ -247,7 +245,8 @@ after connect, on each session-list change, and every 30 seconds:
 }
 ```
 
-Only the current authenticated host may mutate it. The Hub stores at most 255
+Only the current authenticated host may mutate it. The RelayChannel stores at
+most 255
 ordered unique `{id,alive}` entries and assigns a revision. Every control client
 receives the current value immediately on connect and after changes:
 
