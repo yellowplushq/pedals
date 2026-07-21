@@ -27,9 +27,16 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         let session = WCSession.default
         guard session.activationState == .activated, session.isReachable else { return }
 
+        // WatchConnectivity invokes the reply on its own utility queue. A
+        // closure formed in this MainActor-isolated method inherits that
+        // isolation, and the Swift runtime traps at its entry when it runs
+        // off-main (EXC_BREAKPOINT in _dispatch_assert_queue_fail — this
+        // crashed 1.0.1 (8) at launch whenever the phone was reachable).
+        // @Sendable severs the isolation inheritance; the body only builds
+        // Sendable values and hops to MainActor for the actual apply.
         session.sendMessage(
             [WatchTerminalContext.requestMessageKey: true],
-            replyHandler: { [weak self] applicationContext in
+            replyHandler: { @Sendable [weak self] applicationContext in
                 let statusContext = WatchStatusContext(
                     applicationContext: applicationContext
                 )
