@@ -49,7 +49,11 @@ struct WatchStatusView: View {
         .foregroundStyle(PedalsTheme.content)
         .tint(PedalsTheme.content)
         .navigationTitle("Pedals")
-        .task { await refresh() }
+        .task {
+            terminalStore.retryConnections()
+            WatchStatusBridge.shared.requestCurrentContext()
+            await refresh()
+        }
         .onReceive(NotificationCenter.default.publisher(for: StatusSharedStore.didChange)) { _ in
             snapshot = StatusSharedStore.snapshot()
         }

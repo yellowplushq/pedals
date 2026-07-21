@@ -53,6 +53,7 @@ final class AppServices {
         // Foregrounding is a durable retry opportunity after an extension was
         // suspended or a prior endpoint registration hit a transient failure.
         PushEndpointRegistrar.requestFlush()
+        synchronizeWatchTerminalContext()
         scheduleStatusRefresh(immediate: true)
     }
 

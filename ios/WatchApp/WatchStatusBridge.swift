@@ -18,6 +18,39 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
         applyDecoded(applicationContext: session.receivedApplicationContext)
     }
 
+    /// `applicationContext` is the durable fallback, but it can represent an
+    /// intermediate phone state. While both apps are reachable, ask for the
+    /// phone's current value so a Watch reinstall or transient provisioning
+    /// failure cannot leave an empty terminal context installed indefinitely.
+    func requestCurrentContext() {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+
+        session.sendMessage(
+            [WatchTerminalContext.requestMessageKey: true],
+            replyHandler: { [weak self] applicationContext in
+                let statusContext = WatchStatusContext(
+                    applicationContext: applicationContext
+                )
+                let carriesTerminalContext = applicationContext[
+                    WatchTerminalContext.applicationContextPresenceKey
+                ] as? Bool == true
+                let terminalContext = WatchTerminalContext(
+                    applicationContext: applicationContext
+                )
+                Task { @MainActor [weak self] in
+                    self?.apply(
+                        statusContext: statusContext,
+                        carriesTerminalContext: carriesTerminalContext,
+                        terminalContext: terminalContext
+                    )
+                }
+            },
+            errorHandler: nil
+        )
+    }
+
     nonisolated func session(
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
@@ -36,6 +69,7 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
                 carriesTerminalContext: carriesTerminalContext,
                 terminalContext: terminalContext
             )
+            self?.requestCurrentContext()
         }
     }
 
@@ -54,6 +88,13 @@ final class WatchStatusBridge: NSObject, WCSessionDelegate, @unchecked Sendable 
                 carriesTerminalContext: carriesTerminalContext,
                 terminalContext: terminalContext
             )
+        }
+    }
+
+    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        guard session.isReachable else { return }
+        Task { @MainActor [weak self] in
+            self?.requestCurrentContext()
         }
     }
 

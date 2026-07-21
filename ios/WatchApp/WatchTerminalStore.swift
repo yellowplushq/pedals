@@ -63,6 +63,14 @@ final class WatchTerminalStore {
         for session in terminalSessions.values { session.stop() }
     }
 
+    func retryConnections() {
+        guard started else {
+            start()
+            return
+        }
+        for connection in connections.values { connection.start() }
+    }
+
     func descriptor(for id: WatchTerminalID) -> WatchTerminalDescriptor? {
         computers.lazy.flatMap(\.terminals).first { $0.id == id }
     }

@@ -16,6 +16,11 @@ on:
         required: true
         default: Verify pairing, terminal synchronization, text selection, keyboard controls, widgets, Live Activities, and Apple Watch status.
         type: string
+      distribute_external:
+        description: Submit the build to external TestFlight Beta Review
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -42,6 +47,7 @@ jobs:
       PEDALS_REQUESTED_VERSION: ${{ inputs.marketing_version }}
       PEDALS_REQUESTED_BUILD: ${{ inputs.build_number }}
       PEDALS_TEST_NOTES: ${{ inputs.test_notes }}
+      PEDALS_DISTRIBUTE_EXTERNAL: ${{ inputs.distribute_external }}
       PEDALS_RELEASE_DIR: ${{ github.workspace }}/.artifacts/testflight-release
 
     steps:
@@ -399,7 +405,7 @@ jobs:
           test -s "$PEDALS_RELEASE_DIR/Pedals.ipa"
           shasum -a 256 "$PEDALS_RELEASE_DIR/Pedals.ipa"
 
-      - name: Publish to internal and external TestFlight
+      - name: Publish to internal TestFlight
         shell: bash
         run: |
           set -euo pipefail
@@ -430,9 +436,14 @@ jobs:
           jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
             "$PEDALS_RELEASE_DIR/internal-group-builds.json" >/dev/null
 
+      - name: Publish to external TestFlight
+        if: inputs.distribute_external
+        shell: bash
+        run: |
+          set -euo pipefail
           asc publish testflight \
             --app "$ASC_APP_ID" \
-            --build "$build_id" \
+            --build "$PEDALS_BUILD_ID" \
             --group "$PEDALS_EXTERNAL_GROUP_ID" \
             --wait \
             --notify \
@@ -446,7 +457,7 @@ jobs:
             --type builds \
             --paginate \
             --output json > "$PEDALS_RELEASE_DIR/external-group-builds.json"
-          jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
+          jq -e --arg build "$PEDALS_BUILD_ID" 'any(.data[]; .id == $build)' \
             "$PEDALS_RELEASE_DIR/external-group-builds.json" >/dev/null
 
       - name: Verify TestFlight state
@@ -463,11 +474,16 @@ jobs:
             '.data.id == $id and .data.attributes.processingState == "VALID"' \
             "$PEDALS_RELEASE_DIR/build-info.json" >/dev/null
 
-          asc testflight review submissions list \
-            --build-id "$PEDALS_BUILD_ID" \
-            --output json > "$PEDALS_RELEASE_DIR/beta-review.json"
-          external_state="$(jq -er '.data[0].attributes.betaReviewState' \
-            "$PEDALS_RELEASE_DIR/beta-review.json")"
+          distribution="internal"
+          external_state="not requested"
+          if [[ "$PEDALS_DISTRIBUTE_EXTERNAL" == "true" ]]; then
+            distribution="internal + external"
+            asc testflight review submissions list \
+              --build-id "$PEDALS_BUILD_ID" \
+              --output json > "$PEDALS_RELEASE_DIR/beta-review.json"
+            external_state="$(jq -er '.data[0].attributes.betaReviewState' \
+              "$PEDALS_RELEASE_DIR/beta-review.json")"
+          fi
 
           {
             echo "## Pedals TestFlight release"
@@ -475,7 +491,7 @@ jobs:
             echo "- Version: \`$PEDALS_RELEASE_VERSION ($PEDALS_RELEASE_BUILD)\`"
             echo "- Build ID: \`$PEDALS_BUILD_ID\`"
             echo "- Processing: \`VALID\`"
-            echo "- Distribution: \`internal + external\`"
+            echo "- Distribution: \`$distribution\`"
             echo "- Beta Review: \`$external_state\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

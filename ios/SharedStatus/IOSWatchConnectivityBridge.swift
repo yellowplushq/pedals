@@ -29,17 +29,7 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
               session.isWatchAppInstalled
         else { return }
 
-        var applicationContext = WatchTerminalContext.applicationContext(
-            currentTerminalContext()
-        )
-        if let credential = StatusSharedStore.credential() {
-            let context = WatchStatusContext(
-                credential: credential,
-                snapshot: StatusSharedStore.snapshot()
-            )
-            applicationContext.merge(context.applicationContext) { _, new in new }
-        }
-        try? session.updateApplicationContext(applicationContext)
+        try? session.updateApplicationContext(currentApplicationContext())
     }
 
     public func setTerminalContext(_ context: WatchTerminalContext?) {
@@ -53,6 +43,20 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
         contextLock.lock()
         defer { contextLock.unlock() }
         return terminalContext
+    }
+
+    private func currentApplicationContext() -> [String: Any] {
+        var applicationContext = WatchTerminalContext.applicationContext(
+            currentTerminalContext()
+        )
+        if let credential = StatusSharedStore.credential() {
+            let context = WatchStatusContext(
+                credential: credential,
+                snapshot: StatusSharedStore.snapshot()
+            )
+            applicationContext.merge(context.applicationContext) { _, new in new }
+        }
+        return applicationContext
     }
 
     public func session(
@@ -72,5 +76,17 @@ public final class IOSWatchConnectivityBridge: NSObject, WCSessionDelegate, @unc
 
     public func sessionWatchStateDidChange(_ session: WCSession) {
         sendCurrentContext()
+    }
+
+    public func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any],
+        replyHandler: @escaping ([String: Any]) -> Void
+    ) {
+        guard message[WatchTerminalContext.requestMessageKey] as? Bool == true else {
+            replyHandler([:])
+            return
+        }
+        replyHandler(currentApplicationContext())
     }
 }

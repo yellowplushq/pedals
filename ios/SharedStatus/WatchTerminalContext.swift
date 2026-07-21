@@ -7,6 +7,7 @@ import PedalsKit
 public struct WatchTerminalContext: Codable, Equatable, Sendable {
     public static let applicationContextKey = "pedals.terminal.context.v1"
     public static let applicationContextPresenceKey = "pedals.terminal.context.present.v1"
+    public static let requestMessageKey = "pedals.terminal.context.request.v1"
 
     public let identity: ClientIdentity
     public let bindings: [ComputerBinding]
