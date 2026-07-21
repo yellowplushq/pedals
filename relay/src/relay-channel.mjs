@@ -23,6 +23,17 @@ export const CLIENT_SOURCE_PRINCIPAL_BYTES = 32;
 export const CLIENT_SOURCE_ENVELOPE_BYTES = 1 + CLIENT_SOURCE_PRINCIPAL_BYTES;
 export const MAX_CLIENT_ACTIVE_CHANNELS = 16;
 export const MAX_HOST_ACTIVE_CHANNELS = 256;
+// HTTP long-poll transport (watchOS cannot open WebSockets over the Bluetooth
+// companion proxy; plain HTTP requests can). One poll session per
+// client-principal+channel mirrors the one-socket-per-channel WebSocket rule.
+export const HTTP_POLL_WAIT_MS = 20_000;
+export const HTTP_SESSION_IDLE_MS = 60_000;
+export const MAX_HTTP_QUEUE_BYTES = 2 * 1024 * 1024;
+export const MAX_HTTP_QUEUE_MESSAGES = 256;
+export const MAX_HTTP_BATCH_BYTES = 1024 * 1024;
+export const MAX_HTTP_SEND_WIRES = 64;
+const HTTP_SESSION_TOKEN = /^[0-9a-f]{32}$/;
+const HTTP_POLL_AFTER = /^(0|[1-9]\d{0,15})$/;
 
 const textEncoder = new TextEncoder();
 
@@ -144,6 +155,43 @@ function parseTrustedUpgrade(request) {
   return { computerId, channel, role, principalId };
 }
 
+function parseTrustedHttpOp(request) {
+  const op = request.headers.get("x-pedals-http-op");
+  if (op !== "poll" && op !== "send") return null;
+  if (op === "poll" && request.method !== "GET") return null;
+  if (op === "send" && request.method !== "POST") return null;
+  const computerId = request.headers.get("x-pedals-computer-id");
+  const channel = request.headers.get("x-pedals-channel");
+  const role = request.headers.get("x-pedals-role");
+  const principalId = request.headers.get("x-pedals-principal-id");
+  // The HTTP transport exists for clients that cannot hold a WebSocket; hosts
+  // always use sockets, so a host bearer on this surface is a protocol error.
+  if (!isId(computerId) || !channel || role !== "client" || !isId(principalId)) {
+    return null;
+  }
+  if (op === "send") {
+    return { op, computerId, channel, role, principalId };
+  }
+  const token = request.headers.get("x-pedals-poll-session");
+  if (typeof token !== "string" || !HTTP_SESSION_TOKEN.test(token)) return null;
+  const afterHeader = request.headers.get("x-pedals-poll-after");
+  let after = null;
+  if (afterHeader !== null && afterHeader !== "") {
+    if (!HTTP_POLL_AFTER.test(afterHeader)) return null;
+    after = Number(afterHeader);
+  }
+  return { op, computerId, channel, role, principalId, token, after };
+}
+
+function base64FromBytes(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+  }
+  return btoa(binary);
+}
+
 function parseInternalAction(request) {
   if (request.method !== "POST") return null;
   const path = new URL(request.url).pathname;
@@ -184,6 +232,11 @@ function authenticatedClientEnvelope(principalId, payload) {
 export class RelayChannel extends DurableObject {
   retiredSockets = new WeakSet();
   directoryTaskTail = Promise.resolve();
+  // key `${principalId}:${channel}` -> in-memory long-poll session. Lives and
+  // dies with the isolate: an evicted queue surfaces as `reset` on the next
+  // poll and the client redoes its E2EE handshake, exactly like a WebSocket
+  // reconnect.
+  httpSessions = new Map();
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -195,6 +248,21 @@ export class RelayChannel extends DurableObject {
     const action = parseInternalAction(request);
     if (action) {
       return this.ctx.blockConcurrencyWhile(async () => this.applyRevocation(action));
+    }
+
+    const httpOp = parseTrustedHttpOp(request);
+    if (httpOp) {
+      // Same revocation-race recheck as the upgrade path, but only the auth
+      // lookup may block the actor: a parked long-poll must keep receiving
+      // host events, so it waits outside blockConcurrencyWhile.
+      const authorized = await this.ctx.blockConcurrencyWhile(async () =>
+        this.identityStillAuthorized(httpOp),
+      );
+      if (!authorized) return new Response("unauthorized", { status: 401 });
+      this.sweepHttpSessions();
+      return httpOp.op === "send"
+        ? await this.handleHttpSend(httpOp, request)
+        : await this.handleHttpPoll(httpOp);
     }
 
     const identity = parseTrustedUpgrade(request);
@@ -340,6 +408,7 @@ export class RelayChannel extends DurableObject {
       for (const client of this.socketsFor(CLIENT_TAG, state.channel)) {
         this.safeSend(client, message);
       }
+      this.enqueueHttpBinary(state.channel, binary);
       return;
     }
 
@@ -609,6 +678,13 @@ export class RelayChannel extends DurableObject {
       }
       closed += 1;
     }
+    for (const session of [...this.httpSessions.values()]) {
+      if (action.type === "client" && session.principalId !== action.principalId) {
+        continue;
+      }
+      this.destroyHttpSession(session, new Response("unauthorized", { status: 401 }));
+      closed += 1;
+    }
     if (action.type === "computer") {
       await this.ctx.storage.delete(DIRECTORY_STORAGE_KEY);
       await this.ctx.storage.deleteAlarm();
@@ -677,12 +753,215 @@ export class RelayChannel extends DurableObject {
     for (const client of this.socketsFor(CLIENT_TAG, "control")) {
       this.safeSend(client, notice);
     }
+    this.enqueueHttpText("control", notice);
   }
 
   notifyChannelClients(channel, online) {
     const notice = this.channelState(online);
     for (const client of this.socketsFor(CLIENT_TAG, channel)) {
       this.safeSend(client, notice);
+    }
+    this.enqueueHttpText(channel, notice);
+  }
+
+  // HTTP long-poll transport
+
+  async handleHttpPoll(op) {
+    const key = `${op.principalId}:${op.channel}`;
+    const existing = this.httpSessions.get(key);
+    if (existing && existing.token === op.token) {
+      existing.expiresAt = Date.now() + HTTP_SESSION_IDLE_MS;
+      if (op.after !== null) this.ackHttpEntries(existing, op.after);
+      if (existing.entries.length > 0) return this.httpBatchResponse(existing);
+      return await this.parkHttpWaiter(existing);
+    }
+    if (op.after !== null) {
+      // The queue this cursor belongs to is gone (evicted isolate, idle
+      // expiry, or replacement). The client must redo its E2EE handshake.
+      return Response.json({ reset: true });
+    }
+    if (existing) {
+      // One poll session per client principal and channel, mirroring the
+      // WebSocket replacement rule.
+      this.destroyHttpSession(existing, Response.json({ reset: true }));
+    } else {
+      let held = 0;
+      for (const session of this.httpSessions.values()) {
+        if (session.principalId === op.principalId) held += 1;
+      }
+      if (held >= MAX_CLIENT_ACTIVE_CHANNELS) {
+        return new Response("active relay channel limit exceeded", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
+      }
+    }
+    const session = {
+      key,
+      token: op.token,
+      principalId: op.principalId,
+      channel: op.channel,
+      computerId: op.computerId,
+      entries: [],
+      lastSeq: 0,
+      queuedBytes: 0,
+      waiter: null,
+      expiresAt: Date.now() + HTTP_SESSION_IDLE_MS,
+    };
+    this.httpSessions.set(key, session);
+    const initial = op.channel === "control"
+      ? this.directoryMessage(await this.loadDirectory())
+      : this.channelState(this.hasActiveHostSlot(op.channel));
+    this.enqueueHttpEntry(session, "t", initial);
+    return this.httpBatchResponse(session);
+  }
+
+  async handleHttpSend(op, request) {
+    const body = new Uint8Array(await request.arrayBuffer());
+    if (body.byteLength > MAX_BINARY_BYTES + 4 * MAX_HTTP_SEND_WIRES) {
+      return new Response("payload too large", { status: 413 });
+    }
+    const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+    const wires = [];
+    let offset = 0;
+    while (offset < body.byteLength) {
+      if (offset + 4 > body.byteLength || wires.length >= MAX_HTTP_SEND_WIRES) {
+        return new Response("malformed wire batch", { status: 400 });
+      }
+      const length = view.getUint32(offset);
+      offset += 4;
+      if (
+        length === 0 ||
+        length > MAX_BINARY_BYTES ||
+        offset + length > body.byteLength
+      ) {
+        return new Response("malformed wire batch", { status: 400 });
+      }
+      wires.push(body.subarray(offset, offset + length));
+      offset += length;
+    }
+    if (wires.length === 0) {
+      return new Response("malformed wire batch", { status: 400 });
+    }
+    const host = this.activeHostForSend(op.channel);
+    if (host) {
+      for (const wire of wires) {
+        const envelope = authenticatedClientEnvelope(op.principalId, wire);
+        if (!envelope) return new Response("invalid relay principal", { status: 400 });
+        this.safeSend(host, envelope);
+      }
+    }
+    return new Response(null, { status: 204 });
+  }
+
+  enqueueHttpText(channel, text) {
+    for (const session of this.httpSessionsFor(channel)) {
+      this.enqueueHttpEntry(session, "t", text);
+    }
+  }
+
+  enqueueHttpBinary(channel, bytes) {
+    const sessions = this.httpSessionsFor(channel);
+    if (sessions.length === 0) return;
+    // Detach from the WebSocket message buffer before queueing.
+    const copy = new Uint8Array(bytes);
+    for (const session of sessions) {
+      this.enqueueHttpEntry(session, "b", copy);
+    }
+  }
+
+  httpSessionsFor(channel) {
+    const matched = [];
+    for (const session of this.httpSessions.values()) {
+      if (session.channel === channel) matched.push(session);
+    }
+    return matched;
+  }
+
+  enqueueHttpEntry(session, kind, data) {
+    session.lastSeq += 1;
+    session.entries.push({ seq: session.lastSeq, kind, data });
+    session.queuedBytes += kind === "b" ? data.byteLength : data.length;
+    if (
+      session.entries.length > MAX_HTTP_QUEUE_MESSAGES ||
+      session.queuedBytes > MAX_HTTP_QUEUE_BYTES
+    ) {
+      // A reader this far behind cannot be caught up losslessly; force a
+      // fresh handshake instead of silently dropping frames.
+      this.destroyHttpSession(session, Response.json({ reset: true }));
+      return;
+    }
+    if (session.waiter) {
+      session.expiresAt = Date.now() + HTTP_SESSION_IDLE_MS;
+      this.resolveHttpWaiter(session, this.httpBatchResponse(session));
+    }
+  }
+
+  ackHttpEntries(session, after) {
+    let removed = 0;
+    while (
+      removed < session.entries.length &&
+      session.entries[removed].seq <= after
+    ) {
+      const entry = session.entries[removed];
+      session.queuedBytes -= entry.kind === "b" ? entry.data.byteLength : entry.data.length;
+      removed += 1;
+    }
+    if (removed > 0) session.entries.splice(0, removed);
+  }
+
+  httpBatchResponse(session) {
+    const messages = [];
+    let batchBytes = 0;
+    let next = null;
+    for (const entry of session.entries) {
+      const size = entry.kind === "b" ? entry.data.byteLength : entry.data.length;
+      if (messages.length > 0 && batchBytes + size > MAX_HTTP_BATCH_BYTES) break;
+      messages.push(
+        entry.kind === "b" ? { b: base64FromBytes(entry.data) } : { t: entry.data },
+      );
+      batchBytes += size;
+      next = entry.seq;
+    }
+    return Response.json(next === null ? { messages } : { next, messages });
+  }
+
+  parkHttpWaiter(session) {
+    if (session.waiter) {
+      // A concurrent poll for the same session supersedes the parked one.
+      this.resolveHttpWaiter(session, Response.json({ messages: [] }));
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        session.waiter = null;
+        session.expiresAt = Date.now() + HTTP_SESSION_IDLE_MS;
+        resolve(Response.json({ messages: [] }));
+      }, HTTP_POLL_WAIT_MS);
+      session.waiter = { resolve, timer };
+    });
+  }
+
+  resolveHttpWaiter(session, response) {
+    const waiter = session.waiter;
+    if (!waiter) return;
+    session.waiter = null;
+    clearTimeout(waiter.timer);
+    waiter.resolve(response);
+  }
+
+  destroyHttpSession(session, response) {
+    if (this.httpSessions.get(session.key) === session) {
+      this.httpSessions.delete(session.key);
+    }
+    this.resolveHttpWaiter(session, response);
+  }
+
+  sweepHttpSessions() {
+    const now = Date.now();
+    for (const session of [...this.httpSessions.values()]) {
+      if (session.waiter === null && session.expiresAt < now) {
+        this.destroyHttpSession(session, Response.json({ reset: true }));
+      }
     }
   }
 }

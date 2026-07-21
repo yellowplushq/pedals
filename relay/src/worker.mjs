@@ -21,6 +21,9 @@ import { handleDesktopDownload, handleWebsiteAsset } from "./site.mjs";
 export { PushCoordinator, RelayChannel };
 
 const RELAY_PATH = /^\/v2\/relay\/([0-9a-f]{32})$/;
+const RELAY_HTTP_PATH = /^\/v2\/relay\/([0-9a-f]{32})\/http$/;
+const HTTP_SESSION_TOKEN = /^[0-9a-f]{32}$/;
+const HTTP_POLL_AFTER = /^(0|[1-9]\d{0,15})$/;
 const UINT32_MAX = 4_294_967_295;
 
 function workerVersionId(env) {
@@ -30,8 +33,8 @@ function workerVersionId(env) {
     : "unknown";
 }
 
-function parseRelayChannel(url) {
-  const allowed = new Set(["channel", "sid"]);
+function parseRelayChannel(url, extraKeys = []) {
+  const allowed = new Set(["channel", "sid", ...extraKeys]);
   for (const key of url.searchParams.keys()) {
     if (!allowed.has(key)) return null;
   }
@@ -53,6 +56,10 @@ function trustedRelayRequest(request, identity, computerId, channel) {
   headers.set("x-pedals-principal-id", identity.principalId);
   headers.set("x-pedals-computer-id", computerId);
   headers.set("x-pedals-channel", channel);
+  // Upgrades must never smuggle HTTP-transport routing into the actor.
+  headers.delete("x-pedals-http-op");
+  headers.delete("x-pedals-poll-session");
+  headers.delete("x-pedals-poll-after");
   return new Request(request, { headers });
 }
 
@@ -77,6 +84,64 @@ async function handleRelayUpgrade(request, env, url) {
 
   return env.RELAY_CHANNELS.getByName(computerId).fetch(
     trustedRelayRequest(request, identity, computerId, channel),
+  );
+}
+
+// HTTP long-poll relay transport for clients that cannot hold a WebSocket
+// (watchOS over the Bluetooth companion proxy). GET = poll, POST = send.
+async function handleRelayHttp(request, env, url) {
+  const match = RELAY_HTTP_PATH.exec(url.pathname);
+  const isPoll = request.method === "GET";
+  const channel = parseRelayChannel(url, isPoll ? ["session", "after"] : []);
+  if (!match || !channel) return new Response(null, { status: 400 });
+  const computerId = match[1];
+
+  let token = null;
+  let after = null;
+  if (isPoll) {
+    token = url.searchParams.get("session");
+    after = url.searchParams.get("after");
+    if (token === null || !HTTP_SESSION_TOKEN.test(token)) {
+      return new Response(null, { status: 400 });
+    }
+    if (after !== null && !HTTP_POLL_AFTER.test(after)) {
+      return new Response(null, { status: 400 });
+    }
+  }
+
+  const identity = await authorizeRelay(request, env.DB, computerId);
+  if (!identity) return apiError(401, "unauthorized", "relay access denied");
+  if (identity.role !== "client") {
+    return apiError(403, "forbidden", "hosts must use the WebSocket relay");
+  }
+  // A session-opening poll is the moral equivalent of a socket upgrade;
+  // continuation polls and sends ride the global request limiter only.
+  if (isPoll && after === null) {
+    const limiterKey = await rateLimitKey(
+      "relay-upgrade",
+      identity.role,
+      identity.principalId,
+      clientAddress(request),
+    );
+    await enforceRateLimit(env, "RELAY_UPGRADE_LIMITER", limiterKey, {
+      code: "relay_upgrade_rate_limited",
+      message: "too many relay connection attempts",
+    });
+    await touchClient(env.DB, identity.principalId);
+  }
+
+  const headers = new Headers(request.headers);
+  headers.set("x-pedals-role", identity.role);
+  headers.set("x-pedals-principal-id", identity.principalId);
+  headers.set("x-pedals-computer-id", computerId);
+  headers.set("x-pedals-channel", channel);
+  headers.set("x-pedals-http-op", isPoll ? "poll" : "send");
+  if (isPoll) {
+    headers.set("x-pedals-poll-session", token);
+    if (after !== null) headers.set("x-pedals-poll-after", after);
+  }
+  return env.RELAY_CHANNELS.getByName(computerId).fetch(
+    new Request(request, { headers }),
   );
 }
 
@@ -252,6 +317,13 @@ const worker = {
       }
 
       if (upgrading) return await handleRelayUpgrade(request, env, url);
+
+      if (
+        RELAY_HTTP_PATH.test(url.pathname) &&
+        (request.method === "GET" || request.method === "POST")
+      ) {
+        return await handleRelayHttp(request, env, url);
+      }
 
       if (
         (request.method === "GET" || request.method === "HEAD") &&

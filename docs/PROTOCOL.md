@@ -155,6 +155,46 @@ host-role `RelayLink` requires version `0x02`; client-role links receive the
 unchanged host E2EE wire. The 1 MiB peer-frame limit applies before this
 33-byte envelope is added.
 
+### 3.0 Client HTTP long-poll transport
+
+watchOS proxies plain HTTP through the paired iPhone's Bluetooth link but
+cannot open a WebSocket without a direct Wi-Fi/cellular path, so clients (and
+only clients — hosts always use WebSockets) may carry the identical wire
+protocol over HTTP:
+
+```text
+GET  /v2/relay/:computerId/http?channel=...&session=<32hex>[&after=<u53>]
+POST /v2/relay/:computerId/http?channel=...
+```
+
+Both verbs authenticate exactly like the upgrade (client bearer + active D1
+binding, rechecked inside the Durable Object). `GET` is a long poll: the first
+call with a fresh client-generated `session` token registers an in-memory
+queue keyed by `(principalId, channel)` — replacing that principal's previous
+queue like a WebSocket replacement — and immediately returns the same initial
+control-plane message a socket would receive (directory or channel-state).
+Later polls park up to 20 s and return:
+
+```json
+{ "next": 7, "messages": [{ "t": "<relay text>" }, { "b": "<base64 wire>" }] }
+```
+
+`after=<cursor>` acknowledges every message with sequence <= cursor; anything
+unacknowledged is redelivered on the next poll, so a response lost in transit
+cannot drop frames (E2EE replay protection discards duplicates the client
+already opened). A poll naming a session the Durable Object no longer holds
+(isolate eviction, 60 s idle expiry, replacement, or a >2 MiB / >256-message
+backlog) answers `{ "reset": true }`: the client must open a fresh transport
+and redo the E2EE handshake, exactly like a socket reconnect.
+
+`POST` bodies batch client-to-host wires as `u32be length || wire`, repeated
+(max 64 wires; each wire capped at the 1 MiB peer-frame limit). The Durable
+Object applies the same authenticated source envelope per wire before
+forwarding to the active host socket. Sends are serialized client-side, so
+uplink ordering matches the WebSocket transport. A session-opening poll is
+rate-limited like a socket upgrade; continuation polls and sends ride the
+global request limiter only.
+
 ### 3.1 Server-authoritative terminal directory
 
 The host and every bound client keep their authenticated `control` WebSocket

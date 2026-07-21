@@ -70,9 +70,18 @@ struct WatchStatusView: View {
                 .foregroundStyle(PedalsTheme.secondaryContent)
                 .multilineTextAlignment(.center)
         } else if terminalStore.computers.allSatisfy({ $0.terminals.isEmpty }) {
-            Text("No terminals available")
+            if terminalStore.computers.contains(where: { !$0.ready }) {
+                HStack(spacing: 6) {
+                    ProgressView()
+                    Text("Connecting…")
+                }
                 .font(.caption)
                 .foregroundStyle(PedalsTheme.secondaryContent)
+            } else {
+                Text("No terminals available")
+                    .font(.caption)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+            }
         } else {
             ForEach(terminalStore.computers) { computer in
                 if !computer.terminals.isEmpty {

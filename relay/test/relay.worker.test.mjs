@@ -2370,3 +2370,246 @@ describe("scheduled abuse cleanup and push reconciliation", () => {
     }
   });
 });
+
+describe("relay HTTP long-poll transport", () => {
+  function pollUrl(computerId, { channel = "control", sid, session, after } = {}) {
+    const query = new URLSearchParams({ channel });
+    if (sid !== undefined) query.set("sid", String(sid));
+    if (session !== undefined) query.set("session", session);
+    if (after !== undefined) query.set("after", String(after));
+    return `/v2/relay/${computerId}/http?${query}`;
+  }
+
+  async function poll(computerId, token, options = {}) {
+    const response = await api(pollUrl(computerId, options), { token });
+    return { response, value: response.status === 200 ? await response.json() : null };
+  }
+
+  function wireBatch(...wires) {
+    const total = wires.reduce((sum, wire) => sum + 4 + wire.byteLength, 0);
+    const body = new Uint8Array(total);
+    const view = new DataView(body.buffer);
+    let offset = 0;
+    for (const wire of wires) {
+      view.setUint32(offset, wire.byteLength);
+      body.set(wire, offset + 4);
+      offset += 4 + wire.byteLength;
+    }
+    return body;
+  }
+
+  async function send(computerId, token, body, { channel = "control", sid } = {}) {
+    const query = new URLSearchParams({ channel });
+    if (sid !== undefined) query.set("sid", String(sid));
+    return api(`/v2/relay/${computerId}/http?${query}`, {
+      method: "POST",
+      token,
+      rawBody: body,
+    });
+  }
+
+  function bytesFromBase64(encoded) {
+    const binary = atob(encoded);
+    const value = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      value[index] = binary.charCodeAt(index);
+    }
+    return value;
+  }
+
+  const sessionA = "a1".repeat(16);
+  const sessionB = "b2".repeat(16);
+
+  test("poll delivers directory, host frames, acks, and redelivery", async () => {
+    const computer = await createComputer();
+    const client = await createClient();
+    expect((await bind(client, computer)).status).toBe(201);
+    const host = await connect(computer.computerId, computer.hostToken);
+    expect(host.response.status).toBe(101);
+
+    const opened = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+    });
+    expect(opened.response.status).toBe(200);
+    expect(opened.value.messages).toHaveLength(1);
+    const initialDirectory = JSON.parse(opened.value.messages[0].t);
+    expect(initialDirectory.type).toBe("terminal-directory");
+    let cursor = opened.value.next;
+
+    host.peer.ws.send(hostSnapshot("Mac", runningSessions(2)));
+    const updated = await waitFor(async () => {
+      const result = await poll(computer.computerId, client.clientToken, {
+        session: sessionA,
+        after: cursor,
+      });
+      expect(result.response.status).toBe(200);
+      if (result.value.messages.length === 0) return null;
+      return result.value;
+    });
+    const directory = JSON.parse(updated.messages[0].t);
+    expect(directory.type).toBe("terminal-directory");
+    expect(directory.online).toBe(true);
+    expect(directory.hostName).toBe("Mac");
+
+    // Redelivery: the same cursor returns the same batch until acknowledged.
+    const redelivered = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+      after: cursor,
+    });
+    expect(redelivered.value.next).toBe(updated.next);
+    expect(redelivered.value.messages).toEqual(updated.messages);
+    cursor = updated.next;
+
+    const frame = bytes(64, 7);
+    host.peer.ws.send(frame);
+    const binaryBatch = await waitFor(async () => {
+      const result = await poll(computer.computerId, client.clientToken, {
+        session: sessionA,
+        after: cursor,
+      });
+      if (result.value.messages.length === 0) return null;
+      return result.value;
+    });
+    expect(binaryBatch.messages).toHaveLength(1);
+    expect(bytesFromBase64(binaryBatch.messages[0].b)).toEqual(frame);
+
+    const wireOne = bytes(48, 1);
+    const wireTwo = bytes(32, 2);
+    const sent = await send(
+      computer.computerId,
+      client.clientToken,
+      wireBatch(wireOne, wireTwo),
+    );
+    expect(sent.status).toBe(204);
+    const first = decodeClientSourceEnvelope(await host.peer.nextBinary());
+    expect(first.principalId).toBe(client.clientId);
+    expect(new Uint8Array(first.wire)).toEqual(wireOne);
+    const second = decodeClientSourceEnvelope(await host.peer.nextBinary());
+    expect(new Uint8Array(second.wire)).toEqual(wireTwo);
+    closeAll(host.peer);
+  });
+
+  test("session channels receive channel-state and stay isolated", async () => {
+    const computer = await createComputer();
+    const client = await createClient();
+    expect((await bind(client, computer)).status).toBe(201);
+    const host = await connect(computer.computerId, computer.hostToken, "session", 7);
+    expect(host.response.status).toBe(101);
+
+    const online = await poll(computer.computerId, client.clientToken, {
+      channel: "session",
+      sid: 7,
+      session: sessionA,
+    });
+    expect(online.response.status).toBe(200);
+    expect(JSON.parse(online.value.messages[0].t)).toEqual({
+      type: "channel-state",
+      online: true,
+    });
+
+    const offline = await poll(computer.computerId, client.clientToken, {
+      channel: "session",
+      sid: 9,
+      session: sessionB,
+    });
+    expect(JSON.parse(offline.value.messages[0].t)).toEqual({
+      type: "channel-state",
+      online: false,
+    });
+    closeAll(host.peer);
+  });
+
+  test("rejects bad bearers, host bearers, and malformed requests", async () => {
+    const computer = await createComputer();
+    const client = await createClient();
+    expect((await bind(client, computer)).status).toBe(201);
+
+    const hostBearer = await poll(computer.computerId, computer.hostToken, {
+      session: sessionA,
+    });
+    expect(hostBearer.response.status).toBe(403);
+
+    const badBearer = await poll(computer.computerId, "0".repeat(64), {
+      session: sessionA,
+    });
+    expect(badBearer.response.status).toBe(401);
+
+    const missingSession = await api(
+      `/v2/relay/${computer.computerId}/http?channel=control`,
+      { token: client.clientToken },
+    );
+    expect(missingSession.status).toBe(400);
+
+    const badAfter = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+      after: "07",
+    });
+    expect(badAfter.response.status).toBe(400);
+
+    const truncated = wireBatch(bytes(16)).slice(0, 12);
+    expect(
+      (await send(computer.computerId, client.clientToken, truncated)).status,
+    ).toBe(400);
+    expect(
+      (await send(computer.computerId, client.clientToken, new Uint8Array(0))).status,
+    ).toBe(400);
+
+    const unknownCursor = await poll(computer.computerId, client.clientToken, {
+      session: sessionB,
+      after: 3,
+    });
+    expect(unknownCursor.response.status).toBe(200);
+    expect(unknownCursor.value).toEqual({ reset: true });
+  });
+
+  test("a new session token replaces the previous session", async () => {
+    const computer = await createComputer();
+    const client = await createClient();
+    expect((await bind(client, computer)).status).toBe(201);
+
+    const first = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+    });
+    expect(first.response.status).toBe(200);
+    const replacement = await poll(computer.computerId, client.clientToken, {
+      session: sessionB,
+    });
+    expect(replacement.response.status).toBe(200);
+    expect(replacement.value.messages).toHaveLength(1);
+
+    const stale = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+      after: first.value.next,
+    });
+    expect(stale.value).toEqual({ reset: true });
+  });
+
+  test("binding deletion resolves a parked poll with 401", async () => {
+    const computer = await createComputer();
+    const client = await createClient();
+    expect((await bind(client, computer)).status).toBe(201);
+
+    const opened = await poll(computer.computerId, client.clientToken, {
+      session: sessionA,
+    });
+    expect(opened.response.status).toBe(200);
+
+    const parked = api(
+      pollUrl(computer.computerId, { session: sessionA, after: opened.value.next }),
+      { token: client.clientToken },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const removed = await api(`/v2/clients/me/bindings/${computer.computerId}`, {
+      method: "DELETE",
+      token: client.clientToken,
+    });
+    expect(removed.status).toBe(204);
+    expect((await parked).status).toBe(401);
+
+    const rebound = await poll(computer.computerId, client.clientToken, {
+      session: sessionB,
+    });
+    expect(rebound.response.status).toBe(401);
+  });
+});

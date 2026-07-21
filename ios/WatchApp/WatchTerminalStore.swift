@@ -20,6 +20,11 @@ struct WatchTerminalComputer: Identifiable, Equatable, Sendable {
     let id: String
     var name: String
     var online: Bool
+    /// False until this connection has received enough relay state to make
+    /// `terminals` authoritative: the directory, plus the host's session list
+    /// whenever the directory says the host is online. Before that an empty
+    /// list means "still connecting", not "no terminals".
+    var ready: Bool
     var terminals: [WatchTerminalDescriptor]
 }
 
@@ -199,6 +204,7 @@ private final class WatchTerminalComputerConnection {
     private var directoryEntries: [Int: Bool] = [:]
     private var peerSessions: [SessionInfo] = []
     private var visibleSessions: [SessionInfo] = []
+    private var receivedSessions = false
 
     init(binding: ComputerBinding, identity: ClientIdentity) {
         self.binding = binding
@@ -211,6 +217,7 @@ private final class WatchTerminalComputerConnection {
             id: binding.computerID,
             name: name,
             online: hostOnline,
+            ready: directoryRevision != nil && (!hostOnline || receivedSessions),
             terminals: visibleSessions.map { session in
                 WatchTerminalDescriptor(
                     id: WatchTerminalID(
@@ -274,6 +281,7 @@ private final class WatchTerminalComputerConnection {
             if let host, !host.isEmpty { hostName = host }
         case .sessions(let list):
             peerSessions = list
+            receivedSessions = true
             applyDirectory()
         case .title(let id, let title):
             if let index = peerSessions.firstIndex(where: { $0.id == id }) {

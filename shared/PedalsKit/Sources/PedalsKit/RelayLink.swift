@@ -21,6 +21,24 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         case connected
     }
 
+    public enum TransportKind: Equatable, Sendable {
+        case webSocket
+        /// Long-poll GET + batched POST against `/v2/relay/<id>/http`. Same
+        /// E2EE wire protocol; only the carrier differs.
+        case httpLongPoll
+
+        /// watchOS proxies plain HTTP through the paired iPhone's Bluetooth
+        /// link but cannot open a WebSocket without a direct network path,
+        /// so it always uses the HTTP transport.
+        public static var platformDefault: TransportKind {
+            #if os(watchOS)
+            .httpLongPoll
+            #else
+            .webSocket
+            #endif
+        }
+    }
+
     private let computer: ComputerBinding
     private let authorization: String
     private let role: PeerRole
@@ -31,6 +49,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     /// host role only: machine name announced in `hello`.
     private let hostName: String?
     private let principalIsValid: Bool
+    private let transportKind: TransportKind
 
     private let queue = DispatchQueue(label: "air.build.pedals.relaylink")
     private let callbackQueue: DispatchQueue
@@ -51,6 +70,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
 
     private var urlSession: URLSession!
     private var socket: URLSessionWebSocketTask?
+    private var httpTransport: RelayHTTPTransport?
     /// Long-term-key channel used exclusively for fresh-nonce hello frames.
     private var bootstrapChannel: SecureChannel?
     /// Connection-bound peer channels keyed by their public 16-byte routing tag.
@@ -104,11 +124,13 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         principalID: String,
         channel: Channel,
         hostName: String? = nil,
+        transport: TransportKind = .platformDefault,
         callbackQueue: DispatchQueue = .main
     ) {
         self.computer = computer
         self.authorization = authorization
         self.role = role
+        self.transportKind = transport
         // A non-canonical principal can only come from invalid persisted or
         // transported credentials. It must never crash the process: the link
         // simply refuses to connect, and the owner's credential-refresh path
@@ -235,6 +257,22 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         return components.url
     }
 
+    /// The long-poll variant of `relayURL()`; poll parameters are appended by
+    /// the transport itself. Bindings carry a WebSocket `wss`/`ws` relay URL,
+    /// which URLSession data tasks reject as unsupported.
+    private func httpRelayURL() -> URL? {
+        guard let base = relayURL(),
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        else { return nil }
+        switch components.scheme?.lowercased() {
+        case "wss": components.scheme = "https"
+        case "ws": components.scheme = "http"
+        default: break
+        }
+        components.path += "/http"
+        return components.url
+    }
+
     private var keyChannel: KeyDerivation.Channel {
         switch channelKind {
         case .control: .control
@@ -261,18 +299,51 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         pendingPeerOrder.removeAll(keepingCapacity: true)
         pendingClientFrames.removeAll(keepingCapacity: true)
 
-        guard let url = relayURL() else { return }
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(authorization)", forHTTPHeaderField: "Authorization")
-        let socket = urlSession.webSocketTask(with: request)
-        // URLSession defaults to exactly 1 MiB. Client-to-host messages gain a
-        // 33-byte relay-authenticated source header, so the host must opt into
-        // the protocol's actual maximum receive size.
-        socket.maximumMessageSize = Self.maximumPeerWireByteCount
-            + (role == .host ? RelaySourceEnvelope.headerByteCount : 0)
-        self.socket = socket
-        socket.resume()
-        receiveNext(socket: socket, generation: generation)
+        switch transportKind {
+        case .webSocket:
+            guard let url = relayURL() else { return }
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(authorization)", forHTTPHeaderField: "Authorization")
+            let socket = urlSession.webSocketTask(with: request)
+            // URLSession defaults to exactly 1 MiB. Client-to-host messages gain a
+            // 33-byte relay-authenticated source header, so the host must opt into
+            // the protocol's actual maximum receive size.
+            socket.maximumMessageSize = Self.maximumPeerWireByteCount
+                + (role == .host ? RelaySourceEnvelope.headerByteCount : 0)
+            self.socket = socket
+            socket.resume()
+            receiveNext(socket: socket, generation: generation)
+        case .httpLongPoll:
+            guard let endpoint = httpRelayURL() else { return }
+            let transport = RelayHTTPTransport(
+                endpoint: endpoint, authorization: authorization, queue: queue
+            )
+            // Callbacks already arrive on `queue`; a transport superseded by
+            // teardown is identified by object identity, not generation.
+            transport.onOpen = { [weak self, weak transport] in
+                guard let self, let transport, transport === self.httpTransport else { return }
+                self.reconnectAttempt = 0
+                self.setStateLocked(.connected)
+                self.sendHelloLocked()
+            }
+            transport.onText = { [weak self, weak transport] text in
+                guard let self, let transport, transport === self.httpTransport else { return }
+                self.handleTextLocked(text)
+            }
+            transport.onBinary = { [weak self, weak transport] wire in
+                guard let self, let transport, transport === self.httpTransport else { return }
+                self.handleWireLocked(wire)
+            }
+            transport.onClosed = { [weak self, weak transport] unauthorized in
+                guard let self, let transport, transport === self.httpTransport else { return }
+                if unauthorized, let onUnauthorized = self.onUnauthorized {
+                    self.callbackQueue.async { onUnauthorized() }
+                }
+                self.scheduleReconnectLocked()
+            }
+            httpTransport = transport
+            transport.start()
+        }
     }
 
     private func receiveNext(socket: URLSessionWebSocketTask, generation: Int) {
@@ -329,6 +400,8 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         pongOutstanding = false
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
+        httpTransport?.stop()
+        httpTransport = nil
         bootstrapChannel = nil
         peerChannels.removeAll()
         peerOrder.removeAll()
@@ -409,14 +482,22 @@ public final class RelayLink: NSObject, @unchecked Sendable {
 
     private func handleLocked(message: URLSessionWebSocketTask.Message) {
         if case .string(let text) = message {
-            // Text frames are relay link metadata, never peer payload.
-            guard let metadata = try? RelayMetadata(jsonText: text) else { return }
-            if let onMetadata {
-                callbackQueue.async { onMetadata(metadata) }
-            }
+            handleTextLocked(text)
             return
         }
         guard case .data(let data) = message else { return }
+        handleWireLocked(data)
+    }
+
+    private func handleTextLocked(_ text: String) {
+        // Text frames are relay link metadata, never peer payload.
+        guard let metadata = try? RelayMetadata(jsonText: text) else { return }
+        if let onMetadata {
+            callbackQueue.async { onMetadata(metadata) }
+        }
+    }
+
+    private func handleWireLocked(_ data: Data) {
         let sourcePrincipal: String?
         let wire: Data
         switch role {
@@ -637,7 +718,9 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     // MARK: - Send (on `queue`)
 
     private func sendLocked(frame: Frame) {
-        guard socket != nil, case .connected = _state else { return }
+        guard socket != nil || httpTransport != nil,
+              case .connected = _state
+        else { return }
         if peerChannels.isEmpty {
             if role == .client {
                 if pendingClientFrames.count >= Self.maximumPendingClientFrames {
@@ -666,9 +749,15 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     }
 
     private func sendWireLocked(tag: Data, sealed: Data) {
-        guard let socket, case .connected = _state else { return }
+        guard case .connected = _state else { return }
         var wire = tag
         wire.append(sealed)
+        if let httpTransport {
+            // Failures surface through the transport's terminal onClosed.
+            httpTransport.send(wire)
+            return
+        }
+        guard let socket else { return }
         let generation = self.generation
         socket.send(.data(wire)) { [weak self] error in
             guard error != nil, let self else { return }
