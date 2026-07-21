@@ -74,6 +74,14 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     private var reconnectAttempt = 0
     private var reconnectWork: DispatchWorkItem?
     private var pingTimer: DispatchSourceTimer?
+    /// True while a sent WebSocket ping has not yet been answered by a pong.
+    /// `URLSessionWebSocketTask.sendPing` has no deadline of its own: on a
+    /// half-dead connection (a local proxy that lost its upstream keeps our
+    /// TCP segment open, so writes succeed and nothing ever arrives) the
+    /// completion simply never fires — neither success nor error. The ping
+    /// timer therefore treats "previous ping still unanswered at the next
+    /// tick" as a dead link.
+    private var pongOutstanding = false
     /// Bumped on every (re)connect and teardown; stale callbacks are ignored.
     private var generation = 0
     private var _state: State = .idle
@@ -318,6 +326,7 @@ public final class RelayLink: NSObject, @unchecked Sendable {
         reconnectWork = nil
         pingTimer?.cancel()
         pingTimer = nil
+        pongOutstanding = false
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         bootstrapChannel = nil
@@ -358,15 +367,26 @@ public final class RelayLink: NSObject, @unchecked Sendable {
     }
 
     private func startPingLocked(socket: URLSessionWebSocketTask, generation: Int) {
+        pongOutstanding = false
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 10, repeating: 10)
         timer.setEventHandler { [weak self] in
             guard let self, generation == self.generation else { return }
+            guard !self.pongOutstanding else {
+                // The previous ping went a full interval without a pong. The
+                // WebSocket ping/pong rides ordered TCP, so 10+ seconds of
+                // silence means the transport is stalled or half-dead — kick
+                // now instead of trusting a completion that may never fire.
+                self.scheduleReconnectLocked()
+                return
+            }
+            self.pongOutstanding = true
             let start = DispatchTime.now()
             socket.sendPing { [weak self] error in
                 guard let self else { return }
                 self.queue.async {
                     guard generation == self.generation else { return }
+                    self.pongOutstanding = false
                     if error != nil {
                         // A dead connection often only surfaces on write; the
                         // ping doubles as a liveness probe.
