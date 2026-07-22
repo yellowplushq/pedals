@@ -1207,13 +1207,17 @@ describe("Pedals v2 Worker API", () => {
 
   test("push endpoint count is bounded in D1", async () => {
     const client = await createClient();
+    // "fb…" tokens draw a 429 from the APNs mock, so the coordinator defers
+    // the endpoints instead of ending zero-state activities and deleting
+    // them — without this, a slow runner lets the 150 ms alarm free slots
+    // between the eighth and ninth registration.
     for (let index = 0; index < 8; index += 1) {
       expect(
         (await api("/v2/clients/me/push-endpoints/liveactivity-update", {
           method: "PUT",
           token: client.statusToken,
           body: {
-            token: (0x20 + index).toString(16).repeat(32),
+            token: ("fb0" + index.toString(16)).repeat(16),
             environment: "sandbox",
             activityId: `activity-${index}`,
           },
