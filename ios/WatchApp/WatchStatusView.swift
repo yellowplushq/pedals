@@ -1,4 +1,5 @@
 import Combine
+import PedalsKit
 import SwiftUI
 
 struct WatchStatusView: View {
@@ -43,6 +44,7 @@ struct WatchStatusView: View {
                 }
 
                 terminalLinks
+                agentRows
             }
             .frame(maxWidth: .infinity)
         }
@@ -95,7 +97,13 @@ struct WatchStatusView: View {
                             openTerminal(terminal)
                         } label: {
                             HStack(spacing: 6) {
-                                Image(systemName: terminal.alive ? "terminal.fill" : "xmark.circle")
+                                if let state = terminal.agentState {
+                                    AgentMarkBadgeView(
+                                        slug: terminal.agentSlug, state: state, size: 16
+                                    )
+                                } else {
+                                    Image(systemName: terminal.alive ? "terminal.fill" : "xmark.circle")
+                                }
                                 Text(terminal.title)
                                     .lineLimit(2)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -109,6 +117,132 @@ struct WatchStatusView: View {
         }
     }
 
+    /// Standalone Agents section, mirroring the iPhone Home list: state-dot
+    /// column, attention-first sorting, state-colored detail, long-press
+    /// dismissal, and a Clear control for everything not working.
+    @ViewBuilder
+    private var agentRows: some View {
+        let rows = terminalStore.computers
+            .flatMap { computer in
+                computer.agents.map { (computer: computer, info: $0) }
+            }
+            .sorted { lhs, rhs in
+                let l = Self.attentionRank(lhs.info.state)
+                let r = Self.attentionRank(rhs.info.state)
+                return l != r ? l < r : lhs.info.updatedAt > rhs.info.updatedAt
+            }
+        if !rows.isEmpty {
+            Divider()
+                .padding(.vertical, 4)
+            HStack {
+                Text("Agents")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+                Spacer()
+                if rows.contains(where: { $0.info.state != .running }) {
+                    Button {
+                        for row in rows where row.info.state != .running {
+                            terminalStore.dismissAgent(
+                                computerID: row.computer.id, agentID: row.info.id
+                            )
+                        }
+                    } label: {
+                        Text("Clear")
+                            .font(.caption2)
+                            .foregroundStyle(PedalsTheme.tertiaryContent)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            ForEach(rows, id: \.info.id) { row in
+                HStack(alignment: .center, spacing: 6) {
+                    AgentMarkBadgeView(
+                        slug: row.info.agent, state: row.info.state, size: 16
+                    )
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(agentTitle(row.info))
+                            .lineLimit(1)
+                        if let detail = agentDetail(row.info) {
+                            Text(detail)
+                                .font(.caption2)
+                                .foregroundStyle(agentDetailTint(row.info.state))
+                                .lineLimit(2)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.caption)
+                .opacity(row.computer.online ? 1 : 0.5)
+                .contentShape(Rectangle())
+                .contextMenu {
+                    Button(role: .destructive) {
+                        terminalStore.dismissAgent(
+                            computerID: row.computer.id, agentID: row.info.id
+                        )
+                    } label: {
+                        Label("Dismiss", systemImage: "xmark")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Attention first: waiting > error > running > done (same order as
+    /// the iPhone Home list).
+    private static func attentionRank(_ state: AgentState) -> Int {
+        switch state {
+        case .waiting: 0
+        case .error: 1
+        case .running: 2
+        case .done: 3
+        }
+    }
+
+    private func agentTint(_ state: AgentState) -> Color {
+        switch state {
+        case .waiting: PedalsTheme.warning
+        case .error: PedalsTheme.critical
+        case .running: PedalsTheme.content
+        case .done: PedalsTheme.success
+        }
+    }
+
+    private func agentDetailTint(_ state: AgentState) -> Color {
+        switch state {
+        case .waiting: PedalsTheme.warning
+        case .error: PedalsTheme.critical
+        case .running: PedalsTheme.content
+        case .done: PedalsTheme.success
+        }
+    }
+
+    /// Same title rule as the iPhone rows: the user's prompt first, else
+    /// the project directory name.
+    private func agentTitle(_ info: AgentInfo) -> String {
+        if let prompt = info.prompt?
+            .split(whereSeparator: \.isNewline)
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .first(where: { !$0.isEmpty }) {
+            return prompt
+        }
+        let project = (info.cwd as NSString).lastPathComponent
+        return project.isEmpty ? AgentNotification.displayName(forAgent: info.agent) : project
+    }
+
+    private func agentDetail(_ info: AgentInfo) -> String? {
+        switch info.state {
+        case .waiting:
+            return info.message ?? "Waiting for you"
+        case .error:
+            return info.message ?? "Stopped on an error"
+        case .done:
+            return info.message ?? "Done"
+        case .running:
+            if let action = info.action, !action.isEmpty { return action }
+            return nil
+        }
+    }
+
     private func refresh() async {
         guard !refreshing else { return }
         refreshing = true
@@ -117,6 +251,81 @@ struct WatchStatusView: View {
             snapshot = fresh
         } else {
             snapshot = StatusSharedStore.snapshot()
+        }
+    }
+}
+
+
+/// An agent's brand mark with a state badge on its top-right corner —
+/// the same design the iPhone Home rows use. Working blinks slowly.
+struct AgentMarkBadgeView: View {
+    let slug: String?
+    let state: AgentState
+    var size: CGFloat = 16
+
+    @State private var dimmed = false
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if let asset = slug.flatMap(Self.assetName) {
+                Image(asset)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: size, height: size)
+                    .foregroundStyle(PedalsTheme.content)
+            } else {
+                Image(systemName: "sparkles")
+                    .font(.system(size: size - 4))
+                    .frame(width: size, height: size)
+                    .foregroundStyle(PedalsTheme.content)
+            }
+            // Finished shows no badge — a settled agent needs no marker.
+            if state != .done {
+                Circle()
+                    .fill(badgeColor)
+                    .frame(width: 6, height: 6)
+                    .overlay(Circle().stroke(.black, lineWidth: 1.5))
+                    .offset(x: 3, y: -3)
+                    .opacity(state == .running && dimmed ? 0.25 : 1)
+            }
+        }
+        .onAppear { startBlinkIfNeeded() }
+        .onChange(of: state) { _, _ in startBlinkIfNeeded() }
+    }
+
+    private var badgeColor: Color {
+        switch state {
+        case .waiting: PedalsTheme.warning
+        case .error: PedalsTheme.critical
+        case .running: PedalsTheme.content
+        case .done: PedalsTheme.success
+        }
+    }
+
+    private func startBlinkIfNeeded() {
+        guard state == .running else {
+            dimmed = false
+            return
+        }
+        dimmed = false
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+            dimmed = true
+        }
+    }
+
+    private static func assetName(_ slug: String) -> String? {
+        switch slug {
+        case "claude": "claude-code-mark"
+        case "codex": "codex-mark"
+        case "copilot": "copilot-mark"
+        case "grok": "grok-mark"
+        case "hermes": "hermes-mark"
+        case "kimi": "kimi-mark"
+        case "kiro": "kiro-mark"
+        case "omp": "omp-mark"
+        case "opencode": "opencode-mark"
+        case "pi": "pi-mark"
+        default: nil
         }
     }
 }

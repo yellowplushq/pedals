@@ -27,6 +27,14 @@ public final class RelayHostClient: @unchecked Sendable {
     /// splice, see PROTOCOL.md §4).
     private var replayedThrough: [Int: UInt64] = [:]
     private var lastReportedDirectory: [RelayMetadata.DirectoryEntry]?
+    private var lastReportedAgentCounts: RelayMetadata.AgentCounts?
+    /// Latest AgentMonitor snapshot; replayed to late-joining clients right
+    /// after the sessions list. Rich agent content is E2EE-only — it travels
+    /// exclusively in ctl frames, never in relay metadata; the host snapshot
+    /// carries only the per-state counts.
+    private var lastAgents: [AgentInfo] = []
+    /// Client-requested agent dismissal, forwarded to the AgentMonitor.
+    public var onDismissAgent: (@Sendable (String) -> Void)?
 
     private var _state: State = .stopped
     /// A client hello arrived on the current control connection.
@@ -123,6 +131,7 @@ public final class RelayHostClient: @unchecked Sendable {
         sessionLinks.removeAll()
         replayedThrough.removeAll()
         lastReportedDirectory = nil
+        lastReportedAgentCounts = nil
         _clientSeen = false
     }
 
@@ -150,6 +159,7 @@ public final class RelayHostClient: @unchecked Sendable {
             _state = .connected
             reportDirectoryLocked(force: true)
             control?.send(.sessions(list: sessions.list()))
+            control?.send(.agents(list: lastAgents))
         case .connecting:
             _state = .connecting
             _clientSeen = false
@@ -196,6 +206,7 @@ public final class RelayHostClient: @unchecked Sendable {
             guard who == .client else { return }
             _clientSeen = true
             control?.send(.sessions(list: sessions.list()))
+            control?.send(.agents(list: lastAgents))
         case .create(let cwd, let cols, let rows, let req):
             do {
                 let id = try sessions.create(cwd: cwd, cols: cols, rows: rows)
@@ -210,7 +221,9 @@ public final class RelayHostClient: @unchecked Sendable {
             if !sessions.close(id: id) {
                 control?.send(.err(msg: "no such session \(id)"))
             }
-        case .sessions, .created, .title, .exit, .ready, .requestReplay:
+        case .dismissAgent(let agentId):
+            onDismissAgent?(agentId)
+        case .sessions, .agents, .created, .title, .exit, .ready, .requestReplay:
             break // host→client only; ignore if mirrored back
         case .err(let msg, _):
             FileHandle.standardError.write(Data("client error: \(msg)\n".utf8))
@@ -257,6 +270,36 @@ public final class RelayHostClient: @unchecked Sendable {
         }
     }
 
+    // MARK: - Agent events
+
+    /// Publishes an AgentMonitor snapshot to every control client and keeps
+    /// it for replay on the next client hello / reconnect. Also folds the
+    /// per-state aggregate counts into the server-visible host snapshot —
+    /// bare numbers only, the rich list stays E2EE.
+    public func broadcastAgents(_ list: [AgentInfo]) {
+        queue.async { [self] in
+            lastAgents = list
+            guard started else { return }
+            control?.send(.agents(list: list))
+            reportDirectoryLocked(force: false)
+        }
+    }
+
+    static func agentCounts(of list: [AgentInfo]) -> RelayMetadata.AgentCounts {
+        var running = 0, waiting = 0
+        for agent in list {
+            switch agent.state {
+            case .running: running += 1
+            // Error parks the agent on the user just like waiting; the
+            // server-visible aggregate does not distinguish them.
+            case .waiting, .error: waiting += 1
+            case .done: break // grows without bound; client-side only
+            }
+        }
+        let cap = RelayMetadata.AgentCounts.maxCount
+        return .init(running: min(running, cap), waiting: min(waiting, cap))
+    }
+
     // MARK: - Session events (on `queue`)
 
     private func handle(sessionEvent event: SessionEvent) {
@@ -301,9 +344,16 @@ public final class RelayHostClient: @unchecked Sendable {
         let directory = (list ?? sessions.list()).map {
             RelayMetadata.DirectoryEntry(id: $0.id, alive: $0.alive)
         }
-        guard force || directory != lastReportedDirectory else { return }
-        control?.sendMetadata(.hostSnapshot(hostName: hostName, sessions: directory))
+        let counts = Self.agentCounts(of: lastAgents)
+        guard force
+            || directory != lastReportedDirectory
+            || counts != lastReportedAgentCounts
+        else { return }
+        control?.sendMetadata(.hostSnapshot(
+            hostName: hostName, sessions: directory, agents: counts
+        ))
         lastReportedDirectory = directory
+        lastReportedAgentCounts = counts
     }
 
     private func reportOfflineLocked() {

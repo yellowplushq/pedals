@@ -4,6 +4,11 @@ import Foundation
 public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Sendable {
     public struct ContentState: Codable, Hashable, Sendable {
         public var totalRunning: Int
+        /// Coding-agent aggregates. Optional-decoded so pushes from a relay
+        /// that predates agent counts still parse (ActivityKit decodes
+        /// content-state strictly otherwise).
+        public var agentsRunning: Int
+        public var agentsWaiting: Int
         public var onlineComputerCount: Int
         public var offlineComputerCount: Int
         public var updatedAt: Date
@@ -11,21 +16,40 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
 
         public init(
             totalRunning: Int,
+            agentsRunning: Int = 0,
+            agentsWaiting: Int = 0,
             onlineComputerCount: Int,
             offlineComputerCount: Int,
             updatedAt: Date,
             sequence: UInt64
         ) {
             self.totalRunning = max(0, totalRunning)
+            self.agentsRunning = max(0, agentsRunning)
+            self.agentsWaiting = max(0, agentsWaiting)
             self.onlineComputerCount = max(0, onlineComputerCount)
             self.offlineComputerCount = max(0, offlineComputerCount)
             self.updatedAt = updatedAt
             self.sequence = sequence
         }
 
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(
+                totalRunning: try container.decode(Int.self, forKey: .totalRunning),
+                agentsRunning: try container.decodeIfPresent(Int.self, forKey: .agentsRunning) ?? 0,
+                agentsWaiting: try container.decodeIfPresent(Int.self, forKey: .agentsWaiting) ?? 0,
+                onlineComputerCount: try container.decode(Int.self, forKey: .onlineComputerCount),
+                offlineComputerCount: try container.decode(Int.self, forKey: .offlineComputerCount),
+                updatedAt: try container.decode(Date.self, forKey: .updatedAt),
+                sequence: try container.decode(UInt64.self, forKey: .sequence)
+            )
+        }
+
         public init(snapshot: TTYStatusSnapshot) {
             self.init(
                 totalRunning: snapshot.totalRunning,
+                agentsRunning: snapshot.agentsRunning,
+                agentsWaiting: snapshot.agentsWaiting,
                 onlineComputerCount: snapshot.onlineComputerCount,
                 offlineComputerCount: snapshot.offlineComputerCount,
                 updatedAt: snapshot.updatedAt,

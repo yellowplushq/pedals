@@ -206,7 +206,8 @@ the active host sends:
 {
   "type":"host-snapshot",
   "hostName":"MacBook Pro",
-  "sessions":[{"id":7,"alive":true},{"id":9,"alive":false}]
+  "sessions":[{"id":7,"alive":true},{"id":9,"alive":false}],
+  "agents":{"running":2,"waiting":1}
 }
 ```
 
@@ -215,6 +216,18 @@ it only from the current active control host, canonicalizes at most 255 ordered
 unique terminal IDs, renews a 90-second lease, and stores the directory in DO
 storage. Repeating an unchanged snapshot only renews the lease; it does not
 increment the revision or send duplicate push updates.
+
+`agents` carries the per-state coding-agent aggregate counts — the only
+agent-derived data that is server-visible (each value 0–255; `waiting` folds
+in error states, since both park the agent on the user; `done` is
+deliberately absent — it grows without bound, so it stays client-side). The
+key is optional for backward compatibility (absent ⇒ all-zero); when present
+it must contain exactly `{running, waiting}`. The counts flow into the D1
+projection next to the alive-TTY count and from there into widget snapshots
+and the Live Activity content state; the Live Activity lifecycle edge is
+`totalRunning + agentsRunning + agentsWaiting` crossing zero. Rich agent
+detail (names, projects, messages) stays exclusively in the encrypted
+`agents` ctl frame (§5).
 
 Every control client receives the current directory as soon as its WebSocket is
 accepted and again whenever the directory changes:
@@ -372,6 +385,18 @@ Handshake control frames use `sessionId = 0` on every WebSocket channel:
 After `ready` promotes the tag, the control channel accepts:
 
 - `sessions {list:[{id,title,cwd,rows,cols,createdAt,alive}]}`
+- `dismiss-agent {agentId}` — client to host: remove one observed agent from
+  the registry. The agent list is bidirectional: a dismissal removes the
+  record for every client (clients hide the row optimistically first, no
+  persistence), and the agent's next hook event recreates it.
+- `agents {agents:[{id,agent,state,cwd,action?,message?,prompt?,sessionId?,term?,updatedAt}]}`
+  — host to client: full snapshot of coding-agent sessions observed via
+  daemon-installed hooks (docs/AGENT_MONITORING_DESIGN.md). `state` is
+  `running|waiting|error|done`; `sessionId` is set when the agent runs inside
+  a daemon-owned PTY (the dedup rule), `term` names the terminal app for
+  unmanaged agents. Broadcast debounced on change and replayed after
+  `sessions` on every client hello. Rich agent content exists only inside
+  these encrypted frames, never in relay metadata.
 - `create {cwd,cols,rows,req?}` / `created {id,req?}`
 - `close {id}`, `title {id,title}`, `exit {id,code}`
 - `err {msg,req?}`
@@ -406,11 +431,14 @@ GET /v2/clients/me/state
 {
   "version": 2,
   "totalRunning": 3,
+  "agentsRunning": 2,
+  "agentsWaiting": 1,
   "computers": [
     {
       "id": "...",
       "name": "MacBook Pro",
       "runningTTYCount": 3,
+      "agents": {"running": 2, "waiting": 1},
       "online": true,
       "updatedAt": "2026-07-18T00:00:00.000Z"
     }
@@ -421,8 +449,8 @@ GET /v2/clients/me/state
 }
 ```
 
-Offline computers contribute zero to `totalRunning`; their last terminal count
-is never presented as current.
+Offline computers contribute zero to `totalRunning` and to the agent counts;
+their last reported values are never presented as current.
 
 WidgetKit and ActivityKit tokens are registered with:
 
@@ -431,23 +459,75 @@ PUT /v2/clients/me/push-endpoints/:surface
 {"token":"<hex>","environment":"sandbox|production","activityId":"..."?}
 ```
 
-Allowed surfaces are `ios-widget`, `watch-widget`, `liveactivity-start`, and
-`liveactivity-update`. APNs topics and push types are fixed by the Worker, not
-accepted from clients.
+Allowed surfaces are `ios-widget`, `watch-widget`, `liveactivity-start`,
+`liveactivity-update`, and `ios-notification`. APNs topics and push types
+are fixed by the Worker, not accepted from clients.
 
 - Widget push uses `apns-push-type: widgets` and only asks WidgetKit to reload;
   the timeline provider then reads `/state`.
 - Live Activity start/update/end uses `apns-push-type: liveactivity`, attributes
   `TTYActivityAttributes {scope:"all"}`, and content state containing
-  `totalRunning`, online/offline computer counts, `updatedAt`, and `sequence`.
+  `totalRunning`, `agentsRunning`, `agentsWaiting`, online/offline computer
+  counts, `updatedAt`, and `sequence`. The activity starts on the first push
+  after `totalRunning + agentsRunning + agentsWaiting` becomes positive and
+  ends when it returns to zero.
 - APNs provider keys exist only as encrypted Worker secrets. Invalid device
   tokens are removed; throttled/server failures are retried with backoff.
+
+### 6.1 Agent notifications
+
+When an agent transitions into `waiting`, `error`, or `done`, the daemon
+fires a visible push — the notification pipeline exists purely to drive
+Apple push notifications — through:
+
+```http
+POST /v2/computers/:computerId/agent-notifications        (host bearer)
+{"category":"waiting|error|done","sessionId":7?,
+ "dedupeKey":"<agent-session>:<category>:<ts>","sealed":"<base64>"}
+```
+
+The Worker fans the notification out to every bound client's
+`ios-notification` endpoints (push type `alert`, topic `air.build.pedals`,
+`mutable-content: 1`) and never stores the payload. The visible text the Worker composes is generic per
+category ("An agent needs your input"), titled with the server-visible host
+name. `sealed` is `ChaChaPoly(key_notify, aad=computerId)` over
+`{agent, category, message?, cwd?, sessionId?}`, where
+
+```
+key_notify = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="notification", 32)
+```
+
+is deliberately distinct from both traffic keys: the phone mirrors only this
+derived key into a shared keychain group, and the Notification Service
+Extension decrypts and rewrites the alert on-device (agent name, project,
+message). Without the NSE or the key, the generic text still shows. The
+`dedupeKey` makes Worker-side APNs retries idempotent (it seeds `apns-id`).
+Delivery is fire-and-forget: the E2EE agent list is the durable source of
+truth, so a lost notification is one missed banner, not lost state. The
+daemon floors notifications at one per agent session per 3 seconds;
+transitions are edge-triggered (repeated events in the same state do not
+re-notify).
 
 ## 7. Desktop local control
 
 `~/.pedals/pedals.sock` carries newline-delimited JSON requests for `ls`, `new`,
-`kill`, `pair`, `cancelPair`, and `status`. Responses use `{"ok":true,...}` or
-`{"ok":false,"err":"..."}`. `pair` returns a fresh eight-digit `code` and
+`kill`, `pair`, `cancelPair`, `status`, `agent-event`, and `agents`. Responses
+use `{"ok":true,...}` or `{"ok":false,"err":"..."}`.
+
+`agent-event` is sent by the `pedals-hook` reporter (installed into coding
+agents' hook settings by `pedals hooks install` or the menu bar app):
+`{"cmd":"agent-event","agent":"claude","event":"session-start|prompt|ask|tool|
+busy|notify|compact|stop|session-end","agentSessionId":"...","cwd"?,"prompt"?,
+"message"?,"action"?,"agentError"?,"lineage":[{"pid","name","tty"?}]}`. The
+daemon's AgentMonitor applies the state machine, matches `lineage`/`tty`
+against daemon-owned PTYs, and broadcasts the encrypted `agents` ctl snapshot.
+`pedals hooks install|uninstall|status <agent>` manages ten agents — claude,
+codex, copilot, grok, kimi, kiro, opencode, omp, pi, hermes — writing
+sentinel-marked entries (`# pedals-managed-hook`) into each agent's own hook
+settings, or a marker-owned generated plugin file for the plugin-based agents;
+user content is never overwritten.
+`agents` returns the current registry as `{"ok":true,"agents":[...]}` in the
+ctl `agents` entry shape. `pair` returns a fresh eight-digit `code` and
 `expiresAt`, revoking any prior pairing session for that computer. `cancelPair`
 revokes the current session when its pairing surface closes. `pair --reset`
 registers a new computer identity and rotates the host token and E2EE secret

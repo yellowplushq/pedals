@@ -51,6 +51,8 @@ public final class Daemon: @unchecked Sendable {
     public let home: PedalsHome
     private let sessions: SessionManager
     private let relay: RelayHostClient
+    private let agents: AgentMonitor
+    private let agentNotifications: AgentNotificationPusher
     private var controlServer: ControlServer?
     /// Held from identity load/registration until the control socket listens.
     /// An offline CLI that lost the initial socket race blocks on this lock,
@@ -100,6 +102,20 @@ public final class Daemon: @unchecked Sendable {
         }
         sessions = SessionManager(options: sessionOptions)
         relay = RelayHostClient(identity: identity, sessions: sessions)
+        // The monitor re-resolves ownership on its own 2 s sweep, so it needs
+        // no session-event subscription (RelayHostClient owns the single
+        // SessionManager event consumer).
+        agents = AgentMonitor(matchTargets: { [sessions] in
+            sessions.agentMatchTargets()
+        })
+        agents.onChange = { [relay] list in relay.broadcastAgents(list) }
+        // Updates capture the startup identity like RelayHostClient does; an
+        // identity reset restarts the daemon before either matters.
+        agentNotifications = AgentNotificationPusher(identity: identity)
+        agents.onNotification = { [agentNotifications] info, category in
+            agentNotifications.push(info, category: category)
+        }
+        relay.onDismissAgent = { [agents] id in agents.dismiss(id: id) }
         self.startupIdentityLock = startupIdentityLock
         keepStartupLock = true
     }
@@ -216,6 +232,25 @@ public final class Daemon: @unchecked Sendable {
             cancelCurrentPairingSession(revoke: true)
             return .ok([:])
 
+        case "agent-event":
+            guard let agent = request.agent, let event = request.event,
+                  let agentSessionId = request.agentSessionId
+            else {
+                return .error("agent-event requires \"agent\", \"event\", \"agentSessionId\"")
+            }
+            agents.ingest(AgentEvent(
+                agent: agent, event: event, agentSessionId: agentSessionId,
+                cwd: request.cwd, prompt: request.prompt, message: request.message,
+                action: request.action, agentError: request.agentError,
+                lineage: request.lineage ?? []
+            ))
+            return .ok([:])
+
+        case "agents":
+            return .ok([
+                "agents": .array(agents.list().map(Self.encode(agent:)))
+            ])
+
         case "status":
             let state = relay.state
             return .ok([
@@ -304,6 +339,22 @@ public final class Daemon: @unchecked Sendable {
         if revoke, let current {
             try? serviceActions.cancelPairingSession(current, hostIdentity)
         }
+    }
+
+    private static func encode(agent info: AgentInfo) -> ControlValue {
+        var fields: [String: ControlValue] = [
+            "id": .string(info.id),
+            "agent": .string(info.agent),
+            "state": .string(info.state.rawValue),
+            "cwd": .string(info.cwd),
+            "updatedAt": .double(info.updatedAt),
+        ]
+        if let action = info.action { fields["action"] = .string(action) }
+        if let message = info.message { fields["message"] = .string(message) }
+        if let prompt = info.prompt { fields["prompt"] = .string(prompt) }
+        if let sessionId = info.sessionId { fields["sessionId"] = .int(sessionId) }
+        if let term = info.term { fields["term"] = .string(term) }
+        return .object(fields)
     }
 
     private static func encode(session: SessionInfo) -> ControlValue {

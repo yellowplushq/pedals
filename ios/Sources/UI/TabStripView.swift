@@ -14,7 +14,7 @@ final class TabStripView: UIView {
 
     var onSelect: ((TerminalID) -> Void)?
     var onClose: ((TerminalID) -> Void)?
-    var onSettings: (() -> Void)?
+    var onHome: (() -> Void)?
     var onCreate: (() -> Void)?
 
     static let height: CGFloat = 44
@@ -26,10 +26,12 @@ final class TabStripView: UIView {
     private static let minInactiveWidth: CGFloat = 40
 
     private let scrollView = UIScrollView()
+    /// App title shown in the strip's empty middle while no tabs exist.
+    private let titleLabel = UILabel()
     private let plusButton = UIButton(type: .system)
     private let plusGlass = GlassView()
-    private let settingsButton = UIButton(type: .system)
-    private let settingsGlass = GlassView()
+    private let homeButton = UIButton(type: .system)
+    private let homeGlass = GlassView()
 
     private(set) var tabs: [Tab] = []
     private var activeIndex: Int?
@@ -40,6 +42,13 @@ final class TabStripView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+
+        titleLabel.text = "Pedals"
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = PedalsTheme.uiContent
+        titleLabel.textAlignment = .center
+        titleLabel.isHidden = true
+        addSubview(titleLabel)
 
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.alwaysBounceHorizontal = true
@@ -59,20 +68,29 @@ final class TabStripView: UIView {
         plusButton.addAction(UIAction { [weak self] _ in self?.onCreate?() }, for: .touchUpInside)
         addSubview(plusGlass)
 
-        // Settings lives as a permanent, un-closeable leftmost tab.
-        settingsGlass.contentView.addSubview(settingsButton)
-        settingsButton.setImage(
+        // Home lives as a permanent, un-closeable leftmost tab; the settings
+        // gear moved onto the Home page itself.
+        homeGlass.contentView.addSubview(homeButton)
+        homeButton.setImage(
             UIImage(
-                systemName: "gearshape.fill",
+                systemName: "house",
                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
             ),
             for: .normal
         )
-        settingsButton.tintColor = .label
-        settingsButton.addAction(
-            UIAction { [weak self] _ in self?.onSettings?() }, for: .touchUpInside
+        homeButton.tintColor = .secondaryLabel
+        homeButton.accessibilityIdentifier = "pedals.home.tab"
+        homeButton.accessibilityLabel = "Home"
+        homeButton.addAction(
+            UIAction { [weak self] _ in self?.onHome?() }, for: .touchUpInside
         )
-        addSubview(settingsGlass)
+        addSubview(homeGlass)
+    }
+
+    /// Renders the fixed home pill selected (Home page visible) or not.
+    func setHomeSelected(_ selected: Bool) {
+        homeButton.tintColor = selected ? .label : .secondaryLabel
+        homeGlass.contentView.backgroundColor = selected ? PedalsTheme.uiSelection : .clear
     }
 
     @available(*, unavailable)
@@ -110,6 +128,9 @@ final class TabStripView: UIView {
             pills.removeValue(forKey: id)
             pill.removeFromSuperview()
         }
+
+        // The strip's empty middle carries the app title until the first tab.
+        titleLabel.isHidden = !tabs.isEmpty
 
         transition = nil
         let animated = oldActive != activeIndex && window != nil
@@ -174,13 +195,13 @@ final class TabStripView: UIView {
         super.layoutSubviews()
 
         let pillSize: CGFloat = Self.pillHeight
-        settingsGlass.frame = CGRect(
+        homeGlass.frame = CGRect(
             x: 12,
             y: (bounds.height - pillSize) / 2,
             width: pillSize,
             height: pillSize
         )
-        settingsButton.frame = settingsGlass.contentView.bounds
+        homeButton.frame = homeGlass.contentView.bounds
 
         plusGlass.frame = CGRect(
             x: bounds.width - pillSize - 12,
@@ -191,10 +212,11 @@ final class TabStripView: UIView {
         plusButton.frame = plusGlass.contentView.bounds
 
         scrollView.frame = CGRect(
-            x: settingsGlass.frame.maxX + Self.spacing, y: 0,
-            width: plusGlass.frame.minX - settingsGlass.frame.maxX - Self.spacing * 2,
+            x: homeGlass.frame.maxX + Self.spacing, y: 0,
+            width: plusGlass.frame.minX - homeGlass.frame.maxX - Self.spacing * 2,
             height: bounds.height
         )
+        titleLabel.frame = scrollView.frame
         layoutStrip()
     }
 
@@ -219,9 +241,9 @@ final class TabStripView: UIView {
             inactive = min(Self.maxInactiveWidth, inactive)
         }
 
-        let activeIdx = activeIndex ?? 0
+        // No active tab (Home page visible): every pill renders collapsed.
         return tabs.indices.map { index in
-            var expansion: CGFloat = index == activeIdx ? 1 : 0
+            var expansion: CGFloat = index == activeIndex ? 1 : 0
             if let transition {
                 if index == transition.from { expansion = 1 - transition.progress }
                 if index == transition.to { expansion = transition.progress }
@@ -323,7 +345,9 @@ final class TabPillView: UIView {
         titleLabel.alpha = amount
         closeButton.alpha = amount
         glyphLabel.alpha = 1 - amount
-        closeButton.isUserInteractionEnabled = isActive && amount > 0.5
+        // An expanded pill's × always works — a lone tab stays expanded even
+        // when Home is the visible page (no active tab).
+        closeButton.isUserInteractionEnabled = amount > 0.5
         setNeedsLayout()
     }
 

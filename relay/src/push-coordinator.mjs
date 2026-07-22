@@ -69,7 +69,11 @@ export class PushCoordinator extends DurableObject {
   }
 
   async fetch(request) {
-    if (request.method !== "POST" || new URL(request.url).pathname !== "/invalidate") {
+    const pathname = new URL(request.url).pathname;
+    if (request.method === "POST" && pathname === "/notification") {
+      return this.handleNotification(request);
+    }
+    if (request.method !== "POST" || pathname !== "/invalidate") {
       return new Response("not found", { status: 404 });
     }
 
@@ -181,6 +185,95 @@ export class PushCoordinator extends DurableObject {
     });
   }
 
+  /// Agent notifications are event pushes, not state syncs: delivered
+  /// immediately to the client's `ios-notification` endpoints, idempotent
+  /// per dedupe key, and dropped (after endpoint bookkeeping) on failure —
+  /// the E2EE agent list is the durable source of truth, a lost banner is
+  /// not.
+  async handleNotification(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("bad request", { status: 400 });
+    }
+    const { clientId, dedupeKey, payload } = body ?? {};
+    if (
+      !isId(clientId) ||
+      typeof dedupeKey !== "string" ||
+      dedupeKey.length === 0 ||
+      dedupeKey.length > 256 ||
+      !payload ||
+      typeof payload !== "object"
+    ) {
+      return new Response("bad request", { status: 400 });
+    }
+
+    const result = await this.env.DB
+      .prepare(
+        `SELECT id, apns_environment AS environment, token,
+                retry_not_before AS retryNotBefore,
+                notification_categories AS categories
+           FROM push_endpoints
+          WHERE client_id = ?1 AND surface = 'ios-notification' AND invalidated_at IS NULL
+          ORDER BY id`,
+      )
+      .bind(clientId)
+      .all();
+    const endpoints = result.results ?? [];
+    if (endpoints.length === 0) return new Response(null, { status: 202 });
+
+    const cached = await this.ctx.storage.get(TOKEN_CACHE_KEY);
+    const apns = createApnsClient(this.env, { tokenCache: cached ?? null });
+    const now = Date.now();
+
+    for (const endpoint of endpoints) {
+      // "Notify me when…" preference: NULL means every category.
+      if (
+        typeof endpoint.categories === "string" &&
+        !endpoint.categories.split(",").includes(payload.category)
+      ) {
+        continue;
+      }
+      const retryNotBefore = Number(endpoint.retryNotBefore);
+      if (Number.isFinite(retryNotBefore) && retryNotBefore > Math.floor(now / 1000)) {
+        continue;
+      }
+      let outcome;
+      try {
+        outcome = await apns.send(
+          {
+            token: endpoint.token,
+            surface: "ios-notification",
+            environment: endpoint.environment,
+            apnsId: await deliveryApnsId(endpoint.id, dedupeKey, "notification"),
+          },
+          payload,
+        );
+      } catch (error) {
+        console.error(
+          "agent notification build/send failed",
+          error instanceof Error ? error.message : error,
+        );
+        continue;
+      }
+      if (outcome.tokenCache) {
+        await this.ctx.storage.put(TOKEN_CACHE_KEY, outcome.tokenCache);
+      } else {
+        await this.ctx.storage.delete(TOKEN_CACHE_KEY);
+      }
+      if (outcome.outcome === "invalidate") {
+        await this.invalidateEndpoint(endpoint.id);
+      } else if (outcome.outcome === "retry" || outcome.outcome === "fatal") {
+        const retryAt = outcome.outcome === "retry"
+          ? retryAtFromHeader(outcome.retryAfter, now)
+          : now + FATAL_RETRY_MILLISECONDS;
+        await this.deferEndpoint(endpoint.id, retryAt, outcome.reason ?? "APNsError");
+      }
+    }
+    return new Response(null, { status: 202 });
+  }
+
   async deliverClient(clientId, force) {
     const state = await aggregateClientState(this.env.DB, clientId);
     const result = await this.env.DB
@@ -207,26 +300,35 @@ export class PushCoordinator extends DurableObject {
     let pushed = false;
     const now = Date.now();
 
+    // The Live Activity lives while anything is active: a running TTY or a
+    // running/waiting agent (the Dynamic Island is "active while agents run",
+    // AGENT_MONITORING_DESIGN.md §5). Done agents don't keep it alive.
+    const totalActive =
+      state.totalRunning + (state.agentsRunning ?? 0) + (state.agentsWaiting ?? 0);
+
     for (const endpoint of endpoints) {
+      const surface = endpoint.surface;
+      // Notification endpoints are event pushes handled by /notification,
+      // never state syncs.
+      if (surface === "ios-notification") continue;
       if (!force && Number(endpoint.lastSequence) >= state.sequence) continue;
       const retryNotBefore = Number(endpoint.retryNotBefore);
       if (Number.isFinite(retryNotBefore) && retryNotBefore > Math.floor(now / 1000)) {
         earliestRetryAt = earlier(earliestRetryAt, retryNotBefore * 1000);
         continue;
       }
-      const surface = endpoint.surface;
       let payload = {};
 
       if (surface === "liveactivity-start") {
-        if (state.totalRunning === 0 || Number(endpoint.lastTotalRunning ?? 0) > 0) {
-          await this.markDelivered(endpoint.id, state);
+        if (totalActive === 0 || Number(endpoint.lastTotalRunning ?? 0) > 0) {
+          await this.markDelivered(endpoint.id, state, totalActive);
           continue;
         }
         payload = { state, event: "start" };
       } else if (surface === "liveactivity-update") {
         payload = {
           state,
-          event: state.totalRunning === 0 ? "end" : "update",
+          event: totalActive === 0 ? "end" : "update",
         };
       }
 
@@ -265,11 +367,11 @@ export class PushCoordinator extends DurableObject {
       }
 
       if (outcome.outcome === "success") {
-        const endActivity = surface === "liveactivity-update" && state.totalRunning === 0;
+        const endActivity = surface === "liveactivity-update" && totalActive === 0;
         if (endActivity) {
           await this.deleteEndpoint(endpoint.id);
         } else {
-          await this.markDelivered(endpoint.id, state);
+          await this.markDelivered(endpoint.id, state, totalActive);
         }
         pushed = true;
       } else if (outcome.outcome === "invalidate") {
@@ -306,7 +408,10 @@ export class PushCoordinator extends DurableObject {
     return earliestRetryAt;
   }
 
-  async markDelivered(endpointId, state) {
+  /// `totalActive` (TTYs + running/waiting agents) is the Live Activity
+  /// lifecycle baseline stored in last_total_running; it defaults to the TTY
+  /// count for callers that predate agent counts.
+  async markDelivered(endpointId, state, totalActive = state.totalRunning) {
     const now = Math.floor(Date.now() / 1000);
     await this.env.DB
       .prepare(
@@ -319,7 +424,7 @@ export class PushCoordinator extends DurableObject {
                 last_failure_reason = NULL
           WHERE id = ?1`,
       )
-      .bind(endpointId, state.sequence, state.totalRunning, now)
+      .bind(endpointId, state.sequence, totalActive, now)
       .run();
   }
 

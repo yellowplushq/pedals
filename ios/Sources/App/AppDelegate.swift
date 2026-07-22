@@ -24,4 +24,19 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     ) -> UISceneConfiguration {
         UISceneConfiguration(name: "Default", sessionRole: connectingSceneSession.role)
     }
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        AgentNotificationController.shared.handleDeviceToken(deviceToken)
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        // Simulators and denied-network cases land here; APNs registration
+        // retries on the next launch/foreground via registerWhenPaired.
+    }
 }

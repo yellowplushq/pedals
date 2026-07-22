@@ -14,6 +14,10 @@ struct WatchTerminalDescriptor: Identifiable, Hashable, Sendable {
     var cols: Int
     var rows: Int
     var alive: Bool
+    /// State/kind of the agent running inside this terminal, nil when none
+    /// does (the row morph of the ownership/dedup rule, scaled to the Watch).
+    var agentState: AgentState?
+    var agentSlug: String?
 }
 
 struct WatchTerminalComputer: Identifiable, Equatable, Sendable {
@@ -26,6 +30,10 @@ struct WatchTerminalComputer: Identifiable, Equatable, Sendable {
     /// list means "still connecting", not "no terminals".
     var ready: Bool
     var terminals: [WatchTerminalDescriptor]
+    /// Agents not matched to a visible terminal (the standalone Agents
+    /// section). Managed agents render inside their terminal row instead —
+    /// an agent never appears in both places.
+    var agents: [AgentInfo]
 }
 
 @MainActor
@@ -67,6 +75,10 @@ final class WatchTerminalStore {
         guard !started else { return }
         started = true
         for connection in connections.values { connection.start() }
+        #if DEBUG
+        // The layout fixture has no connections to trigger a publish.
+        if Self.fixtureComputers != nil { publishComputers() }
+        #endif
     }
 
     func stop() {
@@ -86,6 +98,14 @@ final class WatchTerminalStore {
 
     func descriptor(for id: WatchTerminalID) -> WatchTerminalDescriptor? {
         computers.lazy.flatMap(\.terminals).first { $0.id == id }
+    }
+
+    /// Optimistic dismissal, mirroring the iPhone Home list: the row hides
+    /// immediately, the daemon drops the record for every client, and the
+    /// agent's next hook event recreates it.
+    func dismissAgent(computerID: String, agentID: String) {
+        connections[computerID]?.dismissAgent(id: agentID)
+        publishComputers()
     }
 
     func session(for descriptor: WatchTerminalDescriptor) -> WatchTerminalSession? {
@@ -110,6 +130,21 @@ final class WatchTerminalStore {
 
     private func replaceContext(_ context: WatchTerminalContext?, persist: Bool) {
         guard context != self.context else { return }
+
+        // The phone stamps a fresh timestamp revision on every send, so
+        // deliveries differ even when the credential payload is unchanged.
+        // Tearing down live connections (and dismissing an open terminal)
+        // over a revision-only change would reset the UI on every wake;
+        // just record the newer revision instead.
+        if let context, let current = self.context,
+           context.identity == current.identity,
+           context.bindings == current.bindings {
+            self.context = context
+            if persist {
+                WatchTerminalCredentialStore.save(context)
+            }
+            return
+        }
 
         for connection in connections.values { connection.stop() }
         for session in terminalSessions.values { session.stop() }
@@ -152,13 +187,72 @@ final class WatchTerminalStore {
         WatchStatusBridge.shared.requestCurrentContext()
     }
 
+    #if DEBUG
+    /// Dev-only layout fixture (`PEDALS_WATCH_HOME_FIXTURE=1`): a realistic
+    /// two-section status list without needing a paired phone.
+    private static let fixtureComputers: [WatchTerminalComputer]? = {
+        guard ProcessInfo.processInfo.environment["PEDALS_WATCH_HOME_FIXTURE"] == "1"
+        else { return nil }
+        let now = Date().timeIntervalSince1970
+        func agent(
+            _ slug: String, _ state: AgentState, cwd: String, age: Double,
+            prompt: String? = nil, message: String? = nil, action: String? = nil
+        ) -> AgentInfo {
+            AgentInfo(
+                id: "fx-\(slug)", agent: slug, state: state, cwd: cwd,
+                action: action, message: message, prompt: prompt,
+                updatedAt: now - age
+            )
+        }
+        return [
+            WatchTerminalComputer(
+                id: "fixture", name: "Studio", online: true, ready: true,
+                terminals: [
+                    WatchTerminalDescriptor(
+                        id: WatchTerminalID(computerID: "fixture", sessionID: 1),
+                        computerName: "Studio", title: "zsh — pedals",
+                        cols: 80, rows: 24, alive: true,
+                        agentState: .waiting, agentSlug: "claude"
+                    ),
+                    WatchTerminalDescriptor(
+                        id: WatchTerminalID(computerID: "fixture", sessionID: 2),
+                        computerName: "Studio", title: "zsh — ~",
+                        cols: 80, rows: 24, alive: true,
+                        agentState: nil, agentSlug: nil
+                    ),
+                ],
+                agents: [
+                    agent(
+                        "codex", .running, cwd: "/Users/eyhn/Projects/website",
+                        age: 300, action: "Bash: npm run build"
+                    ),
+                    agent(
+                        "kiro", .done, cwd: "/Users/eyhn/Projects/blog",
+                        age: 3600, message: "Deployed the new landing page."
+                    ),
+                    agent(
+                        "grok", .error, cwd: "/Users/eyhn/Projects/experiments",
+                        age: 10800, message: "API rate limit exceeded"
+                    ),
+                ]
+            ),
+        ]
+    }()
+    #endif
+
     private func publishComputers() {
         let previousListState = Self.listState(computers)
-        let updatedComputers = connections.values
+        var updatedComputers = connections.values
             .map(\.snapshot)
             .sorted { lhs, rhs in
                 lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
             }
+        #if DEBUG
+        if let fixture = Self.fixtureComputers {
+            updatedComputers = fixture
+            hasCredentials = true
+        }
+        #endif
         computers = updatedComputers
 
         if Self.listState(updatedComputers) != previousListState {
@@ -205,14 +299,39 @@ private final class WatchTerminalComputerConnection {
     private var peerSessions: [SessionInfo] = []
     private var visibleSessions: [SessionInfo] = []
     private var receivedSessions = false
+    private var agents: [AgentInfo] = []
+    /// Optimistic dismissal overlay: agent id → the state it was dismissed
+    /// in. Hidden while the broadcast still shows that state; pruned when
+    /// the agent disappears or moves on (then it shows again).
+    private var dismissed: [String: AgentState] = [:]
 
     init(binding: ComputerBinding, identity: ClientIdentity) {
         self.binding = binding
         self.identity = identity
     }
 
+    func dismissAgent(id: String) {
+        guard let info = agents.first(where: { $0.id == id }) else { return }
+        dismissed[id] = info.state
+        control?.send(.dismissAgent(agentId: id))
+    }
+
     var snapshot: WatchTerminalComputer {
         let name = hostName ?? "Computer \(binding.computerID.prefix(6))"
+        let visible = agents.filter { dismissed[$0.id] != $0.state }
+        let visibleIDs = Set(visibleSessions.map(\.id))
+        // Ownership dedup: managed agents morph their terminal row; the rest
+        // land in the standalone Agents section (never both).
+        let managed = Dictionary(
+            grouping: visible.compactMap { info in
+                info.sessionId.flatMap { visibleIDs.contains($0) ? (sid: $0, info: info) : nil }
+            },
+            by: \.sid
+        )
+        let standalone = visible.filter { info in
+            guard let sid = info.sessionId else { return true }
+            return !visibleIDs.contains(sid)
+        }
         return WatchTerminalComputer(
             id: binding.computerID,
             name: name,
@@ -228,9 +347,12 @@ private final class WatchTerminalComputerConnection {
                     title: session.title,
                     cols: session.cols,
                     rows: session.rows,
-                    alive: session.alive
+                    alive: session.alive,
+                    agentState: managed[session.id]?.first?.info.state,
+                    agentSlug: managed[session.id]?.first?.info.agent
                 )
-            }
+            },
+            agents: standalone
         )
     }
 
@@ -293,7 +415,12 @@ private final class WatchTerminalComputerConnection {
                 peerSessions[index].alive = false
                 applyDirectory()
             }
-        case .ready, .requestReplay, .create, .created, .close, .err:
+        case .agents(let list):
+            agents = list
+            dismissed = dismissed.filter { id, state in
+                list.contains { $0.id == id && $0.state == state }
+            }
+        case .ready, .requestReplay, .create, .created, .close, .dismissAgent, .err:
             break
         }
         onChange?()
@@ -309,7 +436,10 @@ private final class WatchTerminalComputerConnection {
         directoryEntries = directory.online
             ? Dictionary(uniqueKeysWithValues: directory.sessions.map { ($0.id, $0.alive) })
             : [:]
-        if !directory.online { peerSessions.removeAll(keepingCapacity: true) }
+        if !directory.online {
+            peerSessions.removeAll(keepingCapacity: true)
+            agents.removeAll(keepingCapacity: true)
+        }
         applyDirectory()
         onChange?()
     }

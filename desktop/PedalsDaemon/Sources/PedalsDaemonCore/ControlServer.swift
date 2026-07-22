@@ -2,12 +2,24 @@ import Darwin
 import Foundation
 
 /// Newline-delimited JSON request on the daemon's unix control socket
-/// (PROTOCOL.md §7): `{"cmd":"ls"|"kill"|"pair"|"cancelPair"|"status"|"new", "id":N?}`.
-/// `reset` extends `pair` for `pedals pair --reset`.
+/// (PROTOCOL.md §7): `{"cmd":"ls"|"kill"|"pair"|"cancelPair"|"status"|"new"|
+/// "agent-event"|"agents", "id":N?}`. `reset` extends `pair` for
+/// `pedals pair --reset`; the `agent`… fields extend `agent-event` for the
+/// pedals-hook reporter.
 public struct ControlRequest: Decodable, Sendable {
     public var cmd: String
     public var id: Int?
     public var reset: Bool?
+    // agent-event (AgentMonitor)
+    public var agent: String?
+    public var event: String?
+    public var agentSessionId: String?
+    public var cwd: String?
+    public var prompt: String?
+    public var message: String?
+    public var action: String?
+    public var agentError: Bool?
+    public var lineage: [AgentLineageEntry]?
 }
 
 /// Minimal JSON value for building `{"ok":true, ...}` responses without a

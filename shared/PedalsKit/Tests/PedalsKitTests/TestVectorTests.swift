@@ -43,6 +43,26 @@ final class TestVectorTests: XCTestCase {
         )
     }
 
+    /// key_notify = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="notification", 32).
+    /// Distinct from both traffic keys so the NSE-held key exposes no relay traffic.
+    func testHKDFNotificationKeyVector() {
+        XCTAssertEqual(
+            hex(AgentNotification.notificationKey(secret: secret)),
+            "c5a359a64ceabcaf3aef9654f1d571dee246ba6be9ecf0cf08cc9c37e540e068"
+        )
+    }
+
+    func testAgentNotificationSealRoundTripsAndBindsComputerID() throws {
+        let key = AgentNotification.notificationKey(secret: secret)
+        let content = AgentNotification.Content(
+            agent: "claude", category: .waiting,
+            message: "Waiting for your answer", cwd: "/tmp/proj", sessionId: 7
+        )
+        let sealed = try AgentNotification.seal(content, key: key, computerID: "c-1")
+        XCTAssertEqual(try AgentNotification.open(sealed, key: key, computerID: "c-1"), content)
+        XCTAssertThrowsError(try AgentNotification.open(sealed, key: key, computerID: "c-2"))
+    }
+
     func testSealedMessageVectorDecrypts() throws {
         let message = Data(hexString:
             "0100000000000000" // seq = 1, u64 LE

@@ -110,12 +110,41 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
         "stale-date": 1_700_000_300,
         "content-state": {
           totalRunning: 3,
+          agentsRunning: 0,
+          agentsWaiting: 0,
           onlineComputerCount: 1,
           offlineComputerCount: 1,
           updatedAt: 721_692_800,
           sequence: 9,
         },
       },
+    },
+  );
+  // Agent counts flow into content-state when the aggregate carries them.
+  assert.deepEqual(
+    buildApnsPayload(
+      "liveactivity-update",
+      {
+        state: {
+          totalRunning: 0,
+          agentsRunning: 2,
+          agentsWaiting: 1,
+          sequence: 12,
+          updatedAt: "2023-11-14T22:13:20Z",
+          computers: [{ online: true }],
+        },
+        event: "update",
+      },
+      1_700_000_000_999,
+    ).aps["content-state"],
+    {
+      totalRunning: 0,
+      agentsRunning: 2,
+      agentsWaiting: 1,
+      onlineComputerCount: 1,
+      offlineComputerCount: 0,
+      updatedAt: 721_692_800,
+      sequence: 12,
     },
   );
 
@@ -138,6 +167,8 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
   assert.deepEqual(start.aps.attributes, { scope: "all" });
   assert.deepEqual(start.aps["content-state"], {
     totalRunning: 1,
+    agentsRunning: 0,
+    agentsWaiting: 0,
     onlineComputerCount: 1,
     offlineComputerCount: 0,
     updatedAt: 0,
@@ -182,6 +213,66 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
   assert.throws(
     () => buildApnsPayload("unknown", {}),
     /not supported/,
+  );
+});
+
+test("builds agent notification payloads with generic text and opaque sealed blob", () => {
+  const sealed = Buffer.from("ciphertext").toString("base64");
+  assert.deepEqual(
+    buildApnsPayload("ios-notification", {
+      category: "waiting",
+      computerId: "c".repeat(32),
+      sessionId: 7,
+      hostName: "Studio",
+      sealed,
+    }),
+    {
+      aps: {
+        alert: { title: "Studio", body: "An agent needs your input" },
+        sound: "default",
+        "thread-id": "c".repeat(32),
+        category: "PEDALS_AGENT_NOTIFICATION",
+        "mutable-content": 1,
+      },
+      pedals: {
+        v: 1,
+        computerId: "c".repeat(32),
+        category: "waiting",
+        sessionId: 7,
+        sealed,
+      },
+    },
+  );
+
+  // Unmanaged agent: no session id; no host name falls back to "Pedals".
+  const minimal = buildApnsPayload("ios-notification", {
+    category: "done",
+    computerId: "d".repeat(32),
+  });
+  assert.equal(minimal.aps.alert.title, "Pedals");
+  assert.equal(minimal.aps.alert.body, "An agent finished its task");
+  assert.equal(minimal.pedals.sessionId, undefined);
+  assert.equal(minimal.pedals.sealed, undefined);
+
+  assert.throws(
+    () => buildApnsPayload("ios-notification", { category: "nope", computerId: "e".repeat(32) }),
+    /category/,
+  );
+  assert.throws(
+    () => buildApnsPayload("ios-notification", {
+      category: "waiting",
+      computerId: "e".repeat(32),
+      sealed: "not base64!!",
+    }),
+    /base64/,
+  );
+  assert.throws(
+    () => buildApnsPayload("ios-notification", {
+      category: "waiting",
+      computerId: "e".repeat(32),
+      aps: { alert: "injected" },
+    }),
+    /not allowed/,
   );
 });
 

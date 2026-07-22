@@ -9,13 +9,30 @@ final class RelayMetadataTests: XCTestCase {
             sessions: [
                 .init(id: 4, alive: true),
                 .init(id: 9, alive: false),
-            ]
+            ],
+            agents: .init(running: 2, waiting: 1)
         )
         let text = try metadata.jsonText()
         XCTAssertEqual(try RelayMetadata(jsonText: text), metadata)
         XCTAssertFalse(text.contains("title"))
         XCTAssertFalse(text.contains("cwd"))
         XCTAssertFalse(text.contains("stdout"))
+        XCTAssertFalse(text.contains("message"))
+    }
+
+    func testHostSnapshotWithoutAgentCountsDecodesAsZero() throws {
+        let text = #"{"hostName":"Studio","sessions":[{"alive":true,"id":3}],"type":"host-snapshot"}"#
+        guard case .hostSnapshot(_, _, let agents) = try RelayMetadata(jsonText: text) else {
+            return XCTFail("expected host snapshot")
+        }
+        XCTAssertEqual(agents, .zero)
+    }
+
+    func testHostSnapshotRejectsOutOfRangeAgentCounts() {
+        let text = #"{"agents":{"running":256,"waiting":0},"hostName":"Studio","sessions":[],"type":"host-snapshot"}"#
+        XCTAssertThrowsError(try RelayMetadata(jsonText: text))
+        let negative = #"{"agents":{"running":0,"waiting":-1},"hostName":"Studio","sessions":[],"type":"host-snapshot"}"#
+        XCTAssertThrowsError(try RelayMetadata(jsonText: negative))
     }
 
     func testOfflineDirectoryRoundTripsWithReason() throws {

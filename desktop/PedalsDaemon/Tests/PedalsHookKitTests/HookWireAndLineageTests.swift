@@ -1,0 +1,70 @@
+import Darwin
+import Foundation
+import XCTest
+
+@testable import PedalsHookKit
+
+final class HookWireAndLineageTests: XCTestCase {
+    func testRequestLineShape() throws {
+        let report = HookReport(
+            event: "tool", agentSessionId: "s-1", cwd: "/tmp/p",
+            action: "Bash: git status"
+        )
+        let lineage = [
+            LineageEntry(pid: 10, name: "zsh", tty: "/dev/ttys003"),
+            LineageEntry(pid: 9, name: "claude"),
+        ]
+        let line = try XCTUnwrap(
+            HookWire.requestLine(agent: "claude", report: report, lineage: lineage)
+        )
+        XCTAssertEqual(line.last, 0x0A)
+        XCTAssertFalse(line.dropLast().contains(0x0A), "wire form is one line")
+
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: line) as? [String: Any]
+        )
+        XCTAssertEqual(object["cmd"] as? String, "agent-event")
+        XCTAssertEqual(object["agent"] as? String, "claude")
+        XCTAssertEqual(object["event"] as? String, "tool")
+        XCTAssertEqual(object["agentSessionId"] as? String, "s-1")
+        XCTAssertEqual(object["cwd"] as? String, "/tmp/p")
+        XCTAssertEqual(object["action"] as? String, "Bash: git status")
+        XCTAssertNil(object["prompt"])
+        XCTAssertNil(object["agentError"])
+        let wireLineage = try XCTUnwrap(object["lineage"] as? [[String: Any]])
+        XCTAssertEqual(wireLineage.count, 2)
+        XCTAssertEqual(wireLineage[0]["pid"] as? Int, 10)
+        XCTAssertEqual(wireLineage[0]["tty"] as? String, "/dev/ttys003")
+        XCTAssertEqual(wireLineage[1]["name"] as? String, "claude")
+        XCTAssertNil(wireLineage[1]["tty"])
+    }
+
+    func testRequestLineCarriesAgentError() throws {
+        let report = HookReport(
+            event: "stop", agentSessionId: "s-1", message: "API Error", agentError: true
+        )
+        let line = try XCTUnwrap(
+            HookWire.requestLine(agent: "claude", report: report, lineage: [])
+        )
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: line) as? [String: Any]
+        )
+        XCTAssertEqual(object["agentError"] as? Bool, true)
+        XCTAssertEqual(object["message"] as? String, "API Error")
+    }
+
+    func testLineageWalkFindsSelfAncestry() {
+        let entries = ProcessLineage.walk(from: getpid())
+        XCTAssertFalse(entries.isEmpty)
+        XCTAssertEqual(entries.first?.pid, getpid())
+        XCTAssertFalse(entries.first?.name.isEmpty ?? true)
+        XCTAssertLessThanOrEqual(entries.count, 15)
+        // Pids strictly walk upward without cycles.
+        XCTAssertEqual(Set(entries.map(\.pid)).count, entries.count)
+    }
+
+    func testLineageRejectsNonPositivePids() {
+        XCTAssertTrue(ProcessLineage.walk(from: 0).isEmpty)
+        XCTAssertTrue(ProcessLineage.walk(from: -5).isEmpty)
+    }
+}

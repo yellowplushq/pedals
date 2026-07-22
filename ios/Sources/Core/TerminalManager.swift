@@ -2,6 +2,15 @@ import Combine
 import Foundation
 import PedalsKit
 
+/// One observed coding-agent session, tagged with the computer it runs on
+/// (docs/AGENT_MONITORING_DESIGN.md §4).
+struct AgentRow: Equatable {
+    let computerID: String
+    let computerName: String
+    let hostOnline: Bool
+    let info: AgentInfo
+}
+
 /// One tab in the client-maintained cross-computer terminal list.
 struct Terminal: Equatable {
     let id: TerminalID
@@ -34,6 +43,9 @@ final class TerminalManager {
     @Published private(set) var activeID: TerminalID?
     /// Data-channel phase per terminal; missing key = asleep / never opened.
     @Published private(set) var phases: [TerminalID: TerminalChannel.Phase] = [:]
+    /// Every observed coding agent from every bound computer, in computer
+    /// order (unsorted within a computer — presentation sorts).
+    @Published private(set) var agentRows: [AgentRow] = []
 
     enum Output {
         case replay(Data)
@@ -49,6 +61,9 @@ final class TerminalManager {
     let errors = PassthroughSubject<String, Never>()
     /// Transient, non-blocking app-level feedback.
     let notices = PassthroughSubject<String, Never>()
+    /// A terminal created by *this* device just became active (the `created`
+    /// echo matched one of our reqs) — the UI should switch to its page.
+    let ownCreations = PassthroughSubject<TerminalID, Never>()
 
     static let maxLiveChannels = 6
     /// How long to hold an unidentified new session off the tab list while our
@@ -64,6 +79,14 @@ final class TerminalManager {
     private var placeAsOwnWhenSeen: Set<TerminalID> = []
     /// New ids held back during `placementGrace` (see above).
     private var heldAppends: [TerminalID: SessionInfo] = [:]
+    /// Latest per-computer agent snapshot, captured from the EMISSIONS (never
+    /// read back off the connection — @Published emits during willSet).
+    private struct AgentSource {
+        var agents: [AgentInfo]
+        var hostOnline: Bool
+        var computerName: String
+    }
+    private var agentSources: [String: AgentSource] = [:]
 
     init(pairingStore: PairingStore) {
         self.pairingStore = pairingStore
@@ -151,6 +174,18 @@ final class TerminalManager {
                 self.handle(event: event, from: connection)
             }
             .store(in: &cancellables)
+        connection.$agents
+            .combineLatest(connection.$hostOnline, connection.$hostName)
+            .sink { [weak self, weak connection] agents, hostOnline, hostName in
+                guard let self, let connection else { return }
+                let name = hostName.flatMap { $0.isEmpty ? nil : $0 }
+                    ?? "Computer \(connection.binding.computerID.prefix(6))"
+                self.agentSources[connection.id] = AgentSource(
+                    agents: agents, hostOnline: hostOnline, computerName: name
+                )
+                self.rebuildAgentRows()
+            }
+            .store(in: &cancellables)
         subscriptions[connection.id] = cancellables
         connection.start()
     }
@@ -167,12 +202,51 @@ final class TerminalManager {
         // can never open a channel or be closed.
         heldAppends = heldAppends.filter { $0.key.computerID != connection.id }
         placeAsOwnWhenSeen = placeAsOwnWhenSeen.filter { $0.computerID != connection.id }
+        agentSources.removeValue(forKey: connection.id)
+        rebuildAgentRows()
     }
 
     // MARK: - Terminal accessors
 
     func terminal(_ id: TerminalID) -> Terminal? {
         terminals.first { $0.id == id }
+    }
+
+    // MARK: - Agents
+
+    private func rebuildAgentRows() {
+        agentRows = computers.flatMap { connection -> [AgentRow] in
+            guard let source = agentSources[connection.id] else { return [] }
+            return source.agents.map {
+                AgentRow(
+                    computerID: connection.id,
+                    computerName: source.computerName,
+                    hostOnline: source.hostOnline,
+                    info: $0
+                )
+            }
+        }
+    }
+
+    /// The managed agent running inside terminal `id`, if any. Should several
+    /// hooks report the same PTY, the most attention-worthy (waiting > error >
+    /// running > done, then most recently updated) wins.
+    func agent(for id: TerminalID) -> AgentInfo? {
+        Self.agent(for: id, in: agentRows)
+    }
+
+    /// Static so views can resolve against *emitted* rows (a sink must never
+    /// read `agentRows` back off the manager — @Published emits during willSet).
+    static func agent(for id: TerminalID, in rows: [AgentRow]) -> AgentInfo? {
+        rows
+            .filter { $0.computerID == id.computerID && $0.info.sessionId == id.sid }
+            .map(\.info)
+            .min { lhs, rhs in
+                if lhs.state.attentionRank != rhs.state.attentionRank {
+                    return lhs.state.attentionRank < rhs.state.attentionRank
+                }
+                return lhs.updatedAt > rhs.updatedAt
+            }
     }
 
     // MARK: - Activation + connection pool
@@ -258,6 +332,13 @@ final class TerminalManager {
         else { return }
         terminals[index].closing = true
         computer(id: id.computerID)?.closeSession(id: id.sid)
+    }
+
+    /// Forwards an agent dismissal to its daemon (the Home list is
+    /// bidirectional): the record disappears for every client until the
+    /// agent's next hook event. The caller hides the row optimistically.
+    func dismissAgent(computerID: String, agentID: String) {
+        computer(id: computerID)?.dismissAgent(id: agentID)
     }
 
     // MARK: - Terminal I/O passthrough
@@ -387,6 +468,7 @@ final class TerminalManager {
         let terminal = Terminal(id: id, info: info, computerName: computerName)
         terminals.insert(terminal, at: insertionIndexAfterActive())
         activate(id)
+        ownCreations.send(id)
     }
 
     private func moveAfterActiveAndActivate(_ id: TerminalID) {
@@ -394,6 +476,7 @@ final class TerminalManager {
         let terminal = terminals.remove(at: from)
         terminals.insert(terminal, at: insertionIndexAfterActive())
         activate(id)
+        ownCreations.send(id)
     }
 
     private func insertionIndexAfterActive() -> Int {
@@ -423,5 +506,22 @@ final class TerminalManager {
             activeID = nil
             if let fallback { activate(fallback.id) }
         }
+    }
+}
+
+extension AgentState {
+    /// Attention order for sorting and dedup: waiting > error > running > done.
+    var attentionRank: Int {
+        switch self {
+        case .waiting: 0
+        case .error: 1
+        case .running: 2
+        case .done: 3
+        }
+    }
+
+    /// States that should pull the user in ("needs you").
+    var needsAttention: Bool {
+        self == .waiting || self == .error
     }
 }

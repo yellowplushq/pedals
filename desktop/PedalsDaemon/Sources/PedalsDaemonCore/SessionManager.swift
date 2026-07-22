@@ -236,6 +236,36 @@ public final class SessionManager: @unchecked Sendable {
         }
     }
 
+    /// Snapshot for coding-agent ownership matching (AgentMonitor,
+    /// docs/AGENT_MONITORING_DESIGN.md §4): the slave tty path and shell pid
+    /// of every live session. A hook-reported tty equal to `ttyPath`, or a
+    /// hook lineage containing `shellPid`, proves the agent runs inside that
+    /// session.
+    public struct AgentMatchTarget: Equatable, Sendable {
+        public let sessionId: Int
+        public let ttyPath: String?
+        public let shellPid: pid_t
+
+        public init(sessionId: Int, ttyPath: String?, shellPid: pid_t) {
+            self.sessionId = sessionId
+            self.ttyPath = ttyPath
+            self.shellPid = shellPid
+        }
+    }
+
+    public func agentMatchTargets() -> [AgentMatchTarget] {
+        queue.sync {
+            sessions.values
+                .filter(\.alive)
+                .sorted { $0.id < $1.id }
+                .map {
+                    AgentMatchTarget(
+                        sessionId: $0.id, ttyPath: $0.pty.ttyPath, shellPid: $0.pty.pid
+                    )
+                }
+        }
+    }
+
     public func closeAll() {
         queue.sync {
             for session in sessions.values where session.alive {

@@ -6,6 +6,7 @@ struct MenuView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var updater: UpdaterModel
     @EnvironmentObject private var permissions: PermissionsModel
+    @Environment(\.openWindow) private var openWindow
     @State private var showingPairingCode = false
 
     var body: some View {
@@ -66,7 +67,9 @@ struct MenuView: View {
 
             Spacer()
 
-            SettingsLink {
+            Button {
+                openWindow(id: SettingsWindow.id)
+            } label: {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(.borderless)
@@ -125,7 +128,9 @@ struct MenuView: View {
     // MARK: Permissions
 
     private var permissionsReminder: some View {
-        SettingsLink {
+        Button {
+            openWindow(id: SettingsWindow.id)
+        } label: {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(PedalsTheme.warning)

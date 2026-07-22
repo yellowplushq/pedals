@@ -116,6 +116,7 @@ private struct TTYCountWidgetView: View {
                     Text("TTY")
                         .font(.caption2)
                         .foregroundStyle(PedalsTheme.secondaryContent)
+                    agentsLabel
                     alertLabel
                 }
                 Spacer(minLength: 0)
@@ -130,6 +131,7 @@ private struct TTYCountWidgetView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(unitLabel)
                         .font(.headline)
+                    agentsLabel
                     alertLabel
                 }
                 Spacer(minLength: 0)
@@ -142,6 +144,7 @@ private struct TTYCountWidgetView: View {
                 Text(unitLabel)
                     .font(.caption)
                     .foregroundStyle(PedalsTheme.secondaryContent)
+                agentsLabel
                 alertLabel
             }
         }
@@ -152,9 +155,38 @@ private struct TTYCountWidgetView: View {
     }
 
     private var inlineLabel: String {
-        let value = "\(entry.snapshot.totalRunning) TTY"
+        var value = "\(entry.snapshot.totalRunning) TTY"
+        if entry.snapshot.agentsWaiting > 0 {
+            value += " · \(entry.snapshot.agentsWaiting) waiting"
+        } else if entry.snapshot.agentsRunning > 0 {
+            value += " · \(entry.snapshot.agentsRunning) agents"
+        }
         guard let alert else { return value }
         return "\(value) · \(alert.text.lowercased())"
+    }
+
+    /// Coding-agent aggregate line ("2 running · 1 waiting"). Waiting is the
+    /// one state that justifies color under the black/white rule.
+    private var agentsLine: (text: String, needsYou: Bool)? {
+        let running = entry.snapshot.agentsRunning
+        let waiting = entry.snapshot.agentsWaiting
+        guard running > 0 || waiting > 0 else { return nil }
+        var parts: [String] = []
+        if running > 0 { parts.append("\(running) running") }
+        if waiting > 0 { parts.append("\(waiting) waiting") }
+        return (parts.joined(separator: " · "), waiting > 0)
+    }
+
+    @ViewBuilder
+    private var agentsLabel: some View {
+        if let line = agentsLine {
+            Label(line.text, systemImage: "sparkles")
+                .font(.caption2)
+                .foregroundStyle(
+                    line.needsYou ? PedalsTheme.warning : PedalsTheme.secondaryContent
+                )
+                .lineLimit(1)
+        }
     }
 
     private var alert: (symbol: String, text: String)? {

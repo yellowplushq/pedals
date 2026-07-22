@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import GhosttyTerminal
 import PedalsKit
@@ -37,6 +38,11 @@ final class AppServices {
                 self?.observeStatusChanges(in: computers)
                 self?.synchronizeWatchTerminalContext()
                 self?.scheduleStatusRefresh()
+                // The notification permission prompt waits for the first
+                // pairing; an unpaired install never sees it.
+                if !computers.isEmpty {
+                    AgentNotificationController.shared.registerWhenPaired()
+                }
             }
             .store(in: &statusSubscriptions)
     }
@@ -48,7 +54,15 @@ final class AppServices {
             }
         }
         IOSWatchConnectivityBridge.shared.activate()
+        // Delegate installation must precede any notification tap delivery
+        // (a tap can cold-start the process).
+        AgentNotificationController.shared.activate()
         TTYLiveActivityController.shared.startObservingPushTokens()
+        #if DEBUG
+        if let spec = ProcessInfo.processInfo.environment["PEDALS_LA_FIXTURE"] {
+            TTYLiveActivityController.shared.startFixtureActivity(spec: spec)
+        }
+        #endif
         PushEndpointRegistrar.requestFlush()
         installSharedCredential()
         scheduleStatusRefresh(immediate: true)
@@ -128,6 +142,19 @@ final class AppServices {
         synchronizeWatchTerminalContext()
     }
 
+    /// Mirrors the per-computer notification keys into the shared keychain
+    /// group for the Notification Service Extension. Derived keys only —
+    /// the root computer secrets never leave the app's own group.
+    private func synchronizeNotificationKeys(bindings: [ComputerBinding]) {
+        var keys: [String: Data] = [:]
+        for binding in bindings {
+            keys[binding.computerID] = AgentNotification
+                .notificationKey(secret: binding.secret)
+                .withUnsafeBytes { Data($0) }
+        }
+        AgentNotificationKeyStore.setKeys(keys)
+    }
+
     private func synchronizeWatchTerminalContext() {
         watchTerminalSyncTask?.cancel()
         let source: ClientIdentity
@@ -143,6 +170,7 @@ final class AppServices {
             }
             source = identity
             bindings = try pairingStore.loadAll()
+            synchronizeNotificationKeys(bindings: bindings)
         } catch {
             // Transient Keychain failure: keep the Watch's last-known-good
             // credential. The relay is the enforcement point for anything the

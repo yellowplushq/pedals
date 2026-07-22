@@ -53,6 +53,35 @@ public final class TTYLiveActivityController {
         observing = false
     }
 
+    #if DEBUG
+    /// Dev-only visual fixture: the production activity is APNs
+    /// push-to-start only, which a simulator cannot receive, so this renders
+    /// the identical UI from a locally requested activity.
+    /// `PEDALS_LA_FIXTURE="ttys:agentsRunning:agentsWaiting"`.
+    public func startFixtureActivity(spec: String) {
+        let counts = spec.split(separator: ":").compactMap { Int($0) }
+        guard counts.count == 3 else { return }
+        Task { @MainActor in
+            for activity in Activity<TTYActivityAttributes>.activities {
+                await activity.end(nil, dismissalPolicy: .immediate)
+            }
+            let state = TTYActivityAttributes.ContentState(
+                totalRunning: counts[0],
+                agentsRunning: counts[1],
+                agentsWaiting: counts[2],
+                onlineComputerCount: 1,
+                offlineComputerCount: 0,
+                updatedAt: .now,
+                sequence: 1
+            )
+            _ = try? Activity<TTYActivityAttributes>.request(
+                attributes: TTYActivityAttributes(),
+                content: ActivityContent(state: state, staleDate: nil)
+            )
+        }
+    }
+    #endif
+
     private func observe(_ activity: Activity<TTYActivityAttributes>) {
         observeUpdateToken(for: activity)
         observeState(for: activity)
@@ -64,14 +93,18 @@ public final class TTYLiveActivityController {
     /// duplicate Dynamic Island activity.
     public func synchronize(with snapshot: TTYStatusSnapshot) async throws {
         StatusSharedStore.saveSnapshot(snapshot)
+        // The activity lives while anything is active: a running TTY or a
+        // running/waiting agent (the Worker uses the same lifecycle rule).
+        let totalActive =
+            snapshot.totalRunning + snapshot.agentsRunning + snapshot.agentsWaiting
         let content = ActivityContent(
             state: TTYActivityAttributes.ContentState(snapshot: snapshot),
             staleDate: snapshot.updatedAt.addingTimeInterval(5 * 60),
-            relevanceScore: snapshot.totalRunning > 0 ? 100 : 0
+            relevanceScore: totalActive > 0 ? 100 : 0
         )
 
         let activities = Activity<TTYActivityAttributes>.activities
-        if snapshot.totalRunning == 0 {
+        if totalActive == 0 {
             for activity in activities {
                 await activity.end(content, dismissalPolicy: .immediate)
             }

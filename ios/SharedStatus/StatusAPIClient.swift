@@ -5,6 +5,8 @@ public enum PushSurface: String, Codable, CaseIterable, Sendable {
     case watchWidget = "watch-widget"
     case iOSLiveActivityStart = "liveactivity-start"
     case iOSLiveActivityUpdate = "liveactivity-update"
+    /// Visible agent notifications (standard APNs device token).
+    case iOSNotification = "ios-notification"
 }
 
 public enum APNSEnvironment: String, Codable, Sendable {
@@ -25,17 +27,21 @@ public struct PushEndpointRegistration: Codable, Hashable, Sendable {
     public let token: String
     public let environment: APNSEnvironment
     public let activityId: String?
+    /// "Notify me when…" categories (ios-notification only); nil = all.
+    public let categories: [String]?
 
     public init(
         surface: PushSurface,
         token: String,
         environment: APNSEnvironment = .current,
-        activityId: String? = nil
+        activityId: String? = nil,
+        categories: [String]? = nil
     ) {
         self.surface = surface
         self.token = token
         self.environment = environment
         self.activityId = activityId
+        self.categories = categories
     }
 
 }
@@ -75,6 +81,7 @@ private struct PushEndpointRequestBody: Encodable {
     let token: String
     let environment: APNSEnvironment
     let activityId: String?
+    let categories: [String]?
 }
 
 public enum StatusAPIError: Error, LocalizedError, Sendable {
@@ -120,7 +127,8 @@ public struct StatusAPIClient: Sendable {
             PushEndpointRequestBody(
                 token: registration.token,
                 environment: registration.environment,
-                activityId: registration.activityId
+                activityId: registration.activityId,
+                categories: registration.categories
             )
         )
         authorize(&request, credential: credential)
