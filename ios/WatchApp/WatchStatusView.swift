@@ -226,7 +226,7 @@ struct WatchStatusView: View {
             return prompt
         }
         let project = (info.cwd as NSString).lastPathComponent
-        return project.isEmpty ? AgentNotification.displayName(forAgent: info.agent) : project
+        return project.isEmpty ? AgentActivity.displayName(forAgent: info.agent) : project
     }
 
     private func agentDetail(_ info: AgentInfo) -> String? {

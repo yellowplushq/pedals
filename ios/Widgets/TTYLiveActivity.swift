@@ -1,198 +1,298 @@
 import ActivityKit
+import CryptoKit
+import Foundation
+import PedalsKit
 import SwiftUI
 import WidgetKit
 
-/// The aggregate Pedals activity. Content is count-only by construction
-/// (AGENT_MONITORING_DESIGN.md §6): the Worker composes the push from D1
-/// counts (running/waiting agents next to the TTY count) and never sees
-/// agent names or messages. Waiting is the one state that justifies color
-/// under the black/white rule — the island turns orange while any agent
-/// waits on the user.
 struct TTYLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: TTYActivityAttributes.self) { context in
-            LockScreenBanner(state: context.state)
-                .padding(.horizontal)
-                .padding(.vertical, 2)
+            ActivityCard(state: context.state, stale: context.isStale)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
                 .foregroundStyle(PedalsTheme.content)
                 .activityBackgroundTint(PedalsTheme.canvas)
                 .activitySystemActionForegroundColor(PedalsTheme.content)
         } dynamicIsland: { context in
             let state = context.state
+            let agent = state.recentAgent
             return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "terminal.fill")
-                            .foregroundStyle(PedalsTheme.content)
-                        Text(state.totalRunning, format: .number)
-                            .font(.title3.bold())
-                            .monospacedDigit()
-                            .foregroundStyle(PedalsTheme.content)
-                            .contentTransition(.numericText())
-                        Text("TTY")
-                            .font(.caption)
-                            .foregroundStyle(PedalsTheme.secondaryContent)
-                    }
-                    .accessibilityLabel("\(state.totalRunning) terminals")
-                    .padding(.leading, 4)
-                    .padding(.top, 2)
+                    ActivityIdentity(agent: agent)
+                        .padding(.leading, 4)
+                        .padding(.top, 2)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    if state.totalAgents > 0 {
-                        HStack(spacing: 5) {
-                            Image(systemName: "sparkles")
-                                .foregroundStyle(
-                                    state.agentsWaiting > 0
-                                        ? PedalsTheme.warning : PedalsTheme.content
-                                )
-                            Text(state.totalAgents, format: .number)
-                                .font(.title3.bold())
-                                .monospacedDigit()
-                                .foregroundStyle(PedalsTheme.content)
-                                .contentTransition(.numericText())
-                            Text(state.totalAgents == 1 ? "agent" : "agents")
-                                .font(.caption)
-                                .foregroundStyle(PedalsTheme.secondaryContent)
-                        }
-                        .accessibilityLabel("\(state.totalAgents) agents")
+                    StatusPill(state: state, agent: agent)
                         .padding(.trailing, 4)
                         .padding(.top, 2)
-                    }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        AgentStateBreakdown(state: state)
-                        if state.offlineComputerCount > 0 {
-                            Label(
-                                "\(state.offlineComputerCount) offline",
-                                systemImage: "wifi.slash"
-                            )
-                            .foregroundStyle(PedalsTheme.warning)
-                            .font(.caption)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    // Inset from the island's large corner radius: content at
-                    // the region edge gets clipped by the capsule mask (the
-                    // breakdown row's leading dot loses a bite otherwise).
-                    .padding(.leading, 6)
-                    .padding(.bottom, 6)
+                    ActivityBody(state: state, agent: agent, stale: context.isStale)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 7)
+                        .privacySensitive()
                 }
             } compactLeading: {
-                // Attention first: an orange sparkle marks "needs you"; a
-                // plain sparkle marks agents at work; otherwise the terminal.
-                if state.agentsWaiting > 0 {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(PedalsTheme.warning)
-                } else if state.agentsRunning > 0 {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(PedalsTheme.content)
-                } else {
-                    Image(systemName: "terminal.fill")
-                        .foregroundStyle(PedalsTheme.content)
-                }
+                CompactMark(state: state, agent: agent)
             } compactTrailing: {
-                // One number, most urgent first: waiting agents (orange),
-                // then working agents, then TTYs.
-                Text(state.compactCount, format: .number)
-                    .fontWeight(.bold)
-                    .monospacedDigit()
-                    .foregroundStyle(
-                        state.agentsWaiting > 0 ? PedalsTheme.warning : PedalsTheme.content
-                    )
-                    .contentTransition(.numericText())
+                CompactValue(state: state, agent: agent)
             } minimal: {
-                Text(state.compactCount, format: .number)
-                    .fontWeight(.bold)
-                    .monospacedDigit()
-                    .foregroundStyle(
-                        state.agentsWaiting > 0 ? PedalsTheme.warning : PedalsTheme.content
-                    )
+                CompactMark(state: state, agent: agent)
             }
-            .keylineTint(state.agentsWaiting > 0 ? PedalsTheme.warning : PedalsTheme.content)
+            .keylineTint(ActivityStyle.color(for: agent?.state, state: state))
         }
     }
 }
 
-/// Colored-dot per-state row: `● 2 running · ● 1 waiting`. Only non-zero
-/// states appear; nothing renders while no agents are active.
-private struct AgentStateBreakdown: View {
+private struct ActivityCard: View {
     let state: TTYActivityAttributes.ContentState
+    let stale: Bool
 
     var body: some View {
-        if state.totalAgents > 0 {
-            HStack(spacing: 12) {
-                if state.agentsRunning > 0 {
-                    stat(
-                        count: state.agentsRunning, label: "running",
-                        color: PedalsTheme.content
-                    )
-                }
-                if state.agentsWaiting > 0 {
-                    stat(
-                        count: state.agentsWaiting, label: "waiting",
-                        color: PedalsTheme.warning, emphasized: true
-                    )
-                }
+        let agent = state.recentAgent
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ActivityIdentity(agent: agent)
+                Spacer(minLength: 8)
+                StatusPill(state: state, agent: agent)
             }
-            .font(.caption)
+            ActivityBody(state: state, agent: agent, stale: stale)
+                .privacySensitive()
         }
     }
+}
 
-    private func stat(
-        count: Int, label: String, color: Color, emphasized: Bool = false
-    ) -> some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(color)
-                .frame(width: 6, height: 6)
-            Text("\(count) \(label)")
-                .fontWeight(emphasized ? .semibold : .regular)
-                .foregroundStyle(emphasized ? color : PedalsTheme.secondaryContent)
+private struct ActivityIdentity: View {
+    let agent: AgentActivity.Content?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let agent, let asset = ActivityStyle.asset(for: agent.agent) {
+                Image(asset)
+                    .resizable()
+                    .renderingMode(.template)
+                    .scaledToFit()
+                    .frame(width: 20, height: 20)
+            } else {
+                Image(systemName: agent == nil ? "terminal.fill" : "sparkles")
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            Text(agent.map { AgentActivity.displayName(forAgent: $0.agent) } ?? "Pedals")
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+        }
+    }
+}
+
+private struct StatusPill: View {
+    let state: TTYActivityAttributes.ContentState
+    let agent: AgentActivity.Content?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: ActivityStyle.symbol(for: agent?.state, state: state))
+            Text(ActivityStyle.label(for: agent?.state, state: state))
+                .lineLimit(1)
+        }
+        .font(.caption2.weight(.bold))
+        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.white.opacity(0.09), in: Capsule())
+    }
+}
+
+private struct ActivityBody: View {
+    let state: TTYActivityAttributes.ContentState
+    let agent: AgentActivity.Content?
+    let stale: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if let agent {
+                Text(agent.project ?? AgentActivity.displayName(forAgent: agent.agent))
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(ActivityStyle.detail(for: agent))
+                    .font(.subheadline)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+                    .lineLimit(2)
+            } else {
+                Text(state.totalRunning == 1 ? "1 terminal active" : "\(state.totalRunning) terminals active")
+                    .font(.headline)
+                    .contentTransition(.numericText())
+                Text("Remote sessions are ready when you are.")
+                    .font(.subheadline)
+                    .foregroundStyle(PedalsTheme.secondaryContent)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 8) {
+                MetricChip(symbol: "terminal", text: "\(state.totalRunning) TTY")
+                if state.totalAgents > 0 {
+                    MetricChip(symbol: "sparkles", text: "\(state.totalAgents) agents")
+                }
+                if state.offlineComputerCount > 0 {
+                    MetricChip(symbol: "wifi.slash", text: "\(state.offlineComputerCount) offline")
+                }
+                if stale {
+                    MetricChip(symbol: "clock.badge.exclamationmark", text: "stale")
+                }
+            }
+            .lineLimit(1)
+        }
+    }
+}
+
+private struct MetricChip: View {
+    let symbol: String
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: symbol)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(PedalsTheme.secondaryContent)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.white.opacity(0.07), in: Capsule())
+    }
+}
+
+private struct CompactMark: View {
+    let state: TTYActivityAttributes.ContentState
+    let agent: AgentActivity.Content?
+
+    var body: some View {
+        Group {
+            if let agent, let asset = ActivityStyle.asset(for: agent.agent) {
+                Image(asset).resizable().renderingMode(.template).scaledToFit()
+            } else {
+                Image(systemName: ActivityStyle.symbol(for: agent?.state, state: state))
+            }
+        }
+        .frame(width: 17, height: 17)
+        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
+        .accessibilityLabel(ActivityStyle.label(for: agent?.state, state: state))
+    }
+}
+
+private struct CompactValue: View {
+    let state: TTYActivityAttributes.ContentState
+    let agent: AgentActivity.Content?
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if let agent {
+                Image(systemName: ActivityStyle.symbol(for: agent.state, state: state))
+                    .font(.caption2.bold())
+            }
+            Text(state.compactCount, format: .number)
+                .fontWeight(.bold)
                 .monospacedDigit()
                 .contentTransition(.numericText())
         }
+        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
     }
 }
 
-/// Lock-screen banner: identity row (TTYs · agents) over the state breakdown.
-private struct LockScreenBanner: View {
-    let state: TTYActivityAttributes.ContentState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 10) {
-                Image(systemName: "terminal.fill")
-                Text(headline)
-                    .font(.headline)
-                    .contentTransition(.numericText())
-                Spacer()
-                if state.offlineComputerCount > 0 {
-                    Image(systemName: "wifi.slash")
-                        .font(.caption)
-                        .foregroundStyle(PedalsTheme.warning)
-                        .accessibilityLabel("\(state.offlineComputerCount) offline")
-                }
-            }
-            AgentStateBreakdown(state: state)
+private enum ActivityStyle {
+    static func symbol(
+        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
+    ) -> String {
+        switch agentState {
+        case .waiting: "questionmark"
+        case .error: "exclamationmark"
+        case .done: "checkmark"
+        case .running: "ellipsis"
+        case nil: state.agentsWaiting > 0 ? "questionmark" : "terminal.fill"
         }
     }
 
-    private var headline: String {
-        let ttys = state.totalRunning == 1 ? "1 TTY" : "\(state.totalRunning) TTYs"
-        guard state.totalAgents > 0 else { return ttys }
-        let agents = state.totalAgents == 1 ? "1 agent" : "\(state.totalAgents) agents"
-        return "\(ttys) · \(agents)"
+    static func label(
+        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
+    ) -> String {
+        switch agentState {
+        case .waiting: "Needs you"
+        case .error: "Error"
+        case .done: "Finished"
+        case .running: "Working"
+        case nil: state.agentsWaiting > 0 ? "Needs you" : "Live"
+        }
+    }
+
+    static func color(
+        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
+    ) -> Color {
+        switch agentState {
+        case .waiting: PedalsTheme.warning
+        case .error: .red
+        case .done: .green
+        case .running: PedalsTheme.content
+        case nil: state.agentsWaiting > 0 ? PedalsTheme.warning : PedalsTheme.content
+        }
+    }
+
+    static func detail(for agent: AgentActivity.Content) -> String {
+        switch agent.state {
+        case .running: agent.action ?? agent.prompt ?? "Working…"
+        case .waiting: agent.message ?? agent.prompt ?? "Waiting for your input"
+        case .error: agent.message ?? "The agent stopped with an error"
+        case .done: agent.message ?? "Task completed"
+        }
+    }
+
+    static func asset(for slug: String) -> String? {
+        switch slug {
+        case "claude": "claude-code-mark"
+        case "codex": "codex-mark"
+        case "copilot": "copilot-mark"
+        case "grok": "grok-mark"
+        case "hermes": "hermes-mark"
+        case "kimi": "kimi-mark"
+        case "kiro": "kiro-mark"
+        case "omp": "omp-mark"
+        case "opencode": "opencode-mark"
+        case "pi": "pi-mark"
+        default: nil
+        }
     }
 }
 
 private extension TTYActivityAttributes.ContentState {
-    var totalAgents: Int { agentsRunning + agentsWaiting }
+    var recentAgent: AgentActivity.Content? {
+        #if DEBUG
+        if recentAgentComputerID == "fixture", recentAgentSealed == "fixture",
+           let state = recentAgentState.flatMap(AgentState.init(rawValue:))
+        {
+            return .init(
+                id: "fixture", agent: "codex", state: state, project: "pedals",
+                prompt: "Review the Live Activity experience",
+                action: "Build: PedalsWidgets",
+                message: state == .done ? "Live Activity is ready" : "Choose how to continue",
+                sessionId: 1,
+                updatedAt: recentAgentUpdatedAt?.timeIntervalSince1970 ?? Date.now.timeIntervalSince1970
+            )
+        }
+        #endif
+        guard let computerID = recentAgentComputerID,
+              let sealedText = recentAgentSealed,
+              let sealed = Data(base64Encoded: sealedText),
+              let keyData = AgentActivityKeyStore.key(forComputer: computerID)
+        else { return nil }
+        return try? AgentActivity.open(
+            sealed,
+            key: SymmetricKey(data: keyData),
+            computerID: computerID
+        )
+    }
 
-    /// The one number the compact/minimal slot can carry, most urgent first:
-    /// waiting agents, then working agents, then TTYs.
+    var totalAgents: Int { agentsRunning + agentsWaiting + agentsDone }
+
     var compactCount: Int {
         if agentsWaiting > 0 { return agentsWaiting }
+        if agentsDone > 0 { return agentsDone }
         if agentsRunning > 0 { return agentsRunning }
         return totalRunning
     }

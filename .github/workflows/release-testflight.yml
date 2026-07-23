@@ -126,8 +126,8 @@ jobs:
           text = File.read(path)
           build_pattern = /CURRENT_PROJECT_VERSION: "[^"]+"/
           version_pattern = /MARKETING_VERSION: "[^"]+"/
-          abort "expected five embedded build versions" unless text.scan(build_pattern).length == 5
-          abort "expected five embedded marketing versions" unless text.scan(version_pattern).length == 5
+          abort "expected four embedded build versions" unless text.scan(build_pattern).length == 4
+          abort "expected four embedded marketing versions" unless text.scan(version_pattern).length == 4
           text.gsub!(build_pattern, "CURRENT_PROJECT_VERSION: \"#{ENV.fetch("PEDALS_RELEASE_BUILD")}\"")
           text.gsub!(version_pattern, "MARKETING_VERSION: \"#{ENV.fetch("PEDALS_RELEASE_VERSION")}\"")
           File.write(path, text)

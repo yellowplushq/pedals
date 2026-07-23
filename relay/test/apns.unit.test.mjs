@@ -112,6 +112,7 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
           totalRunning: 3,
           agentsRunning: 0,
           agentsWaiting: 0,
+          agentsDone: 0,
           onlineComputerCount: 1,
           offlineComputerCount: 1,
           updatedAt: 721_692_800,
@@ -141,6 +142,7 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
       totalRunning: 0,
       agentsRunning: 2,
       agentsWaiting: 1,
+      agentsDone: 0,
       onlineComputerCount: 1,
       offlineComputerCount: 0,
       updatedAt: 721_692_800,
@@ -158,6 +160,14 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
         computers: [{ online: true }],
       },
       event: "start",
+      activity: {
+        eventID: "11111111-1111-4111-8111-111111111111",
+        state: "waiting",
+        updatedAt: 978_307_200_000,
+        alert: true,
+        sealed: Buffer.from("ciphertext").toString("base64"),
+        computerId: "c".repeat(32),
+      },
     },
     1_800_000_000_000,
   );
@@ -169,6 +179,11 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
     totalRunning: 1,
     agentsRunning: 0,
     agentsWaiting: 0,
+    agentsDone: 0,
+    recentAgentComputerID: "c".repeat(32),
+    recentAgentState: "waiting",
+    recentAgentUpdatedAt: 0,
+    recentAgentSealed: Buffer.from("ciphertext").toString("base64"),
     onlineComputerCount: 1,
     offlineComputerCount: 0,
     updatedAt: 0,
@@ -216,63 +231,59 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
   );
 });
 
-test("builds agent notification payloads with generic text and opaque sealed blob", () => {
+test("embeds opaque agent content and alerts only for attention events", () => {
   const sealed = Buffer.from("ciphertext").toString("base64");
-  assert.deepEqual(
-    buildApnsPayload("ios-notification", {
-      category: "waiting",
-      computerId: "c".repeat(32),
-      sessionId: 7,
-      hostName: "Studio",
-      sealed,
-    }),
-    {
-      aps: {
-        alert: { title: "Studio", body: "An agent needs your input" },
-        sound: "default",
-        "thread-id": "c".repeat(32),
-        category: "PEDALS_AGENT_NOTIFICATION",
-        "mutable-content": 1,
-      },
-      pedals: {
-        v: 1,
-        computerId: "c".repeat(32),
-        category: "waiting",
-        sessionId: 7,
-        sealed,
-      },
+  const base = {
+    state: {
+      totalRunning: 0,
+      agentsRunning: 0,
+      agentsWaiting: 1,
+      agentsDone: 0,
+      sequence: 12,
+      updatedAt: "2023-11-14T22:13:20Z",
+      computers: [{ online: true }],
     },
-  );
-
-  // Unmanaged agent: no session id; no host name falls back to "Pedals".
-  const minimal = buildApnsPayload("ios-notification", {
-    category: "done",
-    computerId: "d".repeat(32),
+    event: "update",
+    activity: {
+      eventID: "11111111-1111-4111-8111-111111111111",
+      state: "waiting",
+      updatedAt: 1_700_000_000_000,
+      alert: true,
+      sealed,
+      computerId: "c".repeat(32),
+    },
+  };
+  const alerting = buildApnsPayload("liveactivity-update", base);
+  assert.deepEqual(alerting.aps.alert, {
+    title: "Pedals", body: "An agent needs your input",
   });
-  assert.equal(minimal.aps.alert.title, "Pedals");
-  assert.equal(minimal.aps.alert.body, "An agent finished its task");
-  assert.equal(minimal.pedals.sessionId, undefined);
-  assert.equal(minimal.pedals.sealed, undefined);
+  assert.equal(alerting.aps.sound, undefined);
+  assert.equal(alerting.aps["content-state"].recentAgentSealed, sealed);
+  assert.ok(Buffer.byteLength(JSON.stringify(alerting)) < 4096);
+  const maximal = buildApnsPayload("liveactivity-update", {
+    ...base,
+    activity: { ...base.activity, sealed: "A".repeat(2668) },
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(maximal)) < 4096);
+
+  const silent = buildApnsPayload("liveactivity-update", {
+    ...base,
+    activity: { ...base.activity, state: "running", alert: false },
+  });
+  assert.equal(silent.aps.alert, undefined);
 
   assert.throws(
-    () => buildApnsPayload("ios-notification", { category: "nope", computerId: "e".repeat(32) }),
-    /category/,
-  );
-  assert.throws(
-    () => buildApnsPayload("ios-notification", {
-      category: "waiting",
-      computerId: "e".repeat(32),
-      sealed: "not base64!!",
+    () => buildApnsPayload("liveactivity-update", {
+      ...base, activity: { ...base.activity, sealed: "not base64!!" },
     }),
     /base64/,
   );
   assert.throws(
-    () => buildApnsPayload("ios-notification", {
-      category: "waiting",
-      computerId: "e".repeat(32),
-      aps: { alert: "injected" },
+    () => buildApnsPayload("liveactivity-start", {
+      state: base.state, event: "start",
+      activity: { ...base.activity, state: "running", alert: false },
     }),
-    /not allowed/,
+    /requires an attention alert/,
   );
 });
 

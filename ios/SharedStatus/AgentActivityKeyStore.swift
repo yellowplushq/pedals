@@ -1,22 +1,13 @@
 import Foundation
 import Security
 
-/// Per-computer notification keys in the shared keychain group, written by
-/// the app on every bindings change and read by the Notification Service
-/// Extension to decrypt sealed agent-alert content.
-///
-/// Only the HKDF-derived notification key crosses into the shared group —
-/// never the root computer secret — so an NSE compromise exposes alert
-/// content, not relay traffic or pairing state.
-public enum AgentNotificationKeyStore {
-    /// Runtime form of `$(AppIdentifierPrefix)air.build.pedals.shared`.
-    /// The team identifier is fixed by project.yml (DEVELOPMENT_TEAM).
+/// Per-computer Live Activity content keys shared by the app and widget.
+/// Only the HKDF-derived activity key crosses the keychain group; root pairing
+/// secrets and relay traffic keys remain private to the app.
+public enum AgentActivityKeyStore {
     public static let accessGroup = "QDJ93ZUQ9B.air.build.pedals.shared"
-    static let service = "air.build.pedals.notification-keys"
+    static let service = "air.build.pedals.live-activity-keys"
 
-    /// Replaces the stored key set: one generic-password item per computer,
-    /// stale computers removed. Accessible after first unlock so alerts
-    /// decrypt while the phone is locked.
     public static func setKeys(_ keys: [String: Data]) {
         let existing = allAccounts()
         for account in existing where keys[account] == nil {
@@ -34,8 +25,10 @@ public enum AgentNotificationKeyStore {
                 kSecAttrAccount: computerID,
                 kSecAttrAccessGroup: accessGroup,
             ]
-            let update: [CFString: Any] = [kSecValueData: key]
-            let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+            let status = SecItemUpdate(
+                query as CFDictionary,
+                [kSecValueData: key] as CFDictionary
+            )
             if status == errSecItemNotFound {
                 var create = query
                 create[kSecValueData] = key

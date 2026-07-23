@@ -27,7 +27,18 @@ final class AgentMonitorTests: XCTestCase {
         // Long enough that the periodic sweep never interferes with tests,
         // which drive sweeps explicitly via `sweepNow()`.
         tuning.sweepInterval = 3600
+        tuning.doneAttentionDelay = 0.1
         monitor = AgentMonitor(tuning: tuning) { [targets] in targets!.current }
+    }
+
+    /// Sleeps past the test's done hold-back window (0.1s) so a held done
+    /// push either lands or is proven cancelled.
+    private func waitPastDoneDelay() {
+        let expectation = expectation(description: "done hold-back elapsed")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 2)
     }
 
     /// A live pid: our own test process, so kill(pid, 0) always succeeds.
@@ -311,20 +322,20 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(last?.first?.id, "a-2", "most recently updated first")
     }
 
-    // MARK: - Notification transitions
+    // MARK: - Live Activity attention transitions
 
     private final class Updates: @unchecked Sendable {
         private let lock = NSLock()
-        private var events: [(info: AgentInfo, category: AgentNotification.Category)] = []
-        var all: [(info: AgentInfo, category: AgentNotification.Category)] { lock.withLock { events } }
-        func append(_ info: AgentInfo, _ category: AgentNotification.Category) {
-            lock.withLock { events.append((info, category)) }
+        private var events: [(info: AgentInfo, attention: AgentActivity.Attention)] = []
+        var all: [(info: AgentInfo, attention: AgentActivity.Attention)] { lock.withLock { events } }
+        func append(_ info: AgentInfo, _ attention: AgentActivity.Attention) {
+            lock.withLock { events.append((info, attention)) }
         }
     }
 
-    func testNotificationFiresOnEntryEdgesOnly() {
+    func testAttentionFiresOnEntryEdgesOnly() {
         let updates = Updates()
-        monitor.onNotification = { updates.append($0, $1) }
+        monitor.onAttention = { updates.append($0, $1) }
 
         monitor.ingest(event("session-start"))
         monitor.ingest(event("prompt", prompt: "go"))
@@ -335,7 +346,7 @@ final class AgentMonitorTests: XCTestCase {
         monitor.ingest(event("ask"))
         monitor.ingest(event("notify", message: "Permission needed"))
         XCTAssertEqual(updates.all.count, 1)
-        XCTAssertEqual(updates.all.first?.category, .waiting)
+        XCTAssertEqual(updates.all.first?.attention, .waiting)
         XCTAssertEqual(updates.all.first?.info.message, "Waiting for your answer")
 
         // Answering (prompt) and a fresh ask is a new edge.
@@ -344,33 +355,92 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(updates.all.count, 2)
         XCTAssertEqual(updates.all.last?.info.message, "Pick a plan")
 
-        // Turn end reports done, with the final message.
+        // Turn end reports done with the final message — after the hold-back
+        // window, not on the edge itself.
         monitor.ingest(event("stop", message: "All tests pass"))
+        XCTAssertEqual(updates.all.count, 2, "done is held back, not immediate")
+        waitPastDoneDelay()
         XCTAssertEqual(updates.all.count, 3)
-        XCTAssertEqual(updates.all.last?.category, .done)
+        XCTAssertEqual(updates.all.last?.attention, .done)
         XCTAssertEqual(updates.all.last?.info.message, "All tests pass")
 
         // A repeated stop in the same state is not an edge.
         monitor.ingest(event("stop"))
+        waitPastDoneDelay()
         XCTAssertEqual(updates.all.count, 3)
     }
 
-    func testNotificationFiresOnErrorStop() {
+    func testAttentionFiresOnErrorStop() {
         let updates = Updates()
-        monitor.onNotification = { updates.append($0, $1) }
+        monitor.onAttention = { updates.append($0, $1) }
         monitor.ingest(event("prompt", prompt: "go"))
         monitor.ingest(event("stop", agentError: true))
         XCTAssertEqual(updates.all.count, 1)
-        XCTAssertEqual(updates.all.first?.category, .error)
+        XCTAssertEqual(updates.all.first?.attention, .error)
 
         // Sticky error: the idle notify must not re-notify (or downgrade).
         monitor.ingest(event("notify", message: "waiting for input"))
         XCTAssertEqual(updates.all.count, 1)
     }
 
+    func testIdleNotifyAfterStopStaysDone() {
+        let updates = Updates()
+        monitor.onAttention = { updates.append($0, $1) }
+        monitor.ingest(event("prompt", prompt: "go"))
+        monitor.ingest(event("stop", message: "All tests pass"))
+
+        // Claude's idle Notification hook fires ~60s after a finished turn;
+        // it must not flip done back to waiting ("needs your input" right
+        // after "finished"), overwrite the finish summary, or cancel the
+        // held-back done push (the state did not change).
+        monitor.ingest(event("notify", message: "Claude is waiting for your input"))
+        waitPastDoneDelay()
+        XCTAssertEqual(updates.all.count, 1)
+        XCTAssertEqual(updates.all.first?.attention, .done)
+        let info = monitor.list().first
+        XCTAssertEqual(info?.state, .done)
+        XCTAssertEqual(info?.message, "All tests pass")
+
+        // The next turn still reaches waiting normally.
+        monitor.ingest(event("prompt", prompt: "continue"))
+        monitor.ingest(event("notify", message: "Permission needed"))
+        XCTAssertEqual(updates.all.count, 2)
+        XCTAssertEqual(updates.all.last?.attention, .waiting)
+    }
+
+    func testDonePushCancelledWhenParkedTurnResumes() {
+        let updates = Updates()
+        monitor.onAttention = { updates.append($0, $1) }
+
+        // Claude parks waiting on a background subagent: Stop fires, then the
+        // main loop resumes inside the hold-back window. No push at all.
+        monitor.ingest(event("prompt", prompt: "go"))
+        monitor.ingest(event("stop", message: "Launched the build agent"))
+        monitor.ingest(event("tool", action: "Bash: swift test"))
+        waitPastDoneDelay()
+        XCTAssertTrue(updates.all.isEmpty, "resumed park must swallow the done push")
+
+        // The real completion still lands after the window.
+        monitor.ingest(event("stop", message: "All done"))
+        waitPastDoneDelay()
+        XCTAssertEqual(updates.all.count, 1)
+        XCTAssertEqual(updates.all.first?.attention, .done)
+        XCTAssertEqual(updates.all.first?.info.message, "All done")
+    }
+
+    func testDonePushCancelledByDismiss() {
+        let updates = Updates()
+        monitor.onAttention = { updates.append($0, $1) }
+        monitor.ingest(event("prompt", prompt: "go"))
+        monitor.ingest(event("stop"))
+        monitor.dismiss(id: "a-1")
+        waitPastDoneDelay()
+        XCTAssertTrue(updates.all.isEmpty, "dismissing the agent cancels the held push")
+    }
+
     func testSessionEndDoesNotNotify() {
         let updates = Updates()
-        monitor.onNotification = { updates.append($0, $1) }
+        monitor.onAttention = { updates.append($0, $1) }
         monitor.ingest(event("prompt", prompt: "go"))
         monitor.ingest(AgentEvent(agent: "claude", event: "session-end", agentSessionId: "a-1"))
         XCTAssertTrue(updates.all.isEmpty)

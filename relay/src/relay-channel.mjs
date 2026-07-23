@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { isId, writeDirectoryProjection } from "./core.mjs";
+import { isId, notifyAgentActivity, writeDirectoryProjection } from "./core.mjs";
 
 const HOST_TAG = "role:host";
 const CLIENT_TAG = "role:client";
@@ -92,17 +92,18 @@ function sameSessions(lhs, rhs) {
 const MAX_AGENT_COUNT = 255;
 
 function zeroAgentCounts() {
-  return { running: 0, waiting: 0 };
+  return { running: 0, waiting: 0, done: 0 };
 }
 
 // Per-state coding-agent aggregate counts: the only agent-derived data the
 // Worker ever sees (bare numbers; the rich list stays E2EE). Running and
-// waiting only — a done count grows without bound and is not maintained
-// server-side. Absent on snapshots from pre-agent daemons (all-zero).
+// `done` is a short-lived completion projection. Absent on snapshots from
+// older daemons (all-zero).
 function canonicalAgentCounts(value, { lenient = false } = {}) {
   if (value === undefined) return zeroAgentCounts();
   if (!value || Array.isArray(value) || typeof value !== "object") return null;
-  if (!lenient && Object.keys(value).length !== 2) return null;
+  const keys = Object.keys(value);
+  if (!lenient && keys.length !== 2 && keys.length !== 3) return null;
   for (const key of ["running", "waiting"]) {
     if (
       !Number.isSafeInteger(value[key]) ||
@@ -112,11 +113,37 @@ function canonicalAgentCounts(value, { lenient = false } = {}) {
       return null;
     }
   }
-  return { running: value.running, waiting: value.waiting };
+  const done = value.done ?? 0;
+  if (!Number.isSafeInteger(done) || done < 0 || done > MAX_AGENT_COUNT) return null;
+  if (!lenient && keys.some((key) => !["running", "waiting", "done"].includes(key))) {
+    return null;
+  }
+  return { running: value.running, waiting: value.waiting, done };
 }
 
 function sameAgentCounts(lhs, rhs) {
-  return lhs.running === rhs.running && lhs.waiting === rhs.waiting;
+  return lhs.running === rhs.running && lhs.waiting === rhs.waiting && lhs.done === rhs.done;
+}
+
+const ACTIVITY_EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ACTIVITY_SEALED = /^[A-Za-z0-9+/]+={0,2}$/;
+const ACTIVITY_STATES = new Set(["running", "waiting", "error", "done"]);
+
+function canonicalAgentActivity(value) {
+  if (!value || Array.isArray(value) || typeof value !== "object") return null;
+  if (
+    Object.keys(value).length !== 5 ||
+    !ACTIVITY_EVENT_ID.test(value.eventID) ||
+    !ACTIVITY_STATES.has(value.state) ||
+    !Number.isSafeInteger(value.updatedAt) || value.updatedAt < 0 ||
+    typeof value.alert !== "boolean" ||
+    typeof value.sealed !== "string" || value.sealed.length > 2_700 ||
+    !ACTIVITY_SEALED.test(value.sealed) ||
+    (value.alert && value.state === "running")
+  ) {
+    return null;
+  }
+  return value;
 }
 
 function emptyDirectory() {
@@ -498,6 +525,18 @@ export class RelayChannel extends DurableObject {
       }
       this.enqueueDirectoryTask(() =>
         this.applyHostSnapshot(ws, state, value.hostName, sessions, agents));
+      return;
+    }
+    if (value.type === "agent-activity") {
+      const activity = canonicalAgentActivity(value.activity);
+      if (Object.keys(value).length !== 2 || activity === null) {
+        this.retireSocket(ws, 1008, "invalid agent activity");
+        return;
+      }
+      this.enqueueDirectoryTask(async () => {
+        if (!this.isActiveHostSlot(ws) || this.activeHostForSend("control") !== ws) return;
+        await notifyAgentActivity(this.env, state.computerId, activity);
+      });
       return;
     }
     if (value.type === "host-offline" && Object.keys(value).length === 1) {

@@ -2,17 +2,27 @@ import Foundation
 
 /// Per-state coding-agent aggregate counts for one computer. These are the
 /// only agent-derived numbers the service sees (rich agent detail is
-/// E2EE-only); `waiting` folds in error states. Running and waiting only —
-/// done grows without bound and stays client-side.
+/// E2EE-only); `waiting` folds in error states and `done` is short-lived.
 public struct ComputerAgentCounts: Codable, Hashable, Sendable {
-    public static let zero = ComputerAgentCounts(running: 0, waiting: 0)
+    public static let zero = ComputerAgentCounts(running: 0, waiting: 0, done: 0)
 
     public var running: Int
     public var waiting: Int
+    public var done: Int
 
-    public init(running: Int, waiting: Int) {
+    public init(running: Int, waiting: Int, done: Int = 0) {
         self.running = max(0, running)
         self.waiting = max(0, waiting)
+        self.done = max(0, done)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            running: try container.decode(Int.self, forKey: .running),
+            waiting: try container.decode(Int.self, forKey: .waiting),
+            done: try container.decodeIfPresent(Int.self, forKey: .done) ?? 0
+        )
     }
 }
 
@@ -98,6 +108,10 @@ public struct TTYStatusSnapshot: Codable, Hashable, Sendable {
 
     public var agentsWaiting: Int {
         computers.reduce(0) { $0 + $1.agents.waiting }
+    }
+
+    public var agentsDone: Int {
+        computers.reduce(0) { $0 + $1.agents.done }
     }
 
 }

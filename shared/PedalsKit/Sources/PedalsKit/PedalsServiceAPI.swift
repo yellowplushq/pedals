@@ -258,40 +258,6 @@ public final class PedalsServiceAPI: @unchecked Sendable {
         throw APIError.rejected(status: 410, message: "pairing code expired")
     }
 
-    private struct AgentNotificationRequest: Encodable {
-        let category: String
-        let sessionId: Int?
-        let dedupeKey: String
-        let sealed: String
-    }
-
-    /// Fires a visible push at every client bound to this computer. The
-    /// Worker sees only the category (for the generic fallback text), the
-    /// daemon session id (already directory-visible), and the sealed blob
-    /// it forwards without storing (AGENT_MONITORING_DESIGN.md §6).
-    public func sendAgentNotification(
-        category: AgentNotification.Category,
-        sessionId: Int?,
-        dedupeKey: String,
-        sealed: Data,
-        identity: HostIdentity
-    ) async throws {
-        guard identity.computer.serviceURL == serviceURL else {
-            throw APIError.serviceMismatch
-        }
-        let _: EmptyResponse = try await send(
-            method: "POST",
-            path: "/v2/computers/\(identity.computer.computerID)/agent-notifications",
-            bearer: identity.hostToken,
-            body: AgentNotificationRequest(
-                category: category.rawValue,
-                sessionId: sessionId,
-                dedupeKey: dedupeKey,
-                sealed: sealed.base64EncodedString()
-            )
-        )
-    }
-
     public func deleteComputer(identity: HostIdentity) async throws {
         guard identity.computer.serviceURL == serviceURL else {
             throw APIError.serviceMismatch

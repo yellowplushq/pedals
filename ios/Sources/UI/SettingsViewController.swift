@@ -1,7 +1,6 @@
 import Combine
 import PedalsKit
 import UIKit
-import UserNotifications
 
 /// Grouped inset settings: bound computers (status, unbind, add), font size,
 /// theme, about.
@@ -9,7 +8,6 @@ import UserNotifications
 final class SettingsViewController: UITableViewController {
     private enum Section: Int, CaseIterable {
         case computers
-        case notifications
         case appearance
         case about
     }
@@ -44,14 +42,6 @@ final class SettingsViewController: UITableViewController {
             }
             .store(in: &cancellables)
 
-        refreshNotificationStatus()
-        NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            // Returning from system Settings: pick up any permission change.
-            Task { @MainActor [weak self] in self?.refreshNotificationStatus() }
-        }
     }
 
     /// Live per-computer state (name, link state, RTT) → refresh the section.
@@ -85,7 +75,6 @@ final class SettingsViewController: UITableViewController {
     ) -> String? {
         switch Section(rawValue: section)! {
         case .computers: "Computers"
-        case .notifications: "Notify me when…"
         case .appearance: "Terminal"
         case .about: "About"
         }
@@ -94,7 +83,6 @@ final class SettingsViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section)! {
         case .computers: computers.count + 1 // + "Add Computer…"
-        case .notifications: 1 + Self.notificationMoments.count
         case .appearance: 3
         case .about: 1
         }
@@ -105,7 +93,6 @@ final class SettingsViewController: UITableViewController {
     ) -> UITableViewCell {
         switch Section(rawValue: indexPath.section)! {
         case .computers: computerCell(row: indexPath.row)
-        case .notifications: notificationsCell(row: indexPath.row)
         case .appearance: appearanceCell(row: indexPath.row)
         case .about: aboutCell()
         }
@@ -157,87 +144,6 @@ final class SettingsViewController: UITableViewController {
         case .connected:
             let rtt = computer.roundTripTime.map { " · \(Int(($0 * 1000).rounded())) ms" } ?? ""
             return "Connected · E2EE" + rtt
-        }
-    }
-
-    /// "Notify me when…" moments, phrased in plain language.
-    static let notificationMoments: [(category: AgentNotification.Category, title: String)] = [
-        (.waiting, "An agent needs you"),
-        (.error, "An agent fails"),
-        (.done, "An agent finishes"),
-    ]
-
-    /// Row 0: permission status plus the fix-it action — request when
-    /// undetermined, otherwise deep-link into system Settings. Rows 1…n:
-    /// per-moment toggles, filtered server-side per device.
-    private func notificationsCell(row: Int) -> UITableViewCell {
-        if row == 0 {
-            let cell = valueCell("Agent Notifications", notificationStatusText ?? "…")
-            cell.accessoryType = .disclosureIndicator
-            cell.selectionStyle = .default
-            return cell
-        }
-        let moment = Self.notificationMoments[row - 1]
-        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
-        var content = cell.defaultContentConfiguration()
-        content.text = moment.title
-        cell.contentConfiguration = content
-        cell.selectionStyle = .none
-        let toggle = UISwitch()
-        toggle.isOn = AgentNotificationPreferences.isEnabled(moment.category)
-        toggle.onTintColor = PedalsTheme.uiContent.withAlphaComponent(0.35)
-        toggle.addAction(
-            UIAction { [weak toggle] _ in
-                guard let toggle else { return }
-                AgentNotificationPreferences.setEnabled(toggle.isOn, for: moment.category)
-            },
-            for: .valueChanged
-        )
-        cell.accessoryView = toggle
-        return cell
-    }
-
-    private var notificationStatusText: String? {
-        didSet {
-            guard isViewLoaded, oldValue != notificationStatusText else { return }
-            tableView.reloadSections(
-                IndexSet([Section.notifications.rawValue]), with: .none
-            )
-        }
-    }
-
-    private func refreshNotificationStatus() {
-        Task { @MainActor [weak self] in
-            let settings = await UNUserNotificationCenter.current().notificationSettings()
-            self?.notificationStatusText = switch settings.authorizationStatus {
-            case .authorized, .provisional, .ephemeral: "Allowed"
-            case .denied: "Off"
-            case .notDetermined: "Not set"
-            @unknown default: "Unknown"
-            }
-        }
-    }
-
-    private func handleNotificationsRowTap() {
-        Task { @MainActor [weak self] in
-            let center = UNUserNotificationCenter.current()
-            let settings = await center.notificationSettings()
-            switch settings.authorizationStatus {
-            case .notDetermined:
-                let granted = (try? await center.requestAuthorization(
-                    options: [.alert, .badge, .sound]
-                )) ?? false
-                if granted {
-                    UIApplication.shared.registerForRemoteNotifications()
-                }
-            default:
-                // Granted or denied: the system Settings pane is the only
-                // place the state can change now.
-                if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
-                    await UIApplication.shared.open(url)
-                }
-            }
-            self?.refreshNotificationStatus()
         }
     }
 
@@ -308,10 +214,6 @@ final class SettingsViewController: UITableViewController {
             } else {
                 presentComputerActions(computers[indexPath.row])
             }
-        case .notifications where indexPath.row == 0:
-            handleNotificationsRowTap()
-        case .notifications:
-            break
         case .appearance where indexPath.row == 1:
             navigationController?.pushViewController(
                 ThemePickerViewController(services: services), animated: true

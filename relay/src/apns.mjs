@@ -38,19 +38,9 @@ export const APNS_SURFACES = Object.freeze({
     topic: "air.build.pedals.push-type.liveactivity",
     priority: "5",
   }),
-  // Visible agent notifications, daemon-emitted on blocked/error/finished.
-  // The alert text is a generic per-category line; the rich content rides in
-  // the opaque `sealed` field and is decrypted on-device by the Notification
-  // Service Extension (mutable-content), so the Worker never sees it.
-  "ios-notification": Object.freeze({
-    pushType: "alert",
-    topic: "air.build.pedals",
-    priority: "10",
-  }),
 });
 
-const NOTIFICATION_EXPIRATION_SECONDS = 60 * 60;
-export const AGENT_NOTIFICATION_CATEGORIES = Object.freeze({
+const AGENT_ACTIVITY_ALERTS = Object.freeze({
   waiting: "An agent needs your input",
   error: "An agent hit an error",
   done: "An agent finished its task",
@@ -235,7 +225,7 @@ function rejectUnknownKeys(value, allowed, name) {
 
 function liveActivityPayload(surface, value, now) {
   const payload = plainObject(value, "payload");
-  rejectUnknownKeys(payload, new Set(["state", "event"]), "payload");
+  rejectUnknownKeys(payload, new Set(["state", "event", "activity"]), "payload");
   const state = plainObject(payload.state, "payload.state");
   if (!Number.isSafeInteger(state.totalRunning) || state.totalRunning < 0) {
     throw new TypeError("payload.state.totalRunning must be a non-negative safe integer");
@@ -280,6 +270,7 @@ function liveActivityPayload(surface, value, now) {
       totalRunning: state.totalRunning,
       agentsRunning: agentCount(state.agentsRunning, "payload.state.agentsRunning"),
       agentsWaiting: agentCount(state.agentsWaiting, "payload.state.agentsWaiting"),
+      agentsDone: agentCount(state.agentsDone, "payload.state.agentsDone"),
       onlineComputerCount,
       offlineComputerCount: state.computers.length - onlineComputerCount,
       updatedAt: updatedAtMilliseconds / 1000 - APPLE_REFERENCE_DATE_UNIX_SECONDS,
@@ -287,77 +278,55 @@ function liveActivityPayload(surface, value, now) {
     },
   };
 
+  if (payload.activity !== undefined) {
+    const activity = plainObject(payload.activity, "payload.activity");
+    rejectUnknownKeys(
+      activity,
+      new Set(["eventID", "state", "updatedAt", "alert", "sealed", "computerId"]),
+      "payload.activity",
+    );
+    if (!Object.hasOwn(AGENT_ACTIVITY_ALERTS, activity.state)) {
+      if (activity.state !== "running") {
+        throw new TypeError("payload.activity.state is invalid");
+      }
+    }
+    if (!Number.isSafeInteger(activity.updatedAt) || activity.updatedAt < 0) {
+      throw new TypeError("payload.activity.updatedAt must be a non-negative safe integer");
+    }
+    if (typeof activity.alert !== "boolean") {
+      throw new TypeError("payload.activity.alert must be boolean");
+    }
+    const computerId = requiredString(activity.computerId, "payload.activity.computerId");
+    const sealed = requiredString(activity.sealed, "payload.activity.sealed");
+    if (sealed.length > 2700 || !/^[A-Za-z0-9+/]+={0,2}$/.test(sealed)) {
+      throw new TypeError("payload.activity.sealed must be base64");
+    }
+    Object.assign(aps["content-state"], {
+      recentAgentComputerID: computerId,
+      recentAgentState: activity.state,
+      recentAgentUpdatedAt:
+        activity.updatedAt / 1000 - APPLE_REFERENCE_DATE_UNIX_SECONDS,
+      recentAgentSealed: sealed,
+    });
+    if (activity.alert) {
+      const body = AGENT_ACTIVITY_ALERTS[activity.state];
+      if (!body) throw new TypeError("running activity cannot alert");
+      aps.alert = { title: "Pedals", body };
+    }
+  }
+
   if (surface === "liveactivity-start") {
     aps["input-push-token"] = 1;
     aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
     aps.attributes = { scope: "all" };
-    // An activity can now start on agent activity alone (0 running TTYs).
-    aps.alert = {
-      title: "Pedals",
-      body:
-        state.totalRunning === 0
-          ? "Coding agents are running"
-          : state.totalRunning === 1
-            ? "1 terminal is running"
-            : `${state.totalRunning} terminals are running`,
-    };
+    if (!aps.alert) {
+      throw new TypeError("liveactivity-start requires an attention alert");
+    }
   }
   if (payload.event === "end") {
     aps["dismissal-date"] = Math.floor(now / 1000);
   }
   return { aps };
-}
-
-// Base64 (standard alphabet) with a hard size cap; the sealed blob is opaque
-// ciphertext the Worker forwards without storing.
-const SEALED_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
-const SEALED_MAX_LENGTH = 4096;
-
-function agentNotificationPayload(value) {
-  const payload = plainObject(value, "payload");
-  rejectUnknownKeys(
-    payload,
-    new Set(["category", "computerId", "sessionId", "hostName", "sealed"]),
-    "payload",
-  );
-  const body = AGENT_NOTIFICATION_CATEGORIES[payload.category];
-  if (!body) throw new TypeError("payload.category is not a known notification category");
-  const computerId = requiredString(payload.computerId, "payload.computerId");
-  if (payload.sessionId !== undefined && (
-    !Number.isSafeInteger(payload.sessionId) || payload.sessionId < 0
-  )) {
-    throw new TypeError("payload.sessionId must be a non-negative safe integer");
-  }
-  if (payload.hostName !== undefined) {
-    requiredString(payload.hostName, "payload.hostName");
-  }
-  if (payload.sealed !== undefined) {
-    const sealed = requiredString(payload.sealed, "payload.sealed");
-    if (sealed.length > SEALED_MAX_LENGTH || !SEALED_PATTERN.test(sealed)) {
-      throw new TypeError("payload.sealed must be base64");
-    }
-  }
-
-  const result = {
-    aps: {
-      alert: {
-        title: payload.hostName ?? "Pedals",
-        body,
-      },
-      sound: "default",
-      "thread-id": computerId,
-      category: "PEDALS_AGENT_NOTIFICATION",
-      "mutable-content": 1,
-    },
-    pedals: {
-      v: 1,
-      computerId,
-      category: payload.category,
-    },
-  };
-  if (payload.sessionId !== undefined) result.pedals.sessionId = payload.sessionId;
-  if (payload.sealed !== undefined) result.pedals.sealed = payload.sealed;
-  return result;
 }
 
 /** Build the only APNs payload accepted for a Pedals push surface. */
@@ -373,9 +342,6 @@ export function buildApnsPayload(surface, payload, now = Date.now()) {
       rejectUnknownKeys(value, new Set(), "payload");
     }
     return { aps: { "content-changed": true } };
-  }
-  if (surface === "ios-notification") {
-    return agentNotificationPayload(payload);
   }
   return liveActivityPayload(surface, payload, now);
 }
@@ -395,11 +361,6 @@ function endpointHost(environment) {
 }
 
 function expirationHeader(surface, payload, now) {
-  // Notifications stay deliverable across a short offline window; a stale
-  // "needs your input" an hour later is noise, so they expire after that.
-  if (surface === "ios-notification") {
-    return String(Math.floor(now / 1000) + NOTIFICATION_EXPIRATION_SECONDS);
-  }
   if (surface !== "liveactivity-start" && surface !== "liveactivity-update") {
     return "0";
   }
@@ -472,7 +433,8 @@ export function createApnsClient(
         "apns-push-type": config.pushType,
         "apns-topic": config.topic,
         "apns-priority":
-          surface === "liveactivity-update" && payload?.event === "end"
+          surface === "liveactivity-update" &&
+          (payload?.event === "end" || payload?.activity?.alert === true)
             ? "10"
             : config.priority,
         // Non-zero expiration lets APNs retain ActivityKit transitions while

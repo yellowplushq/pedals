@@ -52,7 +52,6 @@ public final class Daemon: @unchecked Sendable {
     private let sessions: SessionManager
     private let relay: RelayHostClient
     private let agents: AgentMonitor
-    private let agentNotifications: AgentNotificationPusher
     private var controlServer: ControlServer?
     /// Held from identity load/registration until the control socket listens.
     /// An offline CLI that lost the initial socket race blocks on this lock,
@@ -111,9 +110,8 @@ public final class Daemon: @unchecked Sendable {
         agents.onChange = { [relay] list in relay.broadcastAgents(list) }
         // Updates capture the startup identity like RelayHostClient does; an
         // identity reset restarts the daemon before either matters.
-        agentNotifications = AgentNotificationPusher(identity: identity)
-        agents.onNotification = { [agentNotifications] info, category in
-            agentNotifications.push(info, category: category)
+        agents.onAttention = { [relay] info, _ in
+            relay.broadcastAgentAttention(info)
         }
         relay.onDismissAgent = { [agents] id in agents.dismiss(id: id) }
         self.startupIdentityLock = startupIdentityLock

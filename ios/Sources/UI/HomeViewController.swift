@@ -165,14 +165,6 @@ final class HomeViewController: UIViewController {
         collectionView.alwaysBounceVertical = true
         collectionView.accessibilityIdentifier = "pedals.home.list"
 
-        // Right swipe dismisses an agent row (the opposite direction of the
-        // page-switch gesture, which slides left toward the terminals).
-        let dismissSwipe = UISwipeGestureRecognizer(
-            target: self, action: #selector(handleAgentDismissSwipe(_:))
-        )
-        dismissSwipe.direction = .right
-        collectionView.addGestureRecognizer(dismissSwipe)
-
         let stack = UIStackView(arrangedSubviews: [headerRow, collectionView])
         stack.axis = .vertical
         stack.spacing = 8
@@ -187,7 +179,29 @@ final class HomeViewController: UIViewController {
     }
 
     private func makeCollectionLayout() -> UICollectionViewCompositionalLayout {
-        UICollectionViewCompositionalLayout { sectionIndex, _ in
+        UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
+            let contentInsets = NSDirectionalEdgeInsets(
+                top: 6, leading: 16, bottom: 22, trailing: 16
+            )
+            if Section(rawValue: sectionIndex) == .agents {
+                // A list section so agent rows get the native interactive
+                // swipe (leading = rightward, the opposite direction of the
+                // page-switch gesture, which slides left toward the
+                // terminals). It tracks the finger and springs back below
+                // the commit threshold.
+                var config = UICollectionLayoutListConfiguration(appearance: .plain)
+                config.backgroundColor = .clear
+                config.showsSeparators = false
+                config.headerMode = .supplementary
+                config.leadingSwipeActionsConfigurationProvider = { indexPath in
+                    self?.agentSwipeConfiguration(at: indexPath)
+                }
+                let section = NSCollectionLayoutSection.list(
+                    using: config, layoutEnvironment: environment
+                )
+                section.contentInsets = contentInsets
+                return section
+            }
             let itemSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1),
                 heightDimension: .estimated(64)
@@ -195,12 +209,9 @@ final class HomeViewController: UIViewController {
             let item = NSCollectionLayoutItem(layoutSize: itemSize)
             let group = NSCollectionLayoutGroup.vertical(layoutSize: itemSize, subitems: [item])
             let section = NSCollectionLayoutSection(group: group)
-            // Terminals are spaced surface cards; the flat agents list packs
-            // its backgroundless rows together.
-            section.interGroupSpacing = Section(rawValue: sectionIndex) == .agents ? 0 : 8
-            section.contentInsets = NSDirectionalEdgeInsets(
-                top: 6, leading: 16, bottom: 22, trailing: 16
-            )
+            // Terminals are spaced surface cards.
+            section.interGroupSpacing = 8
+            section.contentInsets = contentInsets
             let headerSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1),
                 heightDimension: .estimated(26)
@@ -467,16 +478,26 @@ final class HomeViewController: UIViewController {
 
     // MARK: - Agent dismissal
 
-    @objc private func handleAgentDismissSwipe(_ recognizer: UISwipeGestureRecognizer) {
-        guard recognizer.state == .ended else { return }
-        let location = recognizer.location(in: collectionView)
-        guard let indexPath = collectionView.indexPathForItem(at: location),
-              case .agent(let key) = dataSource.itemIdentifier(for: indexPath),
-              let row = lastUnmanaged.first(where: {
-                  $0.computerID == key.computerID && $0.info.id == key.agentID
-              })
-        else { return }
-        dismiss(row: row)
+    private func agentSwipeConfiguration(at indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard case .agent(let key) = dataSource.itemIdentifier(for: indexPath) else { return nil }
+        let action = UIContextualAction(style: .destructive, title: "Dismiss") {
+            [weak self] _, _, completion in
+            // Re-resolve by key: the row list may have changed between the
+            // swipe starting and the action firing.
+            guard let self,
+                  let row = lastUnmanaged.first(where: {
+                      $0.computerID == key.computerID && $0.info.id == key.agentID
+                  })
+            else {
+                completion(false)
+                return
+            }
+            dismiss(row: row)
+            completion(true)
+        }
+        let config = UISwipeActionsConfiguration(actions: [action])
+        config.performsFirstActionWithFullSwipe = true
+        return config
     }
 
     /// The Agents header's Clear action: dismisses every agent not
@@ -627,7 +648,9 @@ enum CompactRelativeTime {
 
 /// One surface card row: indicator + primary over secondary on the left,
 /// outline chips + relative time on the right.
-private final class HomeRowCell: UICollectionViewCell {
+// A list cell (not a plain cell) so the agents list section can attach
+// native interactive swipe actions; the terminal section uses it unchanged.
+private final class HomeRowCell: UICollectionViewListCell {
     private let iconView = UIImageView()
     /// Agent state badge on the icon's top-right corner. A canvas-colored
     /// ring keeps it readable over the mark; working blinks slowly.
@@ -642,6 +665,10 @@ private final class HomeRowCell: UICollectionViewCell {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        // The list cell's default background configuration would repaint the
+        // cell on highlight/selection; this cell drives contentView's color
+        // itself for both the card and flat styles.
+        backgroundConfiguration = .clear()
         contentView.backgroundColor = PedalsTheme.uiSurface
         contentView.layer.cornerRadius = 16
         contentView.layer.cornerCurve = .continuous

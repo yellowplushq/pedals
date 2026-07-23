@@ -22,19 +22,63 @@ public enum RelayMetadata: Equatable, Sendable {
 
     /// Per-state coding-agent aggregate counts. Deliberately the only
     /// agent-derived data the Worker ever sees: bare numbers, no names,
-    /// no projects, no messages. Running and waiting only — a done count
-    /// grows without bound, so it stays client-side. `waiting` folds in
-    /// error states — both park the agent on the user.
+    /// no projects, no messages. `done` is a short-lived projection used to
+    /// keep a completion visible long enough for ActivityKit. `waiting` folds
+    /// in error states — both park the agent on the user.
     public struct AgentCounts: Codable, Equatable, Hashable, Sendable {
-        public static let zero = AgentCounts(running: 0, waiting: 0)
+        public static let zero = AgentCounts(running: 0, waiting: 0, done: 0)
         public static let maxCount = 255
 
         public let running: Int
         public let waiting: Int
+        /// Recently completed agents only. The daemon drops this projection
+        /// after the final Live Activity has had time to be seen.
+        public let done: Int
 
-        public init(running: Int, waiting: Int) {
+        public init(running: Int, waiting: Int, done: Int = 0) {
             self.running = running
             self.waiting = waiting
+            self.done = done
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case running, waiting, done
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(
+                running: try container.decode(Int.self, forKey: .running),
+                waiting: try container.decode(Int.self, forKey: .waiting),
+                done: try container.decodeIfPresent(Int.self, forKey: .done) ?? 0
+            )
+        }
+    }
+
+    /// Server-visible routing wrapped around an E2EE agent snapshot. The
+    /// Worker may use `state` to choose ActivityKit alert copy and priority,
+    /// but cannot read the agent, project, prompt, action, or message.
+    public struct AgentActivityEnvelope: Codable, Equatable, Sendable {
+        public static let maxSealedBytes = 2_000
+
+        public let eventID: String
+        public let state: AgentState
+        public let updatedAt: Int64
+        public let alert: Bool
+        public let sealed: Data
+
+        public init(
+            eventID: String = UUID().uuidString.lowercased(),
+            state: AgentState,
+            updatedAt: Int64,
+            alert: Bool,
+            sealed: Data
+        ) {
+            self.eventID = eventID
+            self.state = state
+            self.updatedAt = updatedAt
+            self.alert = alert
+            self.sealed = sealed
         }
     }
 
@@ -66,6 +110,10 @@ public enum RelayMetadata: Equatable, Sendable {
     /// Host -> Durable Object. This is a complete, idempotent snapshot and also
     /// renews the host lease. Repeating it is safe after reconnect ambiguity.
     case hostSnapshot(hostName: String, sessions: [DirectoryEntry], agents: AgentCounts)
+    /// Host -> Durable Object -> Live Activity endpoints. Never persisted by
+    /// the Worker; delivery is best-effort and the count snapshot remains the
+    /// durable fallback.
+    case agentActivity(AgentActivityEnvelope)
     /// Host -> Durable Object. Used before sleep and orderly process exit.
     case hostOffline
     /// Durable Object -> control clients. The revision is assigned by the DO.
@@ -77,11 +125,12 @@ public enum RelayMetadata: Equatable, Sendable {
 
 extension RelayMetadata: Codable {
     private enum CodingKeys: String, CodingKey {
-        case type, hostName, sessions, agents, revision, online, updatedAt, reason
+        case type, hostName, sessions, agents, activity, revision, online, updatedAt, reason
     }
 
     private enum Kind: String, Codable {
         case hostSnapshot = "host-snapshot"
+        case agentActivity = "agent-activity"
         case hostOffline = "host-offline"
         case terminalDirectory = "terminal-directory"
         case channelState = "channel-state"
@@ -100,6 +149,9 @@ extension RelayMetadata: Codable {
             if agents != .zero {
                 try container.encode(agents, forKey: .agents)
             }
+        case .agentActivity(let activity):
+            try container.encode(Kind.agentActivity, forKey: .type)
+            try container.encode(activity, forKey: .activity)
         case .hostOffline:
             try container.encode(Kind.hostOffline, forKey: .type)
         case .terminalDirectory(let directory):
@@ -131,6 +183,21 @@ extension RelayMetadata: Codable {
                 sessions: sessions,
                 agents: agents
             )
+        case .agentActivity:
+            let activity = try container.decode(AgentActivityEnvelope.self, forKey: .activity)
+            guard activity.eventID.count == 36,
+                  UUID(uuidString: activity.eventID) != nil,
+                  activity.updatedAt >= 0,
+                  !activity.sealed.isEmpty,
+                  !(activity.alert && activity.state == .running),
+                  activity.sealed.count <= AgentActivityEnvelope.maxSealedBytes
+            else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "invalid agent activity envelope"
+                ))
+            }
+            self = .agentActivity(activity)
         case .hostOffline:
             self = .hostOffline
         case .terminalDirectory:
@@ -194,7 +261,7 @@ extension RelayMetadata: Codable {
         _ counts: AgentCounts,
         codingPath: [any CodingKey]
     ) throws {
-        for value in [counts.running, counts.waiting] {
+        for value in [counts.running, counts.waiting, counts.done] {
             guard (0...AgentCounts.maxCount).contains(value) else {
                 throw DecodingError.dataCorrupted(.init(
                     codingPath: codingPath,

@@ -9,6 +9,11 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
         /// content-state strictly otherwise).
         public var agentsRunning: Int
         public var agentsWaiting: Int
+        public var agentsDone: Int
+        public var recentAgentComputerID: String?
+        public var recentAgentState: String?
+        public var recentAgentUpdatedAt: Date?
+        public var recentAgentSealed: String?
         public var onlineComputerCount: Int
         public var offlineComputerCount: Int
         public var updatedAt: Date
@@ -18,6 +23,11 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
             totalRunning: Int,
             agentsRunning: Int = 0,
             agentsWaiting: Int = 0,
+            agentsDone: Int = 0,
+            recentAgentComputerID: String? = nil,
+            recentAgentState: String? = nil,
+            recentAgentUpdatedAt: Date? = nil,
+            recentAgentSealed: String? = nil,
             onlineComputerCount: Int,
             offlineComputerCount: Int,
             updatedAt: Date,
@@ -26,6 +36,11 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
             self.totalRunning = max(0, totalRunning)
             self.agentsRunning = max(0, agentsRunning)
             self.agentsWaiting = max(0, agentsWaiting)
+            self.agentsDone = max(0, agentsDone)
+            self.recentAgentComputerID = recentAgentComputerID
+            self.recentAgentState = recentAgentState
+            self.recentAgentUpdatedAt = recentAgentUpdatedAt
+            self.recentAgentSealed = recentAgentSealed
             self.onlineComputerCount = max(0, onlineComputerCount)
             self.offlineComputerCount = max(0, offlineComputerCount)
             self.updatedAt = updatedAt
@@ -38,6 +53,11 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
                 totalRunning: try container.decode(Int.self, forKey: .totalRunning),
                 agentsRunning: try container.decodeIfPresent(Int.self, forKey: .agentsRunning) ?? 0,
                 agentsWaiting: try container.decodeIfPresent(Int.self, forKey: .agentsWaiting) ?? 0,
+                agentsDone: try container.decodeIfPresent(Int.self, forKey: .agentsDone) ?? 0,
+                recentAgentComputerID: try container.decodeIfPresent(String.self, forKey: .recentAgentComputerID),
+                recentAgentState: try container.decodeIfPresent(String.self, forKey: .recentAgentState),
+                recentAgentUpdatedAt: try container.decodeIfPresent(Date.self, forKey: .recentAgentUpdatedAt),
+                recentAgentSealed: try container.decodeIfPresent(String.self, forKey: .recentAgentSealed),
                 onlineComputerCount: try container.decode(Int.self, forKey: .onlineComputerCount),
                 offlineComputerCount: try container.decode(Int.self, forKey: .offlineComputerCount),
                 updatedAt: try container.decode(Date.self, forKey: .updatedAt),
@@ -50,6 +70,7 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
                 totalRunning: snapshot.totalRunning,
                 agentsRunning: snapshot.agentsRunning,
                 agentsWaiting: snapshot.agentsWaiting,
+                agentsDone: snapshot.agentsDone,
                 onlineComputerCount: snapshot.onlineComputerCount,
                 offlineComputerCount: snapshot.offlineComputerCount,
                 updatedAt: snapshot.updatedAt,

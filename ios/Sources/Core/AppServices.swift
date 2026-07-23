@@ -38,11 +38,6 @@ final class AppServices {
                 self?.observeStatusChanges(in: computers)
                 self?.synchronizeWatchTerminalContext()
                 self?.scheduleStatusRefresh()
-                // The notification permission prompt waits for the first
-                // pairing; an unpaired install never sees it.
-                if !computers.isEmpty {
-                    AgentNotificationController.shared.registerWhenPaired()
-                }
             }
             .store(in: &statusSubscriptions)
     }
@@ -54,9 +49,6 @@ final class AppServices {
             }
         }
         IOSWatchConnectivityBridge.shared.activate()
-        // Delegate installation must precede any notification tap delivery
-        // (a tap can cold-start the process).
-        AgentNotificationController.shared.activate()
         TTYLiveActivityController.shared.startObservingPushTokens()
         #if DEBUG
         if let spec = ProcessInfo.processInfo.environment["PEDALS_LA_FIXTURE"] {
@@ -142,17 +134,16 @@ final class AppServices {
         synchronizeWatchTerminalContext()
     }
 
-    /// Mirrors the per-computer notification keys into the shared keychain
-    /// group for the Notification Service Extension. Derived keys only —
+    /// Mirrors per-computer content keys into the widget keychain group. Derived keys only —
     /// the root computer secrets never leave the app's own group.
-    private func synchronizeNotificationKeys(bindings: [ComputerBinding]) {
+    private func synchronizeActivityKeys(bindings: [ComputerBinding]) {
         var keys: [String: Data] = [:]
         for binding in bindings {
-            keys[binding.computerID] = AgentNotification
-                .notificationKey(secret: binding.secret)
+            keys[binding.computerID] = AgentActivity
+                .activityKey(secret: binding.secret)
                 .withUnsafeBytes { Data($0) }
         }
-        AgentNotificationKeyStore.setKeys(keys)
+        AgentActivityKeyStore.setKeys(keys)
     }
 
     private func synchronizeWatchTerminalContext() {
@@ -170,7 +161,7 @@ final class AppServices {
             }
             source = identity
             bindings = try pairingStore.loadAll()
-            synchronizeNotificationKeys(bindings: bindings)
+            synchronizeActivityKeys(bindings: bindings)
         } catch {
             // Transient Keychain failure: keep the Watch's last-known-good
             // credential. The relay is the enforcement point for anything the
@@ -204,6 +195,24 @@ final class AppServices {
                 .dropFirst()
                 .sink { [weak self] _, _ in self?.scheduleStatusRefresh() }
                 .store(in: &computerStatusSubscriptions)
+            computer.$agents
+                .dropFirst()
+                .sink { [weak self] _ in
+                    self?.scheduleStatusRefresh()
+                    self?.synchronizeLatestAgentActivity()
+                }
+                .store(in: &computerStatusSubscriptions)
+        }
+    }
+
+    private func synchronizeLatestAgentActivity() {
+        let recent = terminals.computers
+            .flatMap { computer in computer.agents.map { ($0, computer.binding) } }
+            .max { $0.0.updatedAt < $1.0.updatedAt }
+        Task {
+            await TTYLiveActivityController.shared.synchronizeRecentAgent(
+                recent?.0, binding: recent?.1
+            )
         }
     }
 
@@ -219,6 +228,7 @@ final class AppServices {
             do {
                 let snapshot = try await PedalsStatusRuntime.refreshState()
                 try await TTYLiveActivityController.shared.synchronize(with: snapshot)
+                self?.synchronizeLatestAgentActivity()
                 WidgetCenter.shared.reloadTimelines(
                     ofKind: PedalsStatusConstants.phoneWidgetKind
                 )

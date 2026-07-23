@@ -35,6 +35,9 @@ final class TabStripView: UIView {
 
     private(set) var tabs: [Tab] = []
     private var activeIndex: Int?
+    /// Remembered across trips to Home (activeIndex == nil): the pill that was
+    /// focused last keeps its expanded width there, restyled as inactive.
+    private var lastActiveId: TerminalID?
     private var pills: [TerminalID: TabPillView] = [:]
 
     /// Non-nil while a pan drives the strip: (fromIndex, toIndex, progress).
@@ -109,6 +112,7 @@ final class TabStripView: UIView {
         let oldActive = activeIndex
         tabs = newTabs
         activeIndex = activeId.flatMap { id in tabs.firstIndex { $0.id == id } }
+        if activeIndex != nil { lastActiveId = activeId }
 
         var seen = Set<TerminalID>()
         for tab in tabs {
@@ -180,6 +184,7 @@ final class TabStripView: UIView {
         guard tabs.indices.contains(targetIndex) else { return }
         transition = nil
         activeIndex = targetIndex
+        lastActiveId = tabs[targetIndex].id
         UIView.animate(
             withDuration: duration, delay: 0,
             usingSpringWithDamping: damping, initialSpringVelocity: initialVelocity,
@@ -241,9 +246,12 @@ final class TabStripView: UIView {
             inactive = min(Self.maxInactiveWidth, inactive)
         }
 
-        // No active tab (Home page visible): every pill renders collapsed.
+        // No active tab (Home page visible): the last-focused pill keeps its
+        // expanded width (restyled inactive by layoutStrip); the rest collapse.
+        let expandedIndex = activeIndex
+            ?? lastActiveId.flatMap { id in tabs.firstIndex { $0.id == id } }
         return tabs.indices.map { index in
-            var expansion: CGFloat = index == activeIndex ? 1 : 0
+            var expansion: CGFloat = index == expandedIndex ? 1 : 0
             if let transition {
                 if index == transition.from { expansion = 1 - transition.progress }
                 if index == transition.to { expansion = transition.progress }
@@ -254,6 +262,10 @@ final class TabStripView: UIView {
 
     private func layoutStrip() {
         let widths = widths(available: scrollView.bounds.width)
+        // Mid-drag the title's active styling hands over at the halfway point
+        // rather than only on commit.
+        let styleActive = transition.map { $0.progress >= 0.5 ? $0.to : $0.from }
+            ?? activeIndex
         var x: CGFloat = 0
         for (index, tab) in tabs.enumerated() {
             guard let pill = pills[tab.id] else { continue }
@@ -265,7 +277,7 @@ final class TabStripView: UIView {
                 height: Self.pillHeight
             )
             let expansion = expansionAmount(index: index, width: width)
-            pill.setExpansion(expansion, isActive: index == activeIndex)
+            pill.setExpansion(expansion, isActive: index == styleActive)
             x += width + Self.spacing
         }
         let contentWidth = max(0, x - Self.spacing)
@@ -332,23 +344,35 @@ final class TabPillView: UIView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    private var alive = true
+    private var isActive = false
+
     func configure(tab: TabStripView.Tab) {
         titleLabel.text = tab.title
         let glyph = tab.title.first.map { String($0).lowercased() } ?? ">"
         glyphLabel.text = tab.alive ? glyph : "×"
         glyphLabel.textColor = tab.alive ? .secondaryLabel : PedalsTheme.uiCritical
-        titleLabel.textColor = tab.alive ? .label : .secondaryLabel
+        alive = tab.alive
+        applyTitleStyle()
     }
 
     /// 0 = collapsed icon pill, 1 = fully expanded active pill.
     func setExpansion(_ amount: CGFloat, isActive: Bool) {
+        self.isActive = isActive
         titleLabel.alpha = amount
         closeButton.alpha = amount
         glyphLabel.alpha = 1 - amount
-        // An expanded pill's × always works — a lone tab stays expanded even
-        // when Home is the visible page (no active tab).
+        // An expanded pill's × always works — an expanded pill remains while
+        // Home is the visible page (no active tab).
         closeButton.isUserInteractionEnabled = amount > 0.5
+        applyTitleStyle()
         setNeedsLayout()
+    }
+
+    /// Expanded-but-inactive (Home visible) reads as unfocused: the title
+    /// dims to the secondary color instead of the active label color.
+    private func applyTitleStyle() {
+        titleLabel.textColor = alive && isActive ? .label : .secondaryLabel
     }
 
     @objc private func didTap() {

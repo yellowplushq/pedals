@@ -136,17 +136,23 @@ absent otherwise.
 installing hooks via the Mac menu bar app; an empty Terminals section keeps
 the existing pairing / new-session guidance.
 
-## 5. Notifications, widgets, Live Activity, Watch
+## 5. Widgets, Live Activity, Watch
 
-- Blocked and finished events trigger pushes to iPhone and Watch. When the
-  session is daemon-owned, the notification deep-links into that terminal;
-  otherwise it is informational.
+- The iPhone has no ordinary notification or Notification Service Extension
+  channel. Agent attention is expressed only through Live Activity and the
+  Dynamic Island.
+- Finished attention events are held back (30s, `Tuning.doneAttentionDelay`) and
+  cancelled by any state edge in the window: Claude fires Stop whenever its
+  main loop parks — including mid-task waits on background subagents — so an
+  immediate "finished" alert is often premature. Waiting/error alerts stay
+  immediate, and the E2EE list snapshot still flips to done in real time.
 - Widgets, complications, and the Live Activity extend the existing count
   model to per-state aggregates (e.g. `2 running · 1 waiting · 3 ttys`).
   "Waiting for you" is the one state that can justify color under the
   black/white rule.
-- The Dynamic Island is active while agents run and becomes prominent on a
-  waiting state.
+- Foreground status starts the island locally and silently. A first remote
+  appearance occurs only for waiting/error/done and carries the required
+  ActivityKit alert; ordinary running/count updates never alert.
 - Agent events are far more frequent than TTY lifecycle changes; the daemon
   must coalesce/debounce before pushing to respect APNs budgets for widget
   and Live Activity updates.
@@ -157,24 +163,20 @@ The existing invariant holds unchanged: the Worker stores identities,
 bindings, counts, and push endpoint state — never content.
 
 - **Worker/D1 see aggregate counts only** — per-computer
-  running/blocked/done counts, structurally identical to the alive-TTY
-  count. Widget and Live Activity payloads carry only these numbers (a Live
-  Activity ContentState is rendered by the system and cannot be decrypted
-  client-side, so it is count-only by construction).
+  running/blocked/recently-done counts, structurally identical to the
+  alive-TTY count. A transient Live Activity envelope adds only a state,
+  timestamp, alert bit, and opaque ciphertext; it is never persisted.
 - **Rich content is E2EE.** Agent names, project names, current-action
   lines, and last messages travel from the daemon to the app over the
   existing E2EE relay channel, peer to terminal bytes.
-- **Rich notifications** (agent's last message instead of a generic alert)
-  are possible via daemon-sealed ciphertext that the Worker forwards without
-  storing, decrypted on-device by a Notification Service Extension. Open
-  point: the NSE needs access to the binding secret, which today lives in
-  the app Keychain — access-group design required.
+- **Rich Live Activity content** is daemon-sealed with a dedicated derived
+  key and decrypted by the widget extension from a shared keychain group.
+  The root pairing secret never leaves the app's private keychain group.
 
 ## 7. Open questions (deferred)
 
 - Hook/event protocol details and the per-agent adapter list.
 - Exact agent-state model (is `done` a state or an event? staleness/timeout
   semantics for agents that die without a hook firing).
-- NSE keychain access-group design for rich notifications.
 - Shim tier: scope, packaging, and whether it ever becomes default.
 - Watch app layout for the two-section model on a small screen.

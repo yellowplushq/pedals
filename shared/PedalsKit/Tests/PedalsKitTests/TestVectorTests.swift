@@ -43,24 +43,23 @@ final class TestVectorTests: XCTestCase {
         )
     }
 
-    /// key_notify = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="notification", 32).
-    /// Distinct from both traffic keys so the NSE-held key exposes no relay traffic.
-    func testHKDFNotificationKeyVector() {
+    /// Dedicated to Live Activity content so widget access exposes no relay traffic.
+    func testHKDFLiveActivityKeyVector() {
         XCTAssertEqual(
-            hex(AgentNotification.notificationKey(secret: secret)),
-            "c5a359a64ceabcaf3aef9654f1d571dee246ba6be9ecf0cf08cc9c37e540e068"
+            hex(AgentActivity.activityKey(secret: secret)),
+            "aa9edd51002b92bf44e19b91f97ea7ee79f2416c460e36f25be4d0c71e2b2912"
         )
     }
 
-    func testAgentNotificationSealRoundTripsAndBindsComputerID() throws {
-        let key = AgentNotification.notificationKey(secret: secret)
-        let content = AgentNotification.Content(
-            agent: "claude", category: .waiting,
-            message: "Waiting for your answer", cwd: "/tmp/proj", sessionId: 7
+    func testAgentActivitySealRoundTripsAndBindsComputerID() throws {
+        let key = AgentActivity.activityKey(secret: secret)
+        let content = AgentActivity.Content(
+            id: "a-1", agent: "claude", state: .waiting, project: "proj",
+            message: "Waiting for your answer", sessionId: 7, updatedAt: 1_000
         )
-        let sealed = try AgentNotification.seal(content, key: key, computerID: "c-1")
-        XCTAssertEqual(try AgentNotification.open(sealed, key: key, computerID: "c-1"), content)
-        XCTAssertThrowsError(try AgentNotification.open(sealed, key: key, computerID: "c-2"))
+        let sealed = try AgentActivity.seal(content, key: key, computerID: "c-1")
+        XCTAssertEqual(try AgentActivity.open(sealed, key: key, computerID: "c-1"), content)
+        XCTAssertThrowsError(try AgentActivity.open(sealed, key: key, computerID: "c-2"))
     }
 
     func testSealedMessageVectorDecrypts() throws {

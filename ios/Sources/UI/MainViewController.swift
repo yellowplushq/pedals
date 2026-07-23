@@ -136,15 +136,6 @@ final class MainViewController: UIViewController {
             self?.switchTo(.terminal(id), animated: true)
         }
 
-        // Agent-alert notifications: suppress the banner for the terminal the
-        // user is already viewing; a tap deep-links into its terminal.
-        AgentNotificationController.shared.isViewingTerminal = { [weak self] id in
-            self?.visibleId == id
-        }
-        AgentNotificationController.shared.onOpenTerminal = { [weak self] id in
-            self?.openTerminalFromAlert(id)
-        }
-
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.onKey = { [weak self] key in
             self?.sendToolbarKey(key)
@@ -403,13 +394,6 @@ final class MainViewController: UIViewController {
         let ids = Set(terminals.map(\.id))
         orderedIds = terminals.map(\.id)
 
-        if let pending = pendingAlertTerminal, ids.contains(pending) {
-            pendingAlertTerminal = nil
-            DispatchQueue.main.async { [weak self] in
-                self?.switchTo(.terminal(pending), animated: true)
-            }
-        }
-
         for (id, page) in pages where !ids.contains(id) {
             if page.host.view.isFirstResponder {
                 page.host.view.resignFirstResponder()
@@ -527,23 +511,6 @@ final class MainViewController: UIViewController {
     }
 
     // MARK: - Page navigation
-
-    /// Terminal targeted by a notification tap that arrived before the
-    /// terminal list did (cold start); consumed on the next apply().
-    private var pendingAlertTerminal: TerminalID?
-
-    /// Notification-tap deep link. The terminal may not be known yet on a
-    /// cold start — park the target until the session list catches up. A
-    /// terminal that has since closed degrades to the Home overview.
-    private func openTerminalFromAlert(_ id: TerminalID) {
-        if orderedIds.contains(id) {
-            pendingAlertTerminal = nil
-            switchTo(.terminal(id), animated: true)
-        } else {
-            pendingAlertTerminal = id
-            switchTo(.home, animated: false)
-        }
-    }
 
     /// Instant switch (tab strip tap, own-create echo).
     private func showTerminal(_ id: TerminalID) {

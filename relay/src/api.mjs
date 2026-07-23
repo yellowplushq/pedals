@@ -781,89 +781,6 @@ function pushActivityKey(url, body = undefined) {
   return value;
 }
 
-const AGENT_NOTIFICATION_CATEGORIES = new Set(["waiting", "error", "done"]);
-const AGENT_NOTIFICATION_SEALED = /^[A-Za-z0-9+/]+={0,2}$/;
-
-// Host-authenticated agent notification, emitted on blocked/error/finished:
-// fans a visible push out to every client bound to the computer. Exists
-// purely to drive Apple notifications; the Worker forwards `sealed` without
-// storing it (AGENT_MONITORING_DESIGN.md §6).
-async function createAgentNotification(request, env, ctx, computerId) {
-  const host = await authenticateHost(request, env.DB, computerId);
-  if (!host) return apiError(401, "unauthorized", "valid host bearer required");
-  await limitAuthenticated(request, env, "MUTATION_LIMITER", "agent-notification", computerId);
-  const body = await readJson(request);
-  requireBodyShape(body, ["category", "dedupeKey", "sealed"], ["sessionId"]);
-  if (!AGENT_NOTIFICATION_CATEGORIES.has(body.category)) {
-    throw new ApiFailure(400, "invalid_request", "unknown notification category");
-  }
-  if (
-    typeof body.dedupeKey !== "string" ||
-    body.dedupeKey.length === 0 ||
-    body.dedupeKey.length > 256
-  ) {
-    throw new ApiFailure(400, "invalid_request", "invalid dedupe key");
-  }
-  if (
-    typeof body.sealed !== "string" ||
-    body.sealed.length === 0 ||
-    body.sealed.length > 4096 ||
-    !AGENT_NOTIFICATION_SEALED.test(body.sealed)
-  ) {
-    throw new ApiFailure(400, "invalid_request", "sealed payload must be base64");
-  }
-  if (
-    Object.hasOwn(body, "sessionId") &&
-    body.sessionId !== null &&
-    (!Number.isSafeInteger(body.sessionId) || body.sessionId < 0)
-  ) {
-    throw new ApiFailure(400, "invalid_request", "invalid session id");
-  }
-
-  const [clientsResult, stateResult] = await env.DB.batch([
-    env.DB
-      .prepare(`SELECT client_id AS clientId FROM client_computers WHERE computer_id = ?1`)
-      .bind(computerId),
-    env.DB
-      .prepare(`SELECT host_name AS hostName FROM computer_state WHERE computer_id = ?1`)
-      .bind(computerId),
-  ]);
-  const clientIds = (clientsResult.results ?? []).map((row) => row.clientId);
-  const hostName = stateResult.results?.[0]?.hostName ?? undefined;
-
-  const payload = {
-    category: body.category,
-    computerId,
-    ...(typeof body.sessionId === "number" ? { sessionId: body.sessionId } : {}),
-    ...(hostName ? { hostName } : {}),
-    sealed: body.sealed,
-  };
-
-  // Delivery happens after the response: notifications are fire-and-forget
-  // for the daemon, and APNs latency must not stall its hook pipeline.
-  ctx.waitUntil((async () => {
-    for (const clientId of clientIds) {
-      try {
-        const stub = env.PUSH_COORDINATOR.getByName(clientId);
-        const response = await stub.fetch("https://push.internal/notification", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ clientId, dedupeKey: body.dedupeKey, payload }),
-        });
-        if (!response.ok) {
-          console.error(`agent notification coordinator returned ${response.status}`);
-        }
-      } catch (error) {
-        console.error(
-          "agent notification dispatch failed",
-          error instanceof Error ? error.message : error,
-        );
-      }
-    }
-  })());
-  return json({ clients: clientIds.length }, 202);
-}
-
 async function putPushEndpoint(request, env, surface, url) {
   const client = await requireStatusClient(request, env);
   await limitAuthenticated(
@@ -874,33 +791,13 @@ async function putPushEndpoint(request, env, surface, url) {
     client.id,
   );
   const body = await readJson(request);
-  requireBodyShape(body, ["token", "environment"], ["activityId", "categories"]);
+  requireBodyShape(body, ["token", "environment"], ["activityId"]);
   if (
     typeof body.token !== "string" ||
     !APNS_TOKEN.test(body.token) ||
     body.token.length % 2 !== 0
   ) {
     throw new ApiFailure(400, "invalid_push_token", "token must be even-length hexadecimal bytes");
-  }
-  // "Notify me when…" preferences: a subset of the notification categories,
-  // meaningful only for the visible-notification surface. Absent (or the
-  // full set) stores NULL = all.
-  let notificationCategories = null;
-  if (Object.hasOwn(body, "categories")) {
-    if (surface !== "ios-notification") {
-      throw new ApiFailure(400, "invalid_request", "categories apply to ios-notification only");
-    }
-    if (
-      !Array.isArray(body.categories) ||
-      body.categories.length > 3 ||
-      body.categories.some((value) => !AGENT_NOTIFICATION_CATEGORIES.has(value)) ||
-      new Set(body.categories).size !== body.categories.length
-    ) {
-      throw new ApiFailure(400, "invalid_request", "invalid notification categories");
-    }
-    if (body.categories.length < AGENT_NOTIFICATION_CATEGORIES.size) {
-      notificationCategories = [...body.categories].sort().join(",");
-    }
   }
   if (body.environment !== "sandbox" && body.environment !== "production") {
     throw new ApiFailure(400, "invalid_environment", "environment must be sandbox or production");
@@ -917,10 +814,9 @@ async function putPushEndpoint(request, env, surface, url) {
   const hash = await tokenHash(normalizedToken);
   const endpointId = randomId();
   const now = nowSeconds();
-  // A brand-new push-to-start token must observe the current state so an app
-  // installed while terminals are already running can start immediately.
-  // On token rotation the UPSERT below preserves the prior baseline, which
-  // prevents a second activity from being created for the same positive run.
+  // A push-to-start token remains untouched by ordinary state sync. Its zero
+  // baseline is consumed only when an agent attention event arrives; token
+  // rotation preserves a previously consumed baseline.
   const initialSequence = -1;
   const initialTotal = surface === "liveactivity-start" ? 0 : null;
 
@@ -951,9 +847,9 @@ async function putPushEndpoint(request, env, surface, url) {
              (id, client_id, surface, apns_environment, token, token_hash,
               activity_key, created_at, updated_at, invalidated_at,
               last_sequence, last_total_running, retry_not_before,
-              failure_count, last_failure_reason, notification_categories)
+              failure_count, last_failure_reason)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL, ?9, ?10,
-                   NULL, 0, NULL, ?11)
+                   NULL, 0, NULL)
            ON CONFLICT(client_id, surface, activity_key) DO UPDATE SET
              apns_environment = excluded.apns_environment,
              token = excluded.token,
@@ -963,7 +859,6 @@ async function putPushEndpoint(request, env, surface, url) {
              retry_not_before = NULL,
              failure_count = 0,
              last_failure_reason = NULL,
-             notification_categories = excluded.notification_categories,
              last_sequence = CASE
                WHEN excluded.surface = 'liveactivity-start' THEN push_endpoints.last_sequence
                ELSE -1
@@ -985,7 +880,6 @@ async function putPushEndpoint(request, env, surface, url) {
           now,
           initialSequence,
           initialTotal,
-          notificationCategories,
         ),
     ]);
   } catch (error) {
@@ -1059,12 +953,6 @@ export async function handleApi(request, env, ctx, url) {
   if (match && request.method === "POST") {
     requireQueryShape(url);
     return completePairingSession(request, env, ctx, match[1], match[2]);
-  }
-
-  match = /^\/v2\/computers\/([0-9a-f]{32})\/agent-notifications$/.exec(pathname);
-  if (request.method === "POST" && match) {
-    requireQueryShape(url);
-    return createAgentNotification(request, env, ctx, match[1]);
   }
 
   match = /^\/v2\/computers\/([0-9a-f]{32})$/.exec(pathname);

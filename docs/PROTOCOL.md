@@ -433,12 +433,13 @@ GET /v2/clients/me/state
   "totalRunning": 3,
   "agentsRunning": 2,
   "agentsWaiting": 1,
+  "agentsDone": 0,
   "computers": [
     {
       "id": "...",
       "name": "MacBook Pro",
       "runningTTYCount": 3,
-      "agents": {"running": 2, "waiting": 1},
+      "agents": {"running": 2, "waiting": 1, "done": 0},
       "online": true,
       "updatedAt": "2026-07-18T00:00:00.000Z"
     }
@@ -459,54 +460,49 @@ PUT /v2/clients/me/push-endpoints/:surface
 {"token":"<hex>","environment":"sandbox|production","activityId":"..."?}
 ```
 
-Allowed surfaces are `ios-widget`, `watch-widget`, `liveactivity-start`,
-`liveactivity-update`, and `ios-notification`. APNs topics and push types
+Allowed surfaces are `ios-widget`, `watch-widget`, `liveactivity-start`, and
+`liveactivity-update`. APNs topics and push types
 are fixed by the Worker, not accepted from clients.
 
 - Widget push uses `apns-push-type: widgets` and only asks WidgetKit to reload;
   the timeline provider then reads `/state`.
 - Live Activity start/update/end uses `apns-push-type: liveactivity`, attributes
   `TTYActivityAttributes {scope:"all"}`, and content state containing
-  `totalRunning`, `agentsRunning`, `agentsWaiting`, online/offline computer
-  counts, `updatedAt`, and `sequence`. The activity starts on the first push
-  after `totalRunning + agentsRunning + agentsWaiting` becomes positive and
-  ends when it returns to zero.
+  `totalRunning`, `agentsRunning`, `agentsWaiting`, `agentsDone`, online/offline
+  computer counts, `updatedAt`, and `sequence`. In the foreground the app
+  requests a normal activity locally, without an alert. Count invalidations
+  never consume a push-to-start token. A remote start is reserved for an
+  attention event and therefore carries the ActivityKit-required alert. The
+  activity ends when the aggregate returns to zero.
 - APNs provider keys exist only as encrypted Worker secrets. Invalid device
   tokens are removed; throttled/server failures are retried with backoff.
 
-### 6.1 Agent notifications
+### 6.1 Rich agent Live Activity content
 
-When an agent transitions into `waiting`, `error`, or `done`, the daemon
-fires a visible push — the notification pipeline exists purely to drive
-Apple push notifications — through:
+The daemon sends the most recent agent as transient host metadata:
 
-```http
-POST /v2/computers/:computerId/agent-notifications        (host bearer)
-{"category":"waiting|error|done","sessionId":7?,
- "dedupeKey":"<agent-session>:<category>:<ts>","sealed":"<base64>"}
+```json
+{"type":"agent-activity","activity":{"eventID":"<uuid>",
+ "state":"running|waiting|error|done","updatedAt":1770000000000,
+ "alert":false,"sealed":"<base64>"}}
 ```
 
-The Worker fans the notification out to every bound client's
-`ios-notification` endpoints (push type `alert`, topic `air.build.pedals`,
-`mutable-content: 1`) and never stores the payload. The visible text the Worker composes is generic per
-category ("An agent needs your input"), titled with the server-visible host
-name. `sealed` is `ChaChaPoly(key_notify, aad=computerId)` over
-`{agent, category, message?, cwd?, sessionId?}`, where
+The Worker immediately fans this to bound clients' Live Activity endpoints
+and never stores it. `sealed` is `ChaChaPoly(key_activity, aad=computerId)`
+over the compact agent/project/prompt/action/message snapshot, where
 
 ```
-key_notify = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="notification", 32)
+key_activity = HKDF-SHA256(ikm=secret, salt="pedals-v2", info="live-activity", 32)
 ```
 
-is deliberately distinct from both traffic keys: the phone mirrors only this
-derived key into a shared keychain group, and the Notification Service
-Extension decrypts and rewrites the alert on-device (agent name, project,
-message). Without the NSE or the key, the generic text still shows. The
-`dedupeKey` makes Worker-side APNs retries idempotent (it seeds `apns-id`).
-Delivery is fire-and-forget: the E2EE agent list is the durable source of
-truth, so a lost notification is one missed banner, not lost state. The
-daemon floors notifications at one per agent session per 3 seconds;
-transitions are edge-triggered (repeated events in the same state do not
-re-notify).
+is deliberately distinct from both traffic keys. The phone mirrors only this
+derived key into the widget extension's shared keychain group, and the widget
+decrypts the content while rendering the Lock Screen and Dynamic Island.
+Running content is throttled and silent. Entry into `waiting`, `error`, or
+`done` sets `alert=true`; only those events can remotely start and visibly
+expand the island. The APNs alert remains generic because the provider cannot
+read the ciphertext, and it deliberately has no sound. The aggregate counts
+remain the durable fallback if a transient rich update is lost.
 
 ## 7. Desktop local control
 

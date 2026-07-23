@@ -69,6 +69,14 @@ public final class AgentMonitor: @unchecked Sendable {
         public var idleExpiry: TimeInterval = 30 * 60
         /// Hard ceiling for any record, pid or not.
         public var absoluteTTL: TimeInterval = 24 * 60 * 60
+        /// A `done` edge is held back this long before its attention update, and
+        /// any state edge in the window cancels it. Claude fires Stop whenever
+        /// its main loop parks — including mid-task waits on background
+        /// subagents — so an immediate "finished" alert is often a lie; a park
+        /// that resumes inside the window now alerts nothing. waiting/error
+        /// alerts stay immediate. Only attention is delayed — the E2EE list
+        /// snapshot still shows `done` in real time.
+        public var doneAttentionDelay: TimeInterval = 30
 
         public init() {}
     }
@@ -123,6 +131,8 @@ public final class AgentMonitor: @unchecked Sendable {
     private let tuning: Tuning
     private let matchTargets: @Sendable () -> [SessionManager.AgentMatchTarget]
     private var records: [String: Record] = [:]
+    /// Held-back done attention events by agent id (see Tuning.doneAttentionDelay).
+    private var pendingDoneAttention: [String: DispatchWorkItem] = [:]
     private var sweepTimer: DispatchSourceTimer?
     private var publishPending = false
 
@@ -136,13 +146,13 @@ public final class AgentMonitor: @unchecked Sendable {
     /// Fired on the monitor's serial queue when an agent transitions INTO a
     /// user-facing state (waiting/error/done) — edge-triggered, so repeated
     /// events in the same state (Claude's ask followed by its Notification
-    /// hook) collapse to one notification, mirroring supacode's notify
-    /// dedupe. Not debounced: transitions are rare and each is worth a push.
-    public var onNotification: (@Sendable (AgentInfo, AgentNotification.Category) -> Void)? {
-        get { queue.sync { _onNotification } }
-        set { queue.sync { _onNotification = newValue } }
+    /// hook) collapse to one attention event. Not debounced: transitions are
+    /// rare and each deserves a visible Live Activity update.
+    public var onAttention: (@Sendable (AgentInfo, AgentActivity.Attention) -> Void)? {
+        get { queue.sync { _onAttention } }
+        set { queue.sync { _onAttention = newValue } }
     }
-    private var _onNotification: (@Sendable (AgentInfo, AgentNotification.Category) -> Void)?
+    private var _onAttention: (@Sendable (AgentInfo, AgentActivity.Attention) -> Void)?
 
     public init(
         tuning: Tuning = Tuning(),
@@ -172,6 +182,7 @@ public final class AgentMonitor: @unchecked Sendable {
             guard !id.isEmpty, !agent.isEmpty else { return }
 
             if event.event == "session-end" {
+                pendingDoneAttention.removeValue(forKey: id)?.cancel()
                 guard records.removeValue(forKey: id) != nil else { return }
                 schedulePublishLocked()
                 return
@@ -190,21 +201,45 @@ public final class AgentMonitor: @unchecked Sendable {
             applyLineage(event.lineage, to: record)
             _ = resolveOwnershipLocked(record, targets: matchTargets())
             record.updatedAt = Date()
-            if record.state != oldState, let category = Self.notificationCategory(record.state) {
-                _onNotification?(record.info, category)
+            if record.state != oldState {
+                // Any state edge supersedes held-back completion attention: the park
+                // resumed (running), or something more urgent replaced it.
+                pendingDoneAttention.removeValue(forKey: id)?.cancel()
+                if let attention = Self.attention(record.state) {
+                    if attention == .done {
+                        scheduleDoneAttentionLocked(id: id)
+                    } else {
+                        _onAttention?(record.info, attention)
+                    }
+                }
             }
             schedulePublishLocked()
         }
     }
 
-    /// States whose entry edge is worth a push. `.running` is not one.
-    private static func notificationCategory(_ state: AgentState) -> AgentNotification.Category? {
+    /// States whose entry edge deserves visible attention. `.running` does not.
+    private static func attention(_ state: AgentState) -> AgentActivity.Attention? {
         switch state {
         case .waiting: .waiting
         case .error: .error
         case .done: .done
         case .running: nil
         }
+    }
+
+    /// Delivers completion attention only if the agent is still done once the
+    /// hold-back window closes; the record is re-read at fire time so the
+    /// update carries the freshest message, and a record that vanished
+    /// (session end, dismiss, sweep) alerts nothing.
+    private func scheduleDoneAttentionLocked(id: String) {
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            pendingDoneAttention.removeValue(forKey: id)
+            guard let record = records[id], record.state == .done else { return }
+            _onAttention?(record.info, .done)
+        }
+        pendingDoneAttention[id] = item
+        queue.asyncAfter(deadline: .now() + tuning.doneAttentionDelay, execute: item)
     }
 
     /// Current snapshot, most recently updated first.
@@ -215,9 +250,10 @@ public final class AgentMonitor: @unchecked Sendable {
     /// Client-requested dismissal (the Home list is bidirectional): removes
     /// the record for every client. The agent's next hook event recreates
     /// it, so a dismissed-but-alive agent reappears on its next state
-    /// change. No notification fires for the removal.
+    /// change. No attention event fires for the removal.
     public func dismiss(id: String) {
         queue.sync {
+            pendingDoneAttention.removeValue(forKey: id)?.cancel()
             guard records.removeValue(forKey: id) != nil else { return }
             schedulePublishLocked()
         }
@@ -267,6 +303,13 @@ public final class AgentMonitor: @unchecked Sendable {
             let provided = event.message.map { Self.sanitize($0, cap: Self.messageCap) }
             record.message = provided?.isEmpty == false ? provided : "Waiting for your answer"
         case "notify":
+            // `.done` is sticky against notify too: Claude fires its idle
+            // Notification hook ("waiting for your input") when the REPL
+            // sits unattended after a Stop, and that must not resurrect a
+            // finished agent into waiting — the push would read "needs your
+            // input" right on the heels of "finished". A genuine ask always
+            // happens mid-turn, after a turn start reset the state.
+            guard record.state != .done else { break }
             if !sticky { record.state = .waiting }
             if let message = event.message {
                 record.message = Self.sanitize(message, cap: Self.messageCap)
