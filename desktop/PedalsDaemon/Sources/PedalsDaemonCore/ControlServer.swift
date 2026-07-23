@@ -14,6 +14,7 @@ public struct ControlRequest: Decodable, Sendable {
     public var agent: String?
     public var event: String?
     public var agentSessionId: String?
+    public var sessionName: String?
     public var cwd: String?
     public var prompt: String?
     public var message: String?

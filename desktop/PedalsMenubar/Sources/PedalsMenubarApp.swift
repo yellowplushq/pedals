@@ -1,10 +1,13 @@
 import AppKit
 import SwiftUI
 
-/// The settings window is a plain `Window` scene, not the `Settings` scene:
-/// the Settings scene styles its toolbar itself (centered title, no
-/// full-height sidebar), which fights the split-view look.
-enum SettingsWindow {
+/// Settings uses a value-backed `WindowGroup`, not the `Settings` scene: the
+/// latter styles its toolbar itself (centered title, no full-height sidebar),
+/// which fights the split-view look. Reusing `.main` also preserves the
+/// singleton behavior of the former `Window` scene.
+enum SettingsWindow: String, Codable, Hashable {
+    case main
+
     static let id = "pedals-settings"
 }
 
@@ -13,14 +16,23 @@ struct PedalsMenubarApp: App {
     @NSApplicationDelegateAdaptor(PedalsAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("Settings", id: SettingsWindow.id) {
+        WindowGroup(
+            "Settings",
+            id: SettingsWindow.id,
+            for: SettingsWindow.self
+        ) { _ in
             SettingsView()
                 .environmentObject(appDelegate.updater)
                 .environmentObject(appDelegate.permissions)
+        } defaultValue: {
+            .main
         }
         .handlesExternalEvents(matching: [])
         .windowToolbarStyle(.unified)
         .defaultSize(width: 760, height: 540)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
     }
 }
 
@@ -42,7 +54,7 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
 
         // Dev affordance: land straight in the settings window so local relay
         // runs and UI screenshots don't need the status-item popover. The
-        // real Window scene must render (a plain NSWindow host lays the
+        // real WindowGroup scene must render (a plain NSWindow host lays the
         // toolbar out differently), so a throwaway 1×1 bootstrap window calls
         // the same openWindow(id:) action the menu's gear button uses.
         if ProcessInfo.processInfo.environment["PEDALS_OPEN_SETTINGS"] == "1" {
@@ -74,15 +86,27 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    /// Pedals is a menu-bar service whose lifetime must not be tied to its
+    /// Settings windows.
+    /// Explicitly keep the process, status item, and relay service alive when
+    /// the user closes Settings; the dedicated Quit actions still terminate.
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        false
+    }
 }
 
-/// Hosted in the 1×1 bootstrap window: opens the real settings Window scene
+/// Hosted in the 1×1 bootstrap window: opens the real settings WindowGroup
 /// through the same environment action the menu uses.
 private struct DebugSettingsOpener: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Color.clear
-            .onAppear { openWindow(id: SettingsWindow.id) }
+            .onAppear {
+                openWindow(id: SettingsWindow.id, value: SettingsWindow.main)
+            }
     }
 }

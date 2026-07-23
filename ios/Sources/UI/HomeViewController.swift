@@ -68,13 +68,15 @@ final class HomeViewController: UIViewController {
         else { return nil }
         let now = Date().timeIntervalSince1970
         func row(
-            _ agent: String, _ state: AgentState, cwd: String, age: Double,
+            _ agent: String, _ state: AgentState, sessionName: String,
+            cwd: String, age: Double,
             prompt: String? = nil, message: String? = nil, action: String? = nil
         ) -> AgentRow {
             AgentRow(
                 computerID: "fixture", computerName: "Studio", hostOnline: true,
                 info: AgentInfo(
-                    id: "fx-\(agent)", agent: agent, state: state, cwd: cwd,
+                    id: "fx-\(agent)", agent: agent, state: state,
+                    sessionName: sessionName, cwd: cwd,
                     action: action, message: message, prompt: prompt,
                     updatedAt: now - age
                 )
@@ -82,25 +84,30 @@ final class HomeViewController: UIViewController {
         }
         return [
             row(
-                "claude", .waiting, cwd: "/Users/eyhn/Projects/yellowplus/pedals",
+                "claude", .waiting, sessionName: "Polish agent monitoring",
+                cwd: "/Users/eyhn/Projects/yellowplus/pedals",
                 age: 3 * 60,
                 prompt: "把设置页改成侧边栏布局",
                 message: "Claude needs your permission to use Bash"
             ),
             row(
-                "codex", .running, cwd: "/Users/eyhn/Projects/website",
+                "codex", .running, sessionName: "Website release",
+                cwd: "/Users/eyhn/Projects/website",
                 age: 6 * 60, action: "Bash: npm run build"
             ),
             row(
-                "pi", .running, cwd: "/Users/eyhn/Projects/api-server",
+                "pi", .running, sessionName: "API cleanup",
+                cwd: "/Users/eyhn/Projects/api-server",
                 age: 70, action: "Edit: routes.ts"
             ),
             row(
-                "kiro", .done, cwd: "/Users/eyhn/Projects/blog",
+                "kiro", .done, sessionName: "Landing page",
+                cwd: "/Users/eyhn/Projects/blog",
                 age: 60 * 60, message: "Deployed the new landing page."
             ),
             row(
-                "grok", .error, cwd: "/Users/eyhn/Projects/experiments",
+                "grok", .error, sessionName: "Model experiments",
+                cwd: "/Users/eyhn/Projects/experiments",
                 age: 3 * 60 * 60, message: "API rate limit exceeded"
             ),
         ]
@@ -414,12 +421,16 @@ final class HomeViewController: UIViewController {
             chips.append(terminal.computerName)
         }
         if let agent {
+            let presentation = AgentActivity.Presentation(
+                info: agent, fallbackSessionName: terminal.info.title
+            )
             return HomeRowContent(
                 indicator: .state(agent.state),
                 icon: agentIcon,
-                primary: Self.agentOneLiner(agent),
-                secondary: terminal.info.title,
+                primary: presentation.title,
+                secondary: presentation.detail,
                 chips: chips,
+                secondaryColor: HomeRowCell.stateColor(agent.state),
                 time: CompactRelativeTime.string(from: agent.updatedAt, now: now),
                 dimmed: false
             )
@@ -450,22 +461,12 @@ final class HomeViewController: UIViewController {
         if !row.hostOnline {
             chips.append("offline")
         }
-        let primary = info.prompt.flatMap(Self.firstLine)
-            ?? Self.lastPathComponent(info.cwd)
-        let secondary: String
-        switch info.state {
-        case .running:
-            secondary = info.action ?? Self.abbreviatePath(info.cwd)
-        case .error:
-            secondary = info.message ?? "Agent hit an error"
-        case .waiting, .done:
-            secondary = info.message ?? Self.abbreviatePath(info.cwd)
-        }
+        let presentation = AgentActivity.Presentation(info: info)
         return HomeRowContent(
             indicator: .state(info.state),
             icon: agentIcon,
-            primary: primary,
-            secondary: secondary,
+            primary: presentation.title,
+            secondary: presentation.detail,
             chips: chips,
             secondaryColor: HomeRowCell.stateColor(info.state),
             time: row.hostOnline
@@ -520,12 +521,7 @@ final class HomeViewController: UIViewController {
     // MARK: - Text helpers
 
     static func agentOneLiner(_ agent: AgentInfo) -> String {
-        switch agent.state {
-        case .running: agent.action ?? "Working…"
-        case .waiting: agent.message ?? "Needs your input"
-        case .error: agent.message ?? "Agent hit an error"
-        case .done: agent.message ?? "Finished"
-        }
+        AgentActivity.Presentation(info: agent).detail
     }
 
     static func agentDisplayName(_ slug: String) -> String {
@@ -573,18 +569,6 @@ final class HomeViewController: UIViewController {
         return path
     }
 
-    static func lastPathComponent(_ path: String) -> String {
-        let component = (path as NSString).lastPathComponent
-        return component.isEmpty ? path : component
-    }
-
-    static func firstLine(_ text: String) -> String? {
-        let line = text
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty }
-        return line
-    }
 }
 
 extension HomeViewController: UICollectionViewDelegate {

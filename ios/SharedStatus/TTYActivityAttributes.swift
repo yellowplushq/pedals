@@ -1,5 +1,6 @@
 import ActivityKit
 import Foundation
+import PedalsKit
 
 public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Sendable {
     public struct ContentState: Codable, Hashable, Sendable {
@@ -84,5 +85,27 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
 
     public init(scope: String = "all") {
         self.scope = scope
+    }
+}
+
+extension TTYActivityAttributes.ContentState {
+    /// A nonzero aggregate is the authoritative switch between the agent and
+    /// terminal presentations. Rich agent content is best-effort E2EE data and
+    /// must never decide which presentation the user sees.
+    var totalAgents: Int {
+        agentsRunning + agentsWaiting + agentsDone
+    }
+
+    /// Prefer the state attached to the most recent encrypted agent envelope.
+    /// If that envelope is temporarily absent or unreadable, keep the island
+    /// in agent mode and fall back to the most attention-worthy aggregate.
+    var displayedAgentState: AgentState? {
+        guard totalAgents > 0 else { return nil }
+        if let recentAgentState, let state = AgentState(rawValue: recentAgentState) {
+            return state
+        }
+        if agentsWaiting > 0 { return .waiting }
+        if agentsDone > 0 { return .done }
+        return .running
     }
 }

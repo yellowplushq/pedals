@@ -49,14 +49,17 @@ public enum AgentState: String, Codable, Sendable {
 }
 
 /// One entry of the `agents` list: a coding-agent session observed via hooks.
-/// Rich content (cwd, action, message, prompt) is E2EE-only — it must never
-/// appear in relay metadata or D1.
+/// Rich content (session name, cwd, action, message, prompt) is E2EE-only —
+/// it must never appear in relay metadata or D1.
 public struct AgentInfo: Codable, Equatable, Sendable {
     /// Hook-reported session id, unique per agent process session.
     public var id: String
     /// Agent kind slug: "claude", "codex", …
     public var agent: String
     public var state: AgentState
+    /// User-facing session title. For daemon-owned terminals this is the live
+    /// terminal session title; unmanaged agents may report their own title.
+    public var sessionName: String?
     /// The agent's working directory (project path).
     public var cwd: String
     /// One-line current action while running, e.g. "Bash: git status".
@@ -73,13 +76,15 @@ public struct AgentInfo: Codable, Equatable, Sendable {
     /// Unix epoch seconds of the last state change.
     public var updatedAt: Double
 
-    public init(id: String, agent: String, state: AgentState, cwd: String,
+    public init(id: String, agent: String, state: AgentState,
+                sessionName: String? = nil, cwd: String,
                 action: String? = nil, message: String? = nil,
                 prompt: String? = nil, sessionId: Int? = nil,
                 term: String? = nil, updatedAt: Double) {
         self.id = id
         self.agent = agent
         self.state = state
+        self.sessionName = sessionName
         self.cwd = cwd
         self.action = action
         self.message = message

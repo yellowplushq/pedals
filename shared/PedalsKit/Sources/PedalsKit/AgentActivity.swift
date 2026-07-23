@@ -4,9 +4,10 @@ import Foundation
 /// Rich coding-agent state embedded in the aggregate Pedals Live Activity.
 ///
 /// The Worker receives only a server-visible state, timestamp, and opaque
-/// ciphertext. Agent identity, project, prompt, action, and message remain
-/// encrypted from the daemon to the widget extension. The payload is kept
-/// deliberately small because ActivityKit caps ContentState at 4 KiB.
+/// ciphertext. Agent identity, session name, project, prompt, action, and
+/// message remain encrypted from the daemon to the widget extension. The
+/// payload is kept deliberately small because ActivityKit caps ContentState
+/// at 4 KiB.
 public enum AgentActivity {
     public enum Attention: String, Codable, CaseIterable, Sendable {
         case waiting
@@ -18,6 +19,7 @@ public enum AgentActivity {
         public var id: String
         public var agent: String
         public var state: AgentState
+        public var sessionName: String?
         public var project: String?
         public var prompt: String?
         public var action: String?
@@ -30,6 +32,7 @@ public enum AgentActivity {
             id: String,
             agent: String,
             state: AgentState,
+            sessionName: String? = nil,
             project: String? = nil,
             prompt: String? = nil,
             action: String? = nil,
@@ -41,6 +44,7 @@ public enum AgentActivity {
             self.id = id
             self.agent = agent
             self.state = state
+            self.sessionName = sessionName
             self.project = project
             self.prompt = prompt
             self.action = action
@@ -55,6 +59,7 @@ public enum AgentActivity {
                 id: info.id,
                 agent: info.agent,
                 state: info.state,
+                sessionName: info.sessionName.map { Self.singleLine($0, limit: 120) },
                 project: Self.projectName(from: info.cwd),
                 prompt: info.prompt.map { Self.singleLine($0, limit: 160) },
                 action: info.action.map { Self.singleLine($0, limit: 100) },
@@ -81,6 +86,62 @@ public enum AgentActivity {
                 result.removeLast()
             }
             return result
+        }
+    }
+
+    /// Shared display semantics for every agent surface. The title identifies
+    /// the session; the detail describes the latest useful agent output or
+    /// action. Agent brand and state remain separate visual information.
+    public struct Presentation: Equatable, Sendable {
+        public var title: String
+        public var detail: String
+
+        public init(info: AgentInfo, fallbackSessionName: String? = nil) {
+            self.init(
+                agent: info.agent,
+                state: info.state,
+                sessionName: info.sessionName ?? fallbackSessionName,
+                project: AgentActivity.projectName(from: info.cwd),
+                action: info.action,
+                message: info.message
+            )
+        }
+
+        public init(content: Content) {
+            self.init(
+                agent: content.agent,
+                state: content.state,
+                sessionName: content.sessionName,
+                project: content.project,
+                action: content.action,
+                message: content.message
+            )
+        }
+
+        private init(
+            agent: String,
+            state: AgentState,
+            sessionName: String?,
+            project: String?,
+            action: String?,
+            message: String?
+        ) {
+            title = AgentActivity.displayLine(sessionName)
+                ?? AgentActivity.displayLine(project)
+                ?? AgentActivity.displayName(forAgent: agent)
+
+            let latestMessage = AgentActivity.displayLine(message)
+            let latestAction = AgentActivity.displayLine(action)
+            switch state {
+            case .running:
+                detail = latestMessage ?? latestAction ?? "Working…"
+            case .waiting:
+                detail = latestMessage ?? latestAction ?? "Waiting for your input"
+            case .error:
+                detail = latestMessage ?? latestAction ?? "Agent hit an error"
+            case .done:
+                detail = latestMessage ?? latestAction ?? "Task completed"
+            }
         }
     }
 
@@ -131,5 +192,20 @@ public enum AgentActivity {
         case "pi": "Pi"
         default: slug.capitalized
         }
+    }
+
+    private static func projectName(from path: String) -> String? {
+        guard !path.isEmpty else { return nil }
+        return displayLine((path as NSString).lastPathComponent)
+    }
+
+    private static func displayLine(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return normalized.isEmpty ? nil : normalized
     }
 }

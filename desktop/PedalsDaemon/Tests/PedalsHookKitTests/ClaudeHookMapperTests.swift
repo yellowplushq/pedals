@@ -26,9 +26,18 @@ final class ClaudeHookMapperTests: XCTestCase {
     }
 
     func testSessionAndCwdCarried() {
-        let report = map(base("SessionStart"))
+        var object = base("SessionStart")
+        object["session_name"] = "Pedals release"
+        let report = map(object)
         XCTAssertEqual(report?.agentSessionId, "s-1")
+        XCTAssertEqual(report?.sessionName, "Pedals release")
         XCTAssertEqual(report?.cwd, "/tmp/project")
+    }
+
+    func testNotificationTitleIsNotMistakenForSessionName() {
+        var object = base("Notification")
+        object["title"] = "Agent needs attention"
+        XCTAssertNil(map(object)?.sessionName)
     }
 
     func testPromptCarriedAndCapped() {

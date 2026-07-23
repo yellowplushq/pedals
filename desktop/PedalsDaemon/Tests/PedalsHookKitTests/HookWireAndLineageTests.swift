@@ -7,7 +7,8 @@ import XCTest
 final class HookWireAndLineageTests: XCTestCase {
     func testRequestLineShape() throws {
         let report = HookReport(
-            event: "tool", agentSessionId: "s-1", cwd: "/tmp/p",
+            event: "tool", agentSessionId: "s-1",
+            sessionName: "Pedals release", cwd: "/tmp/p",
             action: "Bash: git status"
         )
         let lineage = [
@@ -27,6 +28,7 @@ final class HookWireAndLineageTests: XCTestCase {
         XCTAssertEqual(object["agent"] as? String, "claude")
         XCTAssertEqual(object["event"] as? String, "tool")
         XCTAssertEqual(object["agentSessionId"] as? String, "s-1")
+        XCTAssertEqual(object["sessionName"] as? String, "Pedals release")
         XCTAssertEqual(object["cwd"] as? String, "/tmp/p")
         XCTAssertEqual(object["action"] as? String, "Bash: git status")
         XCTAssertNil(object["prompt"])

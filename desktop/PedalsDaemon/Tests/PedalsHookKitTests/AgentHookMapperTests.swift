@@ -151,6 +151,21 @@ final class AgentHookMapperTests: XCTestCase {
         XCTAssertEqual(report?.agentSessionId, "kimi-\(getppid())")
     }
 
+    func testSessionNameEnrichment() {
+        XCTAssertEqual(
+            map("codex", "busy", flatBase(["session_title": "Release prep"]))?.sessionName,
+            "Release prep"
+        )
+        XCTAssertEqual(
+            map("pi", "busy", ["sessionId": "n-1", "sessionName": "API cleanup"])?.sessionName,
+            "API cleanup"
+        )
+        XCTAssertNil(
+            map("codex", "notify", flatBase(["title": "Agent completed"]))?.sessionName,
+            "event titles are not persistent session names"
+        )
+    }
+
     func testMalformedStdinStillReports() {
         // Argv names the event; garbage stdin degrades to no enrichment.
         let report = AgentHookMapper.report(

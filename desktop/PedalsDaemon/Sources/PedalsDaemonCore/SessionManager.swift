@@ -243,11 +243,16 @@ public final class SessionManager: @unchecked Sendable {
     /// session.
     public struct AgentMatchTarget: Equatable, Sendable {
         public let sessionId: Int
+        public let sessionName: String
         public let ttyPath: String?
         public let shellPid: pid_t
 
-        public init(sessionId: Int, ttyPath: String?, shellPid: pid_t) {
+        public init(
+            sessionId: Int, sessionName: String = "",
+            ttyPath: String?, shellPid: pid_t
+        ) {
             self.sessionId = sessionId
+            self.sessionName = sessionName
             self.ttyPath = ttyPath
             self.shellPid = shellPid
         }
@@ -260,7 +265,8 @@ public final class SessionManager: @unchecked Sendable {
                 .sorted { $0.id < $1.id }
                 .map {
                     AgentMatchTarget(
-                        sessionId: $0.id, ttyPath: $0.pty.ttyPath, shellPid: $0.pty.pid
+                        sessionId: $0.id, sessionName: $0.title,
+                        ttyPath: $0.pty.ttyPath, shellPid: $0.pty.pid
                     )
                 }
         }

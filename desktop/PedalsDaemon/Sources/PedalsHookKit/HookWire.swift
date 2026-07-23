@@ -12,6 +12,7 @@ public enum HookWire {
             "event": report.event,
             "agentSessionId": report.agentSessionId,
         ]
+        if let sessionName = report.sessionName { object["sessionName"] = sessionName }
         if let cwd = report.cwd { object["cwd"] = cwd }
         if let prompt = report.prompt { object["prompt"] = prompt }
         if let message = report.message { object["message"] = message }

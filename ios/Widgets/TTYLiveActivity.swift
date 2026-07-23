@@ -16,32 +16,40 @@ struct TTYLiveActivityWidget: Widget {
                 .activitySystemActionForegroundColor(PedalsTheme.content)
         } dynamicIsland: { context in
             let state = context.state
-            let agent = state.recentAgent
+            let presentation = ActivityPresentation(state: state)
             return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    ActivityIdentity(agent: agent)
-                        .padding(.leading, 4)
-                        .padding(.top, 2)
+                    Group {
+                        if presentation.showsAgent {
+                            AgentIdentity(presentation: presentation)
+                        } else {
+                            TerminalIdentity()
+                        }
+                    }
+                    .padding(.leading, 4)
+                    .padding(.top, 2)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    StatusPill(state: state, agent: agent)
+                    ActivityStateLabel(presentation: presentation)
                         .padding(.trailing, 4)
                         .padding(.top, 2)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    ActivityBody(state: state, agent: agent, stale: context.isStale)
+                    ActivityBody(
+                        state: state, presentation: presentation, stale: context.isStale
+                    )
                         .padding(.horizontal, 6)
                         .padding(.bottom, 7)
                         .privacySensitive()
                 }
             } compactLeading: {
-                CompactMark(state: state, agent: agent)
+                CompactMark(presentation: presentation)
             } compactTrailing: {
-                CompactValue(state: state, agent: agent)
+                CompactValue(state: state, presentation: presentation)
             } minimal: {
-                CompactMark(state: state, agent: agent)
+                CompactMark(presentation: presentation)
             }
-            .keylineTint(ActivityStyle.color(for: agent?.state, state: state))
+            .keylineTint(ActivityStyle.color(for: presentation))
         }
     }
 }
@@ -51,73 +59,140 @@ private struct ActivityCard: View {
     let stale: Bool
 
     var body: some View {
-        let agent = state.recentAgent
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                ActivityIdentity(agent: agent)
-                Spacer(minLength: 8)
-                StatusPill(state: state, agent: agent)
+        let presentation = ActivityPresentation(state: state)
+        Group {
+            if presentation.showsAgent {
+                AgentActivityRow(
+                    state: state, presentation: presentation, stale: stale
+                )
+            } else {
+                TerminalActivityCard(state: state, stale: stale)
             }
-            ActivityBody(state: state, agent: agent, stale: stale)
-                .privacySensitive()
         }
     }
 }
 
-private struct ActivityIdentity: View {
+private struct ActivityPresentation {
     let agent: AgentActivity.Content?
+    let agentState: AgentState?
+
+    init(state: TTYActivityAttributes.ContentState) {
+        let fallbackState = state.displayedAgentState
+        let decodedAgent = fallbackState == nil ? nil : state.recentAgent
+        agent = decodedAgent
+        agentState = decodedAgent?.state ?? fallbackState
+    }
+
+    var showsAgent: Bool { agentState != nil }
+
+    var agentName: String {
+        guard let agent else { return "Agent" }
+        return AgentActivity.displayName(forAgent: agent.agent)
+    }
+
+    var agentContent: AgentActivity.Presentation? {
+        agent.map { AgentActivity.Presentation(content: $0) }
+    }
+}
+
+/// The same visual anchor as a Home agent row: the real agent mark with its
+/// current state sitting on the mark's top-right corner.
+private struct AgentMark: View {
+    let presentation: ActivityPresentation
+    var size: CGFloat = 22
 
     var body: some View {
-        HStack(spacing: 8) {
-            if let agent, let asset = ActivityStyle.asset(for: agent.agent) {
+        let badgeSize: CGFloat = size >= 22 ? 10 : 8
+        ZStack(alignment: .topLeading) {
+            if let agent = presentation.agent,
+               let asset = ActivityStyle.asset(for: agent.agent)
+            {
                 Image(asset)
                     .resizable()
-                    .renderingMode(.template)
                     .scaledToFit()
-                    .frame(width: 20, height: 20)
+                    .frame(width: size, height: size)
+                    .offset(y: 4)
             } else {
-                Image(systemName: agent == nil ? "terminal.fill" : "sparkles")
-                    .font(.system(size: 16, weight: .semibold))
+                Image(systemName: "sparkles")
+                    .font(.system(size: size * 0.72, weight: .semibold))
+                    .frame(width: size, height: size)
+                    .offset(y: 4)
             }
-            Text(agent.map { AgentActivity.displayName(forAgent: $0.agent) } ?? "Pedals")
+
+            if let agentState = presentation.agentState, agentState != .done {
+                Circle()
+                    .fill(ActivityStyle.color(for: presentation))
+                    .frame(width: badgeSize, height: badgeSize)
+                    .overlay {
+                        Circle()
+                            .stroke(PedalsTheme.canvas, lineWidth: size >= 22 ? 2 : 1.5)
+                    }
+                    .offset(x: size - badgeSize / 2 - 1)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(width: size + 4, height: size + 4, alignment: .topLeading)
+        .foregroundStyle(PedalsTheme.content)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(presentation.agentName), \(ActivityStyle.label(for: presentation))"
+        )
+    }
+}
+
+private struct AgentIdentity: View {
+    let presentation: ActivityPresentation
+
+    var body: some View {
+        HStack(spacing: 7) {
+            AgentMark(presentation: presentation)
+                .accessibilityHidden(true)
+            Text(presentation.agentName)
                 .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(presentation.agentName), \(ActivityStyle.label(for: presentation))"
+        )
     }
 }
 
-private struct StatusPill: View {
-    let state: TTYActivityAttributes.ContentState
-    let agent: AgentActivity.Content?
+private struct TerminalIdentity: View {
+    var body: some View {
+        Label("Pedals", systemImage: "terminal.fill")
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+    }
+}
+
+/// Text instead of a filled capsule keeps the expanded island at the same
+/// visual weight as Home's trailing relative time.
+private struct ActivityStateLabel: View {
+    let presentation: ActivityPresentation
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: ActivityStyle.symbol(for: agent?.state, state: state))
-            Text(ActivityStyle.label(for: agent?.state, state: state))
-                .lineLimit(1)
-        }
-        .font(.caption2.weight(.bold))
-        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(.white.opacity(0.09), in: Capsule())
+        Text(ActivityStyle.label(for: presentation))
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(ActivityStyle.color(for: presentation))
+            .lineLimit(1)
     }
 }
 
 private struct ActivityBody: View {
     let state: TTYActivityAttributes.ContentState
-    let agent: AgentActivity.Content?
+    let presentation: ActivityPresentation
     let stale: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            if let agent {
-                Text(agent.project ?? AgentActivity.displayName(forAgent: agent.agent))
+            if presentation.showsAgent {
+                Text(ActivityStyle.primary(for: presentation, state: state))
                     .font(.headline)
                     .lineLimit(1)
-                Text(ActivityStyle.detail(for: agent))
+                Text(ActivityStyle.detail(for: presentation))
                     .font(.subheadline)
-                    .foregroundStyle(PedalsTheme.secondaryContent)
+                    .foregroundStyle(ActivityStyle.color(for: presentation))
                     .lineLimit(2)
             } else {
                 Text(state.totalRunning == 1 ? "1 terminal active" : "\(state.totalRunning) terminals active")
@@ -129,117 +204,204 @@ private struct ActivityBody: View {
                     .lineLimit(1)
             }
 
-            HStack(spacing: 8) {
-                MetricChip(symbol: "terminal", text: "\(state.totalRunning) TTY")
-                if state.totalAgents > 0 {
-                    MetricChip(symbol: "sparkles", text: "\(state.totalAgents) agents")
+            ActivityMetrics(state: state, stale: stale)
+        }
+        .privacySensitive()
+    }
+}
+
+/// Lock Screen form of the Home agent list item: icon and state badge leading,
+/// session name over the latest output/action, metadata trailing.
+private struct AgentActivityRow: View {
+    let state: TTYActivityAttributes.ContentState
+    let presentation: ActivityPresentation
+    let stale: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AgentMark(presentation: presentation)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(ActivityStyle.primary(for: presentation, state: state))
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    ActivityStateLabel(presentation: presentation)
                 }
-                if state.offlineComputerCount > 0 {
-                    MetricChip(symbol: "wifi.slash", text: "\(state.offlineComputerCount) offline")
-                }
-                if stale {
-                    MetricChip(symbol: "clock.badge.exclamationmark", text: "stale")
-                }
+                Text(ActivityStyle.detail(for: presentation))
+                    .font(.subheadline)
+                    .foregroundStyle(ActivityStyle.color(for: presentation))
+                    .lineLimit(2)
+                ActivityMetrics(state: state, stale: stale)
             }
-            .lineLimit(1)
+            .privacySensitive()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.agentName)
+        .accessibilityValue(
+            "\(ActivityStyle.label(for: presentation)), "
+                + "\(ActivityStyle.primary(for: presentation, state: state)), "
+                + ActivityStyle.detail(for: presentation)
+        )
+    }
+}
+
+private struct TerminalActivityCard: View {
+    let state: TTYActivityAttributes.ContentState
+    let stale: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TerminalIdentity()
+                Spacer(minLength: 8)
+                Text("Live")
+                    .font(.caption2.weight(.semibold))
+            }
+            ActivityBody(
+                state: state, presentation: ActivityPresentation(state: state), stale: stale
+            )
         }
     }
 }
 
+private struct ActivityMetrics: View {
+    let state: TTYActivityAttributes.ContentState
+    let stale: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if state.totalAgents > 0 {
+                MetricChip(
+                    text: state.totalAgents == 1 ? "1 agent" : "\(state.totalAgents) agents"
+                )
+            }
+            MetricChip(text: "\(state.totalRunning) TTY")
+            if state.offlineComputerCount > 0 {
+                MetricChip(text: "\(state.offlineComputerCount) offline")
+            }
+            if stale {
+                MetricChip(text: "stale")
+            }
+        }
+        .lineLimit(1)
+    }
+}
+
+/// Home uses one-pixel outline chips rather than filled metric pills.
 private struct MetricChip: View {
-    let symbol: String
     let text: String
 
     var body: some View {
-        Label(text, systemImage: symbol)
-            .font(.caption2.weight(.medium))
+        Text(text)
+            .font(.caption2)
             .foregroundStyle(PedalsTheme.secondaryContent)
             .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(.white.opacity(0.07), in: Capsule())
+            .padding(.vertical, 3)
+            .overlay {
+                Capsule().stroke(PedalsTheme.separator, lineWidth: 1)
+            }
     }
 }
 
 private struct CompactMark: View {
-    let state: TTYActivityAttributes.ContentState
-    let agent: AgentActivity.Content?
+    let presentation: ActivityPresentation
 
     var body: some View {
         Group {
-            if let agent, let asset = ActivityStyle.asset(for: agent.agent) {
-                Image(asset).resizable().renderingMode(.template).scaledToFit()
+            if presentation.showsAgent {
+                AgentMark(presentation: presentation, size: 17)
             } else {
-                Image(systemName: ActivityStyle.symbol(for: agent?.state, state: state))
+                Image(systemName: "terminal.fill")
+                    .frame(width: 17, height: 17)
             }
         }
-        .frame(width: 17, height: 17)
-        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
-        .accessibilityLabel(ActivityStyle.label(for: agent?.state, state: state))
+        .foregroundStyle(PedalsTheme.content)
+        .accessibilityLabel(ActivityStyle.label(for: presentation))
     }
 }
 
 private struct CompactValue: View {
     let state: TTYActivityAttributes.ContentState
-    let agent: AgentActivity.Content?
+    let presentation: ActivityPresentation
 
     var body: some View {
-        HStack(spacing: 3) {
-            if let agent {
-                Image(systemName: ActivityStyle.symbol(for: agent.state, state: state))
-                    .font(.caption2.bold())
-            }
-            Text(state.compactCount, format: .number)
+        Group {
+            if presentation.showsAgent {
+                Text(ActivityStyle.compactLabel(for: presentation))
+                    .font(.caption2.weight(.bold))
+            } else {
+                Text(state.totalRunning, format: .number)
                 .fontWeight(.bold)
                 .monospacedDigit()
                 .contentTransition(.numericText())
+            }
         }
-        .foregroundStyle(ActivityStyle.color(for: agent?.state, state: state))
+        .foregroundStyle(ActivityStyle.color(for: presentation))
+        .accessibilityLabel(ActivityStyle.label(for: presentation))
     }
 }
 
 private enum ActivityStyle {
-    static func symbol(
-        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
-    ) -> String {
-        switch agentState {
-        case .waiting: "questionmark"
-        case .error: "exclamationmark"
-        case .done: "checkmark"
-        case .running: "ellipsis"
-        case nil: state.agentsWaiting > 0 ? "questionmark" : "terminal.fill"
-        }
-    }
-
-    static func label(
-        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
-    ) -> String {
-        switch agentState {
+    static func label(for presentation: ActivityPresentation) -> String {
+        switch presentation.agentState {
         case .waiting: "Needs you"
         case .error: "Error"
         case .done: "Finished"
         case .running: "Working"
-        case nil: state.agentsWaiting > 0 ? "Needs you" : "Live"
+        case nil: "Live"
         }
     }
 
-    static func color(
-        for agentState: AgentState?, state: TTYActivityAttributes.ContentState
-    ) -> Color {
-        switch agentState {
+    static func compactLabel(for presentation: ActivityPresentation) -> String {
+        switch presentation.agentState {
+        case .waiting: "Needs you"
+        case .error: "Error"
+        case .done: "Done"
+        case .running: "Working"
+        case nil: "Live"
+        }
+    }
+
+    static func color(for presentation: ActivityPresentation) -> Color {
+        switch presentation.agentState {
         case .waiting: PedalsTheme.warning
-        case .error: .red
-        case .done: .green
+        case .error: PedalsTheme.critical
+        case .done: PedalsTheme.success
         case .running: PedalsTheme.content
-        case nil: state.agentsWaiting > 0 ? PedalsTheme.warning : PedalsTheme.content
+        case nil: PedalsTheme.content
         }
     }
 
-    static func detail(for agent: AgentActivity.Content) -> String {
-        switch agent.state {
-        case .running: agent.action ?? agent.prompt ?? "Working…"
-        case .waiting: agent.message ?? agent.prompt ?? "Waiting for your input"
-        case .error: agent.message ?? "The agent stopped with an error"
-        case .done: agent.message ?? "Task completed"
+    static func primary(
+        for presentation: ActivityPresentation,
+        state: TTYActivityAttributes.ContentState
+    ) -> String {
+        guard let agent = presentation.agent else {
+            return state.totalAgents == 1
+                ? "1 agent active" : "\(state.totalAgents) agents active"
+        }
+        return presentation.agentContent?.title
+            ?? AgentActivity.displayName(forAgent: agent.agent)
+    }
+
+    static func detail(for presentation: ActivityPresentation) -> String {
+        guard presentation.agent != nil else {
+            return fallbackDetail(for: presentation.agentState)
+        }
+        return presentation.agentContent?.detail
+            ?? fallbackDetail(for: presentation.agentState)
+    }
+
+    private static func fallbackDetail(for state: AgentState?) -> String {
+        switch state {
+        case .running: "Working…"
+        case .waiting: "Waiting for your input"
+        case .error: "Agent hit an error"
+        case .done: "Task completed"
+        case nil: "Agent activity is updating…"
         }
     }
 
@@ -267,7 +429,8 @@ private extension TTYActivityAttributes.ContentState {
            let state = recentAgentState.flatMap(AgentState.init(rawValue:))
         {
             return .init(
-                id: "fixture", agent: "codex", state: state, project: "pedals",
+                id: "fixture", agent: "codex", state: state,
+                sessionName: "Polish agent monitoring", project: "pedals",
                 prompt: "Review the Live Activity experience",
                 action: "Build: PedalsWidgets",
                 message: state == .done ? "Live Activity is ready" : "Choose how to continue",
@@ -288,12 +451,4 @@ private extension TTYActivityAttributes.ContentState {
         )
     }
 
-    var totalAgents: Int { agentsRunning + agentsWaiting + agentsDone }
-
-    var compactCount: Int {
-        if agentsWaiting > 0 { return agentsWaiting }
-        if agentsDone > 0 { return agentsDone }
-        if agentsRunning > 0 { return agentsRunning }
-        return totalRunning
-    }
 }

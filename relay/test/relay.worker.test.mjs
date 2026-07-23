@@ -2847,13 +2847,20 @@ describe("agent counts and alerts", () => {
     }
   });
 
-  test("recent completion keeps an existing agent-only activity visible, then ends it", async () => {
+  test("aggregate refresh preserves a recent agent card, then ends it", async () => {
     const computer = await createComputer();
     const client = await createClient();
     expect((await bind(client, computer)).status).toBe(201);
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
     const coordinator = env.PUSH_COORDINATOR.getByName(client.clientId);
     try {
+      host.ws.send(
+        snapshotWithAgents("Island Mac", [], { running: 0, waiting: 0, done: 1 }),
+      );
+      const completed = await waitFor(async () => {
+        const snapshot = await state(client);
+        return snapshot.agentsDone === 1 ? snapshot : null;
+      });
       expect(
         (await api("/v2/clients/me/push-endpoints/liveactivity-update", {
           method: "PUT",
@@ -2865,13 +2872,37 @@ describe("agent counts and alerts", () => {
           },
         })).status,
       ).toBe(200);
+      const delivered = await coordinator.fetch("https://push.internal/activity", {
+        method: "POST",
+        body: JSON.stringify({
+          clientId: client.clientId,
+          computerId: computer.computerId,
+          activity: {
+            eventID: "44444444-4444-4444-8444-444444444444",
+            state: "done",
+            updatedAt: Date.now(),
+            alert: false,
+            sealed: btoa("completed-agent-ciphertext"),
+          },
+        }),
+      });
+      expect(delivered.status).toBe(202);
+      await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
 
+      // A later TTY-only projection still contains the done aggregate but no
+      // encrypted agent envelope. It must not replace the rich agent card.
       host.ws.send(
-        snapshotWithAgents("Island Mac", [], { running: 0, waiting: 0, done: 1 }),
+        snapshotWithAgents(
+          "Island Mac",
+          runningSessions(1),
+          { running: 0, waiting: 0, done: 1 },
+        ),
       );
-      const completed = await waitFor(async () => {
+      const terminalChanged = await waitFor(async () => {
         const snapshot = await state(client);
-        return snapshot.agentsDone === 1 ? snapshot : null;
+        return snapshot.totalRunning === 1 && snapshot.sequence > completed.sequence
+          ? snapshot
+          : null;
       });
       await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
       const active = await env.DB
@@ -2884,6 +2915,7 @@ describe("agent counts and alerts", () => {
         .first();
       expect(Number(active.lastSequence)).toBe(completed.sequence);
       expect(Number(active.lastTotal)).toBe(1);
+      expect(terminalChanged.sequence).toBeGreaterThan(completed.sequence);
 
       host.ws.send(
         snapshotWithAgents("Island Mac", [], { running: 0, waiting: 0, done: 0 }),

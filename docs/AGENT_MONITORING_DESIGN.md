@@ -97,13 +97,14 @@ Home has two sections:
 
 1. **Terminals** — the Pedals-hosted TTY list. A row has two states: with no
    agent running it shows the tty title and info; while an agent runs in it,
-   the row morphs — agent icon + state + a one-line current action become the
-   primary content and the tty title drops to secondary text. Tapping the
-   row always opens the terminal; the morph changes information density,
-   never the interaction model.
+   the row morphs to the shared agent presentation: agent icon + state,
+   session name as the title, and the latest assistant message/output (falling
+   back to the current action) as the description. Tapping the row always
+   opens the terminal; the morph changes information density, never the
+   interaction model.
 2. **Agents** — agents detected outside any Pedals-hosted tty, shown as
-   status rows (agent icon, state, project). These rows are glanceable, not
-   attachable.
+   status rows using the same session title and latest-output description.
+   These rows are glanceable, not attachable.
 
 **Ownership/dedup rule (hard rule):** an agent appears in exactly one place.
 The hook reports its tty/PID lineage; the daemon matches it against the PTYs
@@ -150,6 +151,11 @@ the existing pairing / new-session guidance.
   model to per-state aggregates (e.g. `2 running · 1 waiting · 3 ttys`).
   "Waiting for you" is the one state that can justify color under the
   black/white rule.
+- Home, Watch, Lock Screen, and the expanded Dynamic Island share the same
+  agent text model: title = session name; description = latest assistant
+  message/output, then current action, then a short state fallback. Compact
+  and minimal islands keep only the agent glyph and state because those
+  families do not have room for readable session text.
 - Foreground status starts the island locally and silently. A first remote
   appearance occurs only for waiting/error/done and carries the required
   ActivityKit alert; ordinary running/count updates never alert.

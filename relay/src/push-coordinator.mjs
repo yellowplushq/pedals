@@ -336,6 +336,9 @@ export class PushCoordinator extends DurableObject {
     const totalActive =
       state.totalRunning + (state.agentsRunning ?? 0) + (state.agentsWaiting ?? 0)
       + (state.agentsDone ?? 0);
+    const totalAgents =
+      (state.agentsRunning ?? 0) + (state.agentsWaiting ?? 0)
+      + (state.agentsDone ?? 0);
 
     for (const endpoint of endpoints) {
       const surface = endpoint.surface;
@@ -353,6 +356,13 @@ export class PushCoordinator extends DurableObject {
         // use this token. The foreground app starts the normal activity.
         continue;
       } else if (surface === "liveactivity-update") {
+        // ActivityKit ContentState updates are full replacements. Aggregate
+        // state intentionally has no rich E2EE agent envelope, so sending it
+        // while an agent exists would erase the most recent agent card and
+        // make the island fall back to terminal content. Direct /activity
+        // delivery owns Live Activity updates until the agent count reaches
+        // zero; aggregate delivery then resumes to show terminals or end it.
+        if (totalAgents > 0) continue;
         payload = {
           state,
           event: totalActive === 0 ? "end" : "update",

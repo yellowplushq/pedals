@@ -27,6 +27,7 @@ public struct AgentEvent: Sendable {
     /// `notify`, `compact`, `stop`, `session-end`.
     public var event: String
     public var agentSessionId: String
+    public var sessionName: String?
     public var cwd: String?
     public var prompt: String?
     public var message: String?
@@ -36,13 +37,15 @@ public struct AgentEvent: Sendable {
     public var lineage: [AgentLineageEntry]
 
     public init(
-        agent: String, event: String, agentSessionId: String, cwd: String? = nil,
+        agent: String, event: String, agentSessionId: String,
+        sessionName: String? = nil, cwd: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
         agentError: Bool? = nil, lineage: [AgentLineageEntry] = []
     ) {
         self.agent = agent
         self.event = event
         self.agentSessionId = agentSessionId
+        self.sessionName = sessionName
         self.cwd = cwd
         self.prompt = prompt
         self.message = message
@@ -86,6 +89,7 @@ public final class AgentMonitor: @unchecked Sendable {
     static let promptCap = 200
     static let actionCap = 120
     static let messageCap = 300
+    static let sessionNameCap = 120
     static let cwdCap = 1024
     static let idCap = 128
     static let lineageCap = 15
@@ -94,6 +98,11 @@ public final class AgentMonitor: @unchecked Sendable {
         let id: String
         let agent: String
         var state: AgentState = .running
+        /// Name reported by the agent itself, retained if a managed terminal
+        /// later closes and the still-running agent becomes standalone.
+        var reportedSessionName: String?
+        /// Live title of the daemon-owned terminal matched by tty/lineage.
+        var managedSessionName: String?
         var cwd = ""
         var prompt: String?
         var action: String?
@@ -118,7 +127,8 @@ public final class AgentMonitor: @unchecked Sendable {
 
         var info: AgentInfo {
             AgentInfo(
-                id: id, agent: agent, state: state, cwd: cwd,
+                id: id, agent: agent, state: state,
+                sessionName: managedSessionName ?? reportedSessionName, cwd: cwd,
                 action: action, message: message, prompt: prompt,
                 sessionId: sessionId,
                 term: sessionId == nil ? term : nil,
@@ -267,6 +277,10 @@ public final class AgentMonitor: @unchecked Sendable {
     ]
 
     private func apply(_ event: AgentEvent, to record: Record) {
+        if let sessionName = event.sessionName {
+            let cleaned = Self.sanitize(sessionName, cap: Self.sessionNameCap)
+            if !cleaned.isEmpty { record.reportedSessionName = cleaned }
+        }
         if let cwd = event.cwd {
             let cleaned = Self.sanitize(cwd, cap: Self.cwdCap)
             if !cleaned.isEmpty { record.cwd = cleaned }
@@ -351,16 +365,22 @@ public final class AgentMonitor: @unchecked Sendable {
     private func resolveOwnershipLocked(
         _ record: Record, targets: [SessionManager.AgentMatchTarget]
     ) -> Bool {
-        var matched: Int?
+        var matched: SessionManager.AgentMatchTarget?
         if let tty = record.tty {
-            matched = targets.first { $0.ttyPath == tty }?.sessionId
+            matched = targets.first { $0.ttyPath == tty }
         }
         if matched == nil {
             let pids = Set(record.lineagePids)
-            matched = targets.first { pids.contains($0.shellPid) }?.sessionId
+            matched = targets.first { pids.contains($0.shellPid) }
         }
-        guard matched != record.sessionId else { return false }
-        record.sessionId = matched
+        let sessionId = matched?.sessionId
+        let sessionName = matched.map {
+            Self.sanitize($0.sessionName, cap: Self.sessionNameCap)
+        }.flatMap { $0.isEmpty ? nil : $0 }
+        guard sessionId != record.sessionId || sessionName != record.managedSessionName
+        else { return false }
+        record.sessionId = sessionId
+        record.managedSessionName = sessionName
         return true
     }
 

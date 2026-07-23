@@ -104,9 +104,18 @@ struct WatchStatusView: View {
                                 } else {
                                     Image(systemName: terminal.alive ? "terminal.fill" : "xmark.circle")
                                 }
-                                Text(terminal.title)
-                                    .lineLimit(2)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(terminal.title)
+                                        .lineLimit(1)
+                                    if let state = terminal.agentState,
+                                       let detail = terminal.agentDetail {
+                                        Text(detail)
+                                            .font(.caption2)
+                                            .foregroundStyle(agentDetailTint(state))
+                                            .lineLimit(2)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .font(.caption)
                         }
@@ -160,14 +169,13 @@ struct WatchStatusView: View {
                         slug: row.info.agent, state: row.info.state, size: 16
                     )
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(agentTitle(row.info))
+                        let presentation = AgentActivity.Presentation(info: row.info)
+                        Text(presentation.title)
                             .lineLimit(1)
-                        if let detail = agentDetail(row.info) {
-                            Text(detail)
-                                .font(.caption2)
-                                .foregroundStyle(agentDetailTint(row.info.state))
-                                .lineLimit(2)
-                        }
+                        Text(presentation.detail)
+                            .font(.caption2)
+                            .foregroundStyle(agentDetailTint(row.info.state))
+                            .lineLimit(2)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -198,48 +206,12 @@ struct WatchStatusView: View {
         }
     }
 
-    private func agentTint(_ state: AgentState) -> Color {
-        switch state {
-        case .waiting: PedalsTheme.warning
-        case .error: PedalsTheme.critical
-        case .running: PedalsTheme.content
-        case .done: PedalsTheme.success
-        }
-    }
-
     private func agentDetailTint(_ state: AgentState) -> Color {
         switch state {
         case .waiting: PedalsTheme.warning
         case .error: PedalsTheme.critical
         case .running: PedalsTheme.content
         case .done: PedalsTheme.success
-        }
-    }
-
-    /// Same title rule as the iPhone rows: the user's prompt first, else
-    /// the project directory name.
-    private func agentTitle(_ info: AgentInfo) -> String {
-        if let prompt = info.prompt?
-            .split(whereSeparator: \.isNewline)
-            .map({ $0.trimmingCharacters(in: .whitespaces) })
-            .first(where: { !$0.isEmpty }) {
-            return prompt
-        }
-        let project = (info.cwd as NSString).lastPathComponent
-        return project.isEmpty ? AgentActivity.displayName(forAgent: info.agent) : project
-    }
-
-    private func agentDetail(_ info: AgentInfo) -> String? {
-        switch info.state {
-        case .waiting:
-            return info.message ?? "Waiting for you"
-        case .error:
-            return info.message ?? "Stopped on an error"
-        case .done:
-            return info.message ?? "Done"
-        case .running:
-            if let action = info.action, !action.isEmpty { return action }
-            return nil
         }
     }
 

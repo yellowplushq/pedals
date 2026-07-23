@@ -46,11 +46,13 @@ final class AgentMonitorTests: XCTestCase {
 
     private func event(
         _ event: String, id: String = "a-1", cwd: String? = "/tmp/p",
+        sessionName: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
         agentError: Bool? = nil, lineage: [AgentLineageEntry]? = nil
     ) -> AgentEvent {
         AgentEvent(
-            agent: "claude", event: event, agentSessionId: id, cwd: cwd,
+            agent: "claude", event: event, agentSessionId: id,
+            sessionName: sessionName, cwd: cwd,
             prompt: prompt, message: message, action: action,
             agentError: agentError,
             lineage: lineage ?? [AgentLineageEntry(pid: livePid, name: "claude")]
@@ -207,14 +209,49 @@ final class AgentMonitorTests: XCTestCase {
 
     func testMatchByTTY() throws {
         targets.current = [
-            .init(sessionId: 7, ttyPath: "/dev/ttys009", shellPid: 4242)
+            .init(
+                sessionId: 7, sessionName: "Claude — Pedals",
+                ttyPath: "/dev/ttys009", shellPid: 4242
+            )
         ]
         monitor.ingest(event("prompt", lineage: [
             AgentLineageEntry(pid: livePid, name: "claude", tty: "/dev/ttys009")
         ]))
         let info = try only()
         XCTAssertEqual(info.sessionId, 7)
+        XCTAssertEqual(info.sessionName, "Claude — Pedals")
         XCTAssertNil(info.term, "managed agents carry no terminal-app name")
+    }
+
+    func testManagedTitleTracksSessionAndReportedNameSurvivesUnmatch() throws {
+        targets.current = [
+            .init(
+                sessionId: 7, sessionName: "Codex — release",
+                ttyPath: "/dev/ttys009", shellPid: 4242
+            )
+        ]
+        monitor.ingest(event(
+            "prompt", sessionName: "Agent supplied title",
+            lineage: [
+                AgentLineageEntry(pid: livePid, name: "claude", tty: "/dev/ttys009")
+            ]
+        ))
+        XCTAssertEqual(try only().sessionName, "Codex — release")
+
+        targets.current = [
+            .init(
+                sessionId: 7, sessionName: "Codex — TestFlight",
+                ttyPath: "/dev/ttys009", shellPid: 4242
+            )
+        ]
+        monitor.sweepNow()
+        XCTAssertEqual(try only().sessionName, "Codex — TestFlight")
+
+        targets.current = []
+        monitor.sweepNow()
+        let info = try only()
+        XCTAssertNil(info.sessionId)
+        XCTAssertEqual(info.sessionName, "Agent supplied title")
     }
 
     func testMatchByShellPidInLineage() throws {

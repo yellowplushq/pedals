@@ -9,6 +9,8 @@ public struct HookReport: Equatable, Sendable {
     public var event: String
     /// The agent's own session id (Claude Code `session_id`).
     public var agentSessionId: String
+    /// Optional user-facing name supplied by the agent hook.
+    public var sessionName: String?
     public var cwd: String?
     /// The user's prompt text (`prompt` events only), capped.
     public var prompt: String?
@@ -20,12 +22,14 @@ public struct HookReport: Equatable, Sendable {
     public var agentError: Bool?
 
     public init(
-        event: String, agentSessionId: String, cwd: String? = nil,
+        event: String, agentSessionId: String, sessionName: String? = nil,
+        cwd: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
         agentError: Bool? = nil
     ) {
         self.event = event
         self.agentSessionId = agentSessionId
+        self.sessionName = sessionName
         self.cwd = cwd
         self.prompt = prompt
         self.message = message
@@ -40,6 +44,19 @@ enum HookFieldCaps {
     static let prompt = 200
     static let action = 120
     static let message = 300
+    static let sessionName = 120
+}
+
+/// Session-name fields used by agent hook payloads. A generic notification
+/// `title` is intentionally excluded: it describes the event, not the
+/// persistent session identity.
+func hookSessionName(from object: [String: Any]) -> String? {
+    for key in ["session_name", "session_title", "sessionName", "sessionTitle"] {
+        guard let value = object[key] as? String else { continue }
+        let cleaned = sanitizeHookText(value, cap: HookFieldCaps.sessionName)
+        if !cleaned.isEmpty { return cleaned }
+    }
+    return nil
 }
 
 /// "ToolName: detail" one-liner shared by all Claude-shaped mappers: detail is

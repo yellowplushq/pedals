@@ -56,6 +56,7 @@ final class DaemonAgentControlTests: XCTestCase {
             "agent": "claude",
             "event": "prompt",
             "agentSessionId": "abc-123",
+            "sessionName": "Fix test suite",
             "cwd": "/tmp/project",
             "prompt": "fix the tests",
             "lineage": [
@@ -72,6 +73,7 @@ final class DaemonAgentControlTests: XCTestCase {
         XCTAssertEqual(list[0]["id"] as? String, "abc-123")
         XCTAssertEqual(list[0]["agent"] as? String, "claude")
         XCTAssertEqual(list[0]["state"] as? String, "running")
+        XCTAssertEqual(list[0]["sessionName"] as? String, "Fix test suite")
         XCTAssertEqual(list[0]["cwd"] as? String, "/tmp/project")
         XCTAssertEqual(list[0]["prompt"] as? String, "fix the tests")
         XCTAssertNil(list[0]["sessionId"], "no daemon session owns this tty")

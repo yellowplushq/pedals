@@ -389,14 +389,15 @@ After `ready` promotes the tag, the control channel accepts:
   the registry. The agent list is bidirectional: a dismissal removes the
   record for every client (clients hide the row optimistically first, no
   persistence), and the agent's next hook event recreates it.
-- `agents {agents:[{id,agent,state,cwd,action?,message?,prompt?,sessionId?,term?,updatedAt}]}`
+- `agents {agents:[{id,agent,state,sessionName?,cwd,action?,message?,prompt?,sessionId?,term?,updatedAt}]}`
   — host to client: full snapshot of coding-agent sessions observed via
   daemon-installed hooks (docs/AGENT_MONITORING_DESIGN.md). `state` is
   `running|waiting|error|done`; `sessionId` is set when the agent runs inside
-  a daemon-owned PTY (the dedup rule), `term` names the terminal app for
-  unmanaged agents. Broadcast debounced on change and replayed after
-  `sessions` on every client hello. Rich agent content exists only inside
-  these encrypted frames, never in relay metadata.
+  a daemon-owned PTY (the dedup rule), `sessionName` is the user-facing session
+  title, and `term` names the terminal app for unmanaged agents. Broadcast
+  debounced on change and replayed after `sessions` on every client hello.
+  Rich agent content exists only inside these encrypted frames, never in relay
+  metadata.
 - `create {cwd,cols,rows,req?}` / `created {id,req?}`
 - `close {id}`, `title {id,title}`, `exit {id,code}`
 - `err {msg,req?}`
@@ -513,10 +514,13 @@ use `{"ok":true,...}` or `{"ok":false,"err":"..."}`.
 `agent-event` is sent by the `pedals-hook` reporter (installed into coding
 agents' hook settings by `pedals hooks install` or the menu bar app):
 `{"cmd":"agent-event","agent":"claude","event":"session-start|prompt|ask|tool|
-busy|notify|compact|stop|session-end","agentSessionId":"...","cwd"?,"prompt"?,
-"message"?,"action"?,"agentError"?,"lineage":[{"pid","name","tty"?}]}`. The
-daemon's AgentMonitor applies the state machine, matches `lineage`/`tty`
-against daemon-owned PTYs, and broadcasts the encrypted `agents` ctl snapshot.
+busy|notify|compact|stop|session-end","agentSessionId":"...","sessionName"?,
+"cwd"?,"prompt"?,"message"?,"action"?,"agentError"?,
+"lineage":[{"pid","name","tty"?}]}`. The daemon's AgentMonitor applies the
+state machine, matches `lineage`/`tty` against daemon-owned PTYs, and broadcasts
+the encrypted `agents` ctl snapshot. For managed sessions, the daemon's live
+terminal title is authoritative for `sessionName`; otherwise an agent adapter
+may report an explicit session-name field.
 `pedals hooks install|uninstall|status <agent>` manages ten agents — claude,
 codex, copilot, grok, kimi, kiro, opencode, omp, pi, hermes — writing
 sentinel-marked entries (`# pedals-managed-hook`) into each agent's own hook

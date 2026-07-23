@@ -238,7 +238,8 @@ public final class Daemon: @unchecked Sendable {
             }
             agents.ingest(AgentEvent(
                 agent: agent, event: event, agentSessionId: agentSessionId,
-                cwd: request.cwd, prompt: request.prompt, message: request.message,
+                sessionName: request.sessionName, cwd: request.cwd,
+                prompt: request.prompt, message: request.message,
                 action: request.action, agentError: request.agentError,
                 lineage: request.lineage ?? []
             ))
@@ -350,6 +351,7 @@ public final class Daemon: @unchecked Sendable {
         if let action = info.action { fields["action"] = .string(action) }
         if let message = info.message { fields["message"] = .string(message) }
         if let prompt = info.prompt { fields["prompt"] = .string(prompt) }
+        if let sessionName = info.sessionName { fields["sessionName"] = .string(sessionName) }
         if let sessionId = info.sessionId { fields["sessionId"] = .int(sessionId) }
         if let term = info.term { fields["term"] = .string(term) }
         return .object(fields)

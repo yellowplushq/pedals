@@ -18,7 +18,9 @@ public enum ClaudeHookMapper {
         else { return nil }
 
         var report = HookReport(
-            event: "", agentSessionId: sessionId, cwd: object["cwd"] as? String
+            event: "", agentSessionId: sessionId,
+            sessionName: hookSessionName(from: object),
+            cwd: object["cwd"] as? String
         )
         switch eventName {
         case "SessionStart":

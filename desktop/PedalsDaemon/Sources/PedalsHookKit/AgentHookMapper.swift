@@ -7,6 +7,7 @@ import Foundation
 /// `--event` alone decides the mapped event.
 struct ClaudeFlatStdin {
     var sessionId: String?
+    var sessionName: String?
     var cwd: String?
     var prompt: String?
     var toolName: String?
@@ -25,6 +26,7 @@ struct ClaudeFlatStdin {
         if let id = object["session_id"] as? String, !id.isEmpty {
             sessionId = id
         }
+        sessionName = hookSessionName(from: object)
         cwd = object["cwd"] as? String
         if let prompt = object["prompt"] as? String {
             let cleaned = sanitizeHookText(prompt, cap: HookFieldCaps.prompt)
@@ -51,6 +53,7 @@ struct ClaudeFlatStdin {
 /// else on stdin.
 struct NormalizedStdin {
     var sessionId: String?
+    var sessionName: String?
     var cwd: String?
     var message: String?
     var action: String?
@@ -61,6 +64,7 @@ struct NormalizedStdin {
         if let id = object["sessionId"] as? String, !id.isEmpty {
             sessionId = id
         }
+        sessionName = hookSessionName(from: object)
         cwd = object["cwd"] as? String
         if let message = object["message"] as? String {
             let cleaned = sanitizeHookText(message, cap: HookFieldCaps.message)
@@ -138,7 +142,7 @@ public enum AgentHookMapper {
     ) -> HookReport? {
         var report = HookReport(
             event: event, agentSessionId: stdin.sessionId ?? fallbackSessionId,
-            cwd: stdin.cwd
+            sessionName: stdin.sessionName, cwd: stdin.cwd
         )
         switch event {
         case "prompt":
@@ -174,7 +178,7 @@ public enum AgentHookMapper {
         let stdin = ClaudeFlatStdin(object: object)
         return HookReport(
             event: "notify", agentSessionId: stdin.sessionId ?? fallbackSessionId,
-            cwd: stdin.cwd, message: stdin.message
+            sessionName: stdin.sessionName, cwd: stdin.cwd, message: stdin.message
         )
     }
 
@@ -184,7 +188,7 @@ public enum AgentHookMapper {
     ) -> HookReport? {
         var report = HookReport(
             event: event, agentSessionId: stdin.sessionId ?? fallbackSessionId,
-            cwd: stdin.cwd
+            sessionName: stdin.sessionName, cwd: stdin.cwd
         )
         switch event {
         case "tool":

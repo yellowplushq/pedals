@@ -18,6 +18,8 @@ struct WatchTerminalDescriptor: Identifiable, Hashable, Sendable {
     /// does (the row morph of the ownership/dedup rule, scaled to the Watch).
     var agentState: AgentState?
     var agentSlug: String?
+    /// Latest assistant message or current action for the managed agent.
+    var agentDetail: String?
 }
 
 struct WatchTerminalComputer: Identifiable, Equatable, Sendable {
@@ -195,11 +197,13 @@ final class WatchTerminalStore {
         else { return nil }
         let now = Date().timeIntervalSince1970
         func agent(
-            _ slug: String, _ state: AgentState, cwd: String, age: Double,
+            _ slug: String, _ state: AgentState, sessionName: String,
+            cwd: String, age: Double,
             prompt: String? = nil, message: String? = nil, action: String? = nil
         ) -> AgentInfo {
             AgentInfo(
-                id: "fx-\(slug)", agent: slug, state: state, cwd: cwd,
+                id: "fx-\(slug)", agent: slug, state: state,
+                sessionName: sessionName, cwd: cwd,
                 action: action, message: message, prompt: prompt,
                 updatedAt: now - age
             )
@@ -210,28 +214,32 @@ final class WatchTerminalStore {
                 terminals: [
                     WatchTerminalDescriptor(
                         id: WatchTerminalID(computerID: "fixture", sessionID: 1),
-                        computerName: "Studio", title: "zsh — pedals",
+                        computerName: "Studio", title: "Polish agent monitoring",
                         cols: 80, rows: 24, alive: true,
-                        agentState: .waiting, agentSlug: "claude"
+                        agentState: .waiting, agentSlug: "claude",
+                        agentDetail: "Choose how to continue"
                     ),
                     WatchTerminalDescriptor(
                         id: WatchTerminalID(computerID: "fixture", sessionID: 2),
                         computerName: "Studio", title: "zsh — ~",
                         cols: 80, rows: 24, alive: true,
-                        agentState: nil, agentSlug: nil
+                        agentState: nil, agentSlug: nil, agentDetail: nil
                     ),
                 ],
                 agents: [
                     agent(
-                        "codex", .running, cwd: "/Users/eyhn/Projects/website",
+                        "codex", .running, sessionName: "Website release",
+                        cwd: "/Users/eyhn/Projects/website",
                         age: 300, action: "Bash: npm run build"
                     ),
                     agent(
-                        "kiro", .done, cwd: "/Users/eyhn/Projects/blog",
+                        "kiro", .done, sessionName: "Landing page",
+                        cwd: "/Users/eyhn/Projects/blog",
                         age: 3600, message: "Deployed the new landing page."
                     ),
                     agent(
-                        "grok", .error, cwd: "/Users/eyhn/Projects/experiments",
+                        "grok", .error, sessionName: "Model experiments",
+                        cwd: "/Users/eyhn/Projects/experiments",
                         age: 10800, message: "API rate limit exceeded"
                     ),
                 ]
@@ -338,7 +346,8 @@ private final class WatchTerminalComputerConnection {
             online: hostOnline,
             ready: directoryRevision != nil && (!hostOnline || receivedSessions),
             terminals: visibleSessions.map { session in
-                WatchTerminalDescriptor(
+                let agent = managed[session.id]?.first?.info
+                return WatchTerminalDescriptor(
                     id: WatchTerminalID(
                         computerID: binding.computerID,
                         sessionID: session.id
@@ -348,8 +357,13 @@ private final class WatchTerminalComputerConnection {
                     cols: session.cols,
                     rows: session.rows,
                     alive: session.alive,
-                    agentState: managed[session.id]?.first?.info.state,
-                    agentSlug: managed[session.id]?.first?.info.agent
+                    agentState: agent?.state,
+                    agentSlug: agent?.agent,
+                    agentDetail: agent.map {
+                        AgentActivity.Presentation(
+                            info: $0, fallbackSessionName: session.title
+                        ).detail
+                    }
                 )
             },
             agents: standalone

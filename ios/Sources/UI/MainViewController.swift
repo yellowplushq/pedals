@@ -82,6 +82,17 @@ final class MainViewController: UIViewController {
 
     private let unpairedView = UnpairedStateView()
 
+    /// Lets the existing Home agent fixture be captured on a clean simulator
+    /// without manufacturing a pairing identity. Release builds always show
+    /// the real unpaired state.
+    private var hidesUnpairedStateForAgentFixture: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["PEDALS_HOME_AGENTS_FIXTURE"] == "1"
+        #else
+        false
+        #endif
+    }
+
     /// Bound computer count, taken from the `$computers` EMISSION — never read
     /// `manager.computers` inside a sink (@Published emits during willSet, so
     /// the property still holds the old value there).
@@ -264,7 +275,7 @@ final class MainViewController: UIViewController {
             .sink { [weak self] count in
                 guard let self else { return }
                 computerCount = count
-                let unpaired = count == 0
+                let unpaired = count == 0 && !hidesUnpairedStateForAgentFixture
                 unpairedView.isHidden = !unpaired
                 tabStrip.isHidden = unpaired
                 tabStrip.setCreateMenu(count > 1 ? makeCreateMenu() : nil)
