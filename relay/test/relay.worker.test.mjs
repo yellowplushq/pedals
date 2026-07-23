@@ -2790,6 +2790,12 @@ describe("agent counts and alerts", () => {
           body: { token: "ba".repeat(32), environment: "sandbox" },
         })).status,
       ).toBe(200);
+
+      host.ws.send(
+        snapshotWithAgents("Island Mac", [], { running: 0, waiting: 1, done: 0 }),
+      );
+      await waitFor(async () => ((await state(client)).agentsWaiting === 1 ? true : null));
+
       expect(
         (await api("/v2/clients/me/push-endpoints/liveactivity-update", {
           method: "PUT",
@@ -2801,11 +2807,6 @@ describe("agent counts and alerts", () => {
           },
         })).status,
       ).toBe(200);
-
-      host.ws.send(
-        snapshotWithAgents("Island Mac", [], { running: 0, waiting: 1, done: 0 }),
-      );
-      await waitFor(async () => ((await state(client)).agentsWaiting === 1 ? true : null));
       const delivered = await coordinator.fetch("https://push.internal/activity", {
         method: "POST",
         body: JSON.stringify({
