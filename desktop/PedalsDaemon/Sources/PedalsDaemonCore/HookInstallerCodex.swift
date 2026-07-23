@@ -2,8 +2,7 @@ import Foundation
 
 /// Codex CLI: sentinel-marked entries merged into `~/.codex/hooks.json`
 /// (Claude-style grouped shape) plus the `hooks = true` feature flag in
-/// `~/.codex/config.toml`. Codex is turn-level: SessionStart fires on the
-/// first turn and there is no SessionEnd — the daemon pid sweep cleans up.
+/// `~/.codex/config.toml`.
 ///
 /// The TOML flag is edited line-based (as supacode does): only the
 /// `hooks = true` / legacy `codex_hooks = true` lines inside `[features]` are
@@ -24,7 +23,10 @@ extension HookInstaller {
             [
                 ("SessionStart", "session-start", 5),
                 ("UserPromptSubmit", "prompt", 10),
+                ("PreToolUse", "tool", 10),
+                ("PermissionRequest", "ask", 10),
                 ("Stop", "stop", 10),
+                ("SessionEnd", "session-end", 5),
             ].map { event, reporterEvent, timeout in
                 GroupedHookEntry(
                     event: event, matcher: nil,

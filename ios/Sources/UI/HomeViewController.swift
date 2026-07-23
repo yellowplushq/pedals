@@ -269,6 +269,7 @@ final class HomeViewController: UIViewController {
         ) { [weak self] header, _, indexPath in
             let section = Section(rawValue: indexPath.section)
             header.setTitle(section?.title ?? "")
+            header.setHorizontalInset(section == .agents ? 16 : 0)
             header.onClear = section == .agents
                 ? { [weak self] in self?.dismissSettledAgents() }
                 : nil
@@ -917,6 +918,8 @@ private final class HomeHintCell: UICollectionViewCell {
 private final class HomeSectionHeaderView: UICollectionReusableView {
     private let label = UILabel()
     private let clearButton = UIButton(type: .system)
+    private var labelLeadingConstraint: NSLayoutConstraint!
+    private var clearTrailingConstraint: NSLayoutConstraint!
 
     /// Non-nil shows the trailing Clear control (the Agents section).
     var onClear: (() -> Void)? {
@@ -941,12 +944,18 @@ private final class HomeSectionHeaderView: UICollectionReusableView {
 
         addSubview(label)
         addSubview(clearButton)
+        labelLeadingConstraint = label.leadingAnchor.constraint(
+            equalTo: leadingAnchor, constant: 4
+        )
+        clearTrailingConstraint = clearButton.trailingAnchor.constraint(
+            equalTo: trailingAnchor, constant: -4
+        )
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            labelLeadingConstraint,
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
             label.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-            clearButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            clearTrailingConstraint,
             clearButton.centerYAnchor.constraint(equalTo: label.centerYAnchor),
         ])
     }
@@ -956,6 +965,11 @@ private final class HomeSectionHeaderView: UICollectionReusableView {
 
     func setTitle(_ title: String) {
         label.text = title
+    }
+
+    func setHorizontalInset(_ inset: CGFloat) {
+        labelLeadingConstraint.constant = inset + 4
+        clearTrailingConstraint.constant = -(inset + 4)
     }
 }
 

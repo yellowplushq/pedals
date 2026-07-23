@@ -79,6 +79,9 @@ public final class TTYLiveActivityController {
                 recentAgentState: agentState == "terminal" ? nil : agentState,
                 recentAgentUpdatedAt: agentState == "terminal" ? nil : .now,
                 recentAgentSealed: agentState == "terminal" ? nil : "fixture",
+                recentAgentDisplay: agentState == "terminal"
+                    ? nil
+                    : fixtureDisplay(state: agentState),
                 onlineComputerCount: 1,
                 offlineComputerCount: 0,
                 updatedAt: .now,
@@ -108,14 +111,20 @@ public final class TTYLiveActivityController {
         let totalActive =
             snapshot.totalRunning + snapshot.agentsRunning
             + snapshot.agentsWaiting + snapshot.agentsDone
-        let activities = Activity<TTYActivityAttributes>.activities
         var state = TTYActivityAttributes.ContentState(snapshot: snapshot)
-        if let recent = activities.first?.content.state {
+        let recent = Self.latestAgentState(
+            from: Activity<TTYActivityAttributes>.activities.map {
+                $0.content.state
+            }
+        )
+        if state.totalAgents > 0, let recent {
             state.recentAgentComputerID = recent.recentAgentComputerID
             state.recentAgentState = recent.recentAgentState
             state.recentAgentUpdatedAt = recent.recentAgentUpdatedAt
             state.recentAgentSealed = recent.recentAgentSealed
+            state.recentAgentDisplay = recent.recentAgentDisplay
         }
+        let activities = Activity<TTYActivityAttributes>.activities
         let content = ActivityContent(
             state: state,
             staleDate: snapshot.updatedAt.addingTimeInterval(5 * 60),
@@ -150,43 +159,55 @@ public final class TTYLiveActivityController {
     public func synchronizeRecentAgent(
         _ info: AgentInfo?, binding: ComputerBinding?
     ) async {
-        guard let activity = Activity<TTYActivityAttributes>.activities.first else { return }
-        var state = activity.content.state
-
+        let activities = Activity<TTYActivityAttributes>.activities
+        guard !activities.isEmpty else { return }
+        var agentContent: AgentActivity.Content?
+        var sealedText: String?
         if let info, let binding {
+            let content = AgentActivity.Content(info: info)
+            agentContent = content
             do {
-                let content = AgentActivity.Content(info: info)
                 let sealed = try AgentActivity.seal(
                     content,
                     key: AgentActivity.activityKey(secret: binding.secret),
                     computerID: binding.computerID
                 )
-                guard sealed.count <= RelayMetadata.AgentActivityEnvelope.maxSealedBytes else {
-                    return
+                if sealed.count <= RelayMetadata.AgentActivityEnvelope.maxSealedBytes {
+                    sealedText = sealed.base64EncodedString()
                 }
-                state.recentAgentComputerID = binding.computerID
-                state.recentAgentState = info.state.rawValue
-                state.recentAgentUpdatedAt = Date(timeIntervalSince1970: info.updatedAt)
-                state.recentAgentSealed = sealed.base64EncodedString()
             } catch {
-                return
+                // Home already has the decrypted content. Keep the local
+                // ActivityKit presentation useful and let a later key/push
+                // synchronization repair the encrypted envelope.
             }
-        } else if state.agentsRunning + state.agentsWaiting + state.agentsDone == 0 {
-            state.recentAgentComputerID = nil
-            state.recentAgentState = nil
-            state.recentAgentUpdatedAt = nil
-            state.recentAgentSealed = nil
         }
 
         let attention = switch info?.state {
         case .waiting, .error, .done: true
         case .running, nil: false
         }
-        await activity.update(ActivityContent(
-            state: state,
-            staleDate: state.updatedAt.addingTimeInterval(5 * 60),
-            relevanceScore: attention ? 100 : 60
-        ))
+        for activity in activities {
+            var state = activity.content.state
+            if let info, let binding, let agentContent {
+                state.recentAgentComputerID = binding.computerID
+                state.recentAgentState = info.state.rawValue
+                state.recentAgentUpdatedAt = Date(timeIntervalSince1970: info.updatedAt)
+                state.recentAgentSealed = sealedText
+                state.recentAgentDisplay = .init(content: agentContent)
+            } else if state.totalAgents == 0 {
+                state.recentAgentComputerID = nil
+                state.recentAgentState = nil
+                state.recentAgentUpdatedAt = nil
+                state.recentAgentSealed = nil
+                state.recentAgentDisplay = nil
+            }
+
+            await activity.update(ActivityContent(
+                state: state,
+                staleDate: state.updatedAt.addingTimeInterval(5 * 60),
+                relevanceScore: attention ? 100 : 60
+            ))
+        }
     }
 
     private func observeUpdateToken(for activity: Activity<TTYActivityAttributes>) {
@@ -239,4 +260,44 @@ public final class TTYLiveActivityController {
     private static func isTerminal(_ state: ActivityState) -> Bool {
         state == .ended || state == .dismissed
     }
+
+    private nonisolated static func latestAgentState(
+        from states: [TTYActivityAttributes.ContentState]
+    ) -> TTYActivityAttributes.ContentState? {
+        var latest: TTYActivityAttributes.ContentState?
+        var latestDate = Date.distantPast
+        for candidate in states {
+            guard candidate.recentAgentDisplay != nil
+                    || candidate.recentAgentSealed != nil
+            else { continue }
+            let candidateDate = candidate.recentAgentDisplay?.updatedAt
+                ?? candidate.recentAgentUpdatedAt ?? .distantPast
+            if latest == nil || candidateDate > latestDate {
+                latest = candidate
+                latestDate = candidateDate
+            }
+        }
+        return latest
+    }
+
+    #if DEBUG
+    private func fixtureDisplay(
+        state rawState: String
+    ) -> TTYActivityAttributes.ContentState.RecentAgentDisplay? {
+        guard let state = AgentState(rawValue: rawState) else { return nil }
+        return .init(content: .init(
+            id: "fixture",
+            agent: "codex",
+            state: state,
+            sessionName: "Polish agent monitoring",
+            project: "pedals",
+            prompt: "Review the Live Activity experience",
+            action: "Build: PedalsWidgets",
+            message: state == .done
+                ? "Live Activity is ready" : "Choose how to continue",
+            sessionId: 1,
+            updatedAt: Date.now.timeIntervalSince1970
+        ))
+    }
+    #endif
 }

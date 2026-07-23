@@ -28,10 +28,14 @@ final class ClaudeHookMapperTests: XCTestCase {
     func testSessionAndCwdCarried() {
         var object = base("SessionStart")
         object["session_name"] = "Pedals release"
+        object["transcript_path"] = "/Users/test/.claude/projects/s-1.jsonl"
         let report = map(object)
         XCTAssertEqual(report?.agentSessionId, "s-1")
         XCTAssertEqual(report?.sessionName, "Pedals release")
         XCTAssertEqual(report?.cwd, "/tmp/project")
+        XCTAssertEqual(
+            report?.transcriptPath, "/Users/test/.claude/projects/s-1.jsonl"
+        )
     }
 
     func testNotificationTitleIsNotMistakenForSessionName() {
@@ -47,6 +51,13 @@ final class ClaudeHookMapperTests: XCTestCase {
 
         object["prompt"] = String(repeating: "x", count: 500)
         XCTAssertEqual(map(object)?.prompt?.count, 200)
+    }
+
+    func testTranscriptPathIsCappedAndCarriedOnEveryEvent() {
+        var object = base("PreToolUse")
+        object["tool_name"] = "Bash"
+        object["transcript_path"] = "/" + String(repeating: "p", count: 5000) + ".jsonl"
+        XCTAssertEqual(map(object)?.transcriptPath?.count, 4096)
     }
 
     func testAskToolsMapToAsk() {
@@ -73,11 +84,11 @@ final class ClaudeHookMapperTests: XCTestCase {
         XCTAssertEqual(map(object)?.action, "Edit: Daemon.swift")
     }
 
-    func testToolActionWithoutDetail() {
+    func testToolActionFromSearchPattern() {
         var object = base("PreToolUse")
         object["tool_name"] = "Glob"
         object["tool_input"] = ["pattern": "**/*.swift"]
-        XCTAssertEqual(map(object)?.action, "Glob")
+        XCTAssertEqual(map(object)?.action, "Glob: **/*.swift")
     }
 
     func testToolActionCapped() {

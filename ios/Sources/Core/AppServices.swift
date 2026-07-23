@@ -40,6 +40,17 @@ final class AppServices {
                 self?.scheduleStatusRefresh()
             }
             .store(in: &statusSubscriptions)
+        terminals.$agentRows
+            .dropFirst()
+            .sink { [weak self] rows in
+                self?.scheduleStatusRefresh()
+                // Use the value emitted by TerminalManager. Reading
+                // ComputerConnection.agents here sees the pre-willSet value
+                // and is why Home could be specific while the island stayed
+                // generic.
+                self?.synchronizeLatestAgentActivity(rows: rows)
+            }
+            .store(in: &statusSubscriptions)
     }
 
     func startSystemSurfaces() {
@@ -195,23 +206,18 @@ final class AppServices {
                 .dropFirst()
                 .sink { [weak self] _, _ in self?.scheduleStatusRefresh() }
                 .store(in: &computerStatusSubscriptions)
-            computer.$agents
-                .dropFirst()
-                .sink { [weak self] _ in
-                    self?.scheduleStatusRefresh()
-                    self?.synchronizeLatestAgentActivity()
-                }
-                .store(in: &computerStatusSubscriptions)
         }
     }
 
-    private func synchronizeLatestAgentActivity() {
-        let recent = terminals.computers
-            .flatMap { computer in computer.agents.map { ($0, computer.binding) } }
-            .max { $0.0.updatedAt < $1.0.updatedAt }
+    private func synchronizeLatestAgentActivity(rows: [AgentRow]? = nil) {
+        let recent = (rows ?? terminals.agentRows)
+            .max { $0.info.updatedAt < $1.info.updatedAt }
+        let binding = recent.flatMap {
+            terminals.computer(id: $0.computerID)?.binding
+        }
         Task {
             await TTYLiveActivityController.shared.synchronizeRecentAgent(
-                recent?.0, binding: recent?.1
+                recent?.info, binding: binding
             )
         }
     }

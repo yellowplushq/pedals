@@ -20,19 +20,8 @@ public enum TranscriptTail {
     public static let tailLimit = 256 * 1024
 
     public static func scan(path: String, sessionId: String) -> TranscriptSummary {
-        guard let handle = FileHandle(forReadingAtPath: path) else {
-            return TranscriptSummary()
-        }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return TranscriptSummary() }
-        let start = size > UInt64(tailLimit) ? size - UInt64(tailLimit) : 0
-        guard (try? handle.seek(toOffset: start)) != nil,
-              let data = try? handle.readToEnd()
-        else { return TranscriptSummary() }
-
-        var lines = data.split(separator: UInt8(ascii: "\n"))
-        // A mid-file start almost certainly landed inside a line; drop it.
-        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        let lines = tailLines(path: path)
+        guard !lines.isEmpty else { return TranscriptSummary() }
 
         var lastMessage: String?
         var isError = false
@@ -52,6 +41,26 @@ public enum TranscriptTail {
             }
         }
         return TranscriptSummary(lastMessage: lastMessage, isError: isError)
+    }
+
+    /// Shared bounded JSONL reader for stop-time summaries and live sampling.
+    /// Returning independent Data values avoids retaining the entire tail
+    /// buffer after parsing.
+    static func tailLines(path: String) -> [Data] {
+        guard let handle = FileHandle(forReadingAtPath: path) else {
+            return []
+        }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return [] }
+        let start = size > UInt64(tailLimit) ? size - UInt64(tailLimit) : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd()
+        else { return [] }
+
+        var lines = data.split(separator: UInt8(ascii: "\n"))
+        // A mid-file start almost certainly landed inside a line; drop it.
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        return lines.map { Data($0) }
     }
 
     /// Concatenated `message.content[].text` parts of an assistant line.

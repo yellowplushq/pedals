@@ -9,7 +9,8 @@ final class HookWireAndLineageTests: XCTestCase {
         let report = HookReport(
             event: "tool", agentSessionId: "s-1",
             sessionName: "Pedals release", cwd: "/tmp/p",
-            action: "Bash: git status"
+            action: "Bash: git status",
+            transcriptPath: "/Users/test/.claude/projects/s-1.jsonl"
         )
         let lineage = [
             LineageEntry(pid: 10, name: "zsh", tty: "/dev/ttys003"),
@@ -31,6 +32,10 @@ final class HookWireAndLineageTests: XCTestCase {
         XCTAssertEqual(object["sessionName"] as? String, "Pedals release")
         XCTAssertEqual(object["cwd"] as? String, "/tmp/p")
         XCTAssertEqual(object["action"] as? String, "Bash: git status")
+        XCTAssertEqual(
+            object["transcriptPath"] as? String,
+            "/Users/test/.claude/projects/s-1.jsonl"
+        )
         XCTAssertNil(object["prompt"])
         XCTAssertNil(object["agentError"])
         let wireLineage = try XCTUnwrap(object["lineage"] as? [[String: Any]])

@@ -8,7 +8,12 @@ import Foundation
 struct ClaudeFlatStdin {
     var sessionId: String?
     var sessionName: String?
+    /// Codex includes these fields only for thread-spawned subagents. They
+    /// are internal child work, not user sessions, and must not become
+    /// standalone Pedals rows or Live Activities.
+    var isCodexSubagent = false
     var cwd: String?
+    var transcriptPath: String?
     var prompt: String?
     var toolName: String?
     /// "ToolName: detail" one-liner from `tool_name` + `tool_input`, capped.
@@ -26,8 +31,16 @@ struct ClaudeFlatStdin {
         if let id = object["session_id"] as? String, !id.isEmpty {
             sessionId = id
         }
+        isCodexSubagent = ["agent_id", "agent_type"].contains {
+            guard let value = object[$0] as? String else { return false }
+            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         sessionName = hookSessionName(from: object)
         cwd = object["cwd"] as? String
+        if let path = object["transcript_path"] as? String {
+            let cleaned = sanitizeHookText(path, cap: HookFieldCaps.transcriptPath)
+            if !cleaned.isEmpty { transcriptPath = cleaned }
+        }
         if let prompt = object["prompt"] as? String {
             let cleaned = sanitizeHookText(prompt, cap: HookFieldCaps.prompt)
             if !cleaned.isEmpty { self.prompt = cleaned }
@@ -35,7 +48,8 @@ struct ClaudeFlatStdin {
         if let tool = object["tool_name"] as? String, !tool.isEmpty {
             toolName = tool
             let line = hookActionLine(tool: tool, input: object["tool_input"] as? [String: Any])
-            action = sanitizeHookText(line, cap: HookFieldCaps.action)
+            let cleaned = sanitizeHookText(line, cap: HookFieldCaps.action)
+            action = cleaned.isEmpty ? nil : cleaned
         }
         for key in ["message", "last_assistant_message", "assistant_response"] {
             guard let value = object[key] as? String else { continue }
@@ -109,7 +123,8 @@ public enum AgentHookMapper {
 
     public static func report(
         slug: String, event: String, stdinData: Data,
-        fallbackSessionId: String? = nil
+        fallbackSessionId: String? = nil,
+        codexHome: URL? = nil
     ) -> HookReport? {
         // Deterministic per agent process, so repeated events without a
         // stdin session id coalesce into one record.
@@ -119,9 +134,19 @@ public enum AgentHookMapper {
                 return copilotNotification(stdinData: stdinData, fallbackSessionId: fallback)
             }
             guard genericEvents.contains(event) else { return nil }
+            let stdin = ClaudeFlatStdin(data: stdinData)
+            if slug == "codex", stdin.isCodexSubagent {
+                return nil
+            }
+            let sessionID = stdin.sessionId ?? fallback
+            let codexMetadata = slug == "codex"
+                ? CodexSessionMetadata.resolve(sessionID: sessionID, home: codexHome)
+                : nil
+            let sessionName = stdin.sessionName ?? codexMetadata?.title
             return genericReport(
-                event: event, stdin: ClaudeFlatStdin(data: stdinData),
-                fallbackSessionId: fallback
+                event: event, stdin: stdin,
+                fallbackSessionId: fallback, sessionName: sessionName,
+                transcriptPath: stdin.transcriptPath ?? codexMetadata?.transcriptPath
             )
         }
         if normalizedSlugs.contains(slug) {
@@ -138,11 +163,13 @@ public enum AgentHookMapper {
     /// fills the fields that event carries. No transcript probe and no
     /// `agentError` for these agents.
     static func genericReport(
-        event: String, stdin: ClaudeFlatStdin, fallbackSessionId: String
+        event: String, stdin: ClaudeFlatStdin, fallbackSessionId: String,
+        sessionName: String? = nil, transcriptPath: String? = nil
     ) -> HookReport? {
         var report = HookReport(
             event: event, agentSessionId: stdin.sessionId ?? fallbackSessionId,
-            sessionName: stdin.sessionName, cwd: stdin.cwd
+            sessionName: sessionName ?? stdin.sessionName, cwd: stdin.cwd,
+            transcriptPath: transcriptPath ?? stdin.transcriptPath
         )
         switch event {
         case "prompt":

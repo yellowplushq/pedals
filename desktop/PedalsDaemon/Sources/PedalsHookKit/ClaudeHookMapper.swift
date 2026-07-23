@@ -20,7 +20,11 @@ public enum ClaudeHookMapper {
         var report = HookReport(
             event: "", agentSessionId: sessionId,
             sessionName: hookSessionName(from: object),
-            cwd: object["cwd"] as? String
+            cwd: object["cwd"] as? String,
+            transcriptPath: (object["transcript_path"] as? String).flatMap {
+                let path = sanitizeHookText($0, cap: HookFieldCaps.transcriptPath)
+                return path.isEmpty ? nil : path
+            }
         )
         switch eventName {
         case "SessionStart":
@@ -37,7 +41,8 @@ public enum ClaudeHookMapper {
             } else {
                 report.event = "tool"
                 let line = hookActionLine(tool: tool, input: object["tool_input"] as? [String: Any])
-                report.action = sanitizeHookText(line, cap: HookFieldCaps.action)
+                let action = sanitizeHookText(line, cap: HookFieldCaps.action)
+                report.action = action.isEmpty ? nil : action
             }
         case "Notification":
             report.event = "notify"
@@ -48,7 +53,7 @@ public enum ClaudeHookMapper {
             report.event = "compact"
         case "Stop":
             report.event = "stop"
-            if let path = object["transcript_path"] as? String, !path.isEmpty {
+            if let path = report.transcriptPath {
                 let summary = TranscriptTail.scan(path: path, sessionId: sessionId)
                 report.message = summary.lastMessage
                 report.agentError = summary.isError

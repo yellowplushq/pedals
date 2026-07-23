@@ -90,8 +90,9 @@ public enum AgentActivity {
     }
 
     /// Shared display semantics for every agent surface. The title identifies
-    /// the session; the detail describes the latest useful agent output or
-    /// action. Agent brand and state remain separate visual information.
+    /// the session; the detail is the last agent message, falling back to the
+    /// last user prompt. Agent brand and state remain separate visual
+    /// information; implementation-level tool activity is never displayed.
     public struct Presentation: Equatable, Sendable {
         public var title: String
         public var detail: String
@@ -102,7 +103,7 @@ public enum AgentActivity {
                 state: info.state,
                 sessionName: info.sessionName ?? fallbackSessionName,
                 project: AgentActivity.projectName(from: info.cwd),
-                action: info.action,
+                prompt: info.prompt,
                 message: info.message
             )
         }
@@ -113,7 +114,7 @@ public enum AgentActivity {
                 state: content.state,
                 sessionName: content.sessionName,
                 project: content.project,
-                action: content.action,
+                prompt: content.prompt,
                 message: content.message
             )
         }
@@ -123,7 +124,7 @@ public enum AgentActivity {
             state: AgentState,
             sessionName: String?,
             project: String?,
-            action: String?,
+            prompt: String?,
             message: String?
         ) {
             title = AgentActivity.displayLine(sessionName)
@@ -131,16 +132,16 @@ public enum AgentActivity {
                 ?? AgentActivity.displayName(forAgent: agent)
 
             let latestMessage = AgentActivity.displayLine(message)
-            let latestAction = AgentActivity.displayLine(action)
+            let latestPrompt = AgentActivity.displayLine(prompt)
             switch state {
             case .running:
-                detail = latestMessage ?? latestAction ?? "Working…"
+                detail = latestMessage ?? latestPrompt ?? "Working…"
             case .waiting:
-                detail = latestMessage ?? latestAction ?? "Waiting for your input"
+                detail = latestMessage ?? latestPrompt ?? "Waiting for your input"
             case .error:
-                detail = latestMessage ?? latestAction ?? "Agent hit an error"
+                detail = latestMessage ?? latestPrompt ?? "Agent hit an error"
             case .done:
-                detail = latestMessage ?? latestAction ?? "Task completed"
+                detail = latestMessage ?? latestPrompt ?? "Task completed"
             }
         }
     }

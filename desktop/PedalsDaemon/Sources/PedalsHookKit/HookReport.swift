@@ -18,6 +18,10 @@ public struct HookReport: Equatable, Sendable {
     public var message: String?
     /// One-line current action (`tool` events only), capped.
     public var action: String?
+    /// Local JSONL transcript used for best-effort, low-frequency refreshes
+    /// while the agent is working. The daemon validates it against the
+    /// agent's own config directory before reading.
+    public var transcriptPath: String?
     /// `stop` only: the turn ended on an agent-side failure (API error).
     public var agentError: Bool?
 
@@ -25,6 +29,7 @@ public struct HookReport: Equatable, Sendable {
         event: String, agentSessionId: String, sessionName: String? = nil,
         cwd: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
+        transcriptPath: String? = nil,
         agentError: Bool? = nil
     ) {
         self.event = event
@@ -34,6 +39,7 @@ public struct HookReport: Equatable, Sendable {
         self.prompt = prompt
         self.message = message
         self.action = action
+        self.transcriptPath = transcriptPath
         self.agentError = agentError
     }
 }
@@ -45,6 +51,7 @@ enum HookFieldCaps {
     static let action = 120
     static let message = 300
     static let sessionName = 120
+    static let transcriptPath = 4096
 }
 
 /// Session-name fields used by agent hook payloads. A generic notification
@@ -60,20 +67,27 @@ func hookSessionName(from object: [String: Any]) -> String? {
 }
 
 /// "ToolName: detail" one-liner shared by all Claude-shaped mappers: detail is
-/// the first line of `tool_input.command`, else the last path component of
-/// `tool_input.file_path`, else empty.
+/// the first useful command/query, else the last component of a file path.
 func hookActionLine(tool: String, input: [String: Any]?) -> String {
     var detail = ""
-    if let command = input?["command"] as? String {
+    if let command = (input?["command"] ?? input?["cmd"]) as? String {
         detail = command
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? ""
-    } else if let path = input?["file_path"] as? String, !path.isEmpty {
+    } else if let path = (input?["file_path"] ?? input?["path"]) as? String,
+              !path.isEmpty
+    {
         detail = (path as NSString).lastPathComponent
+    } else if let query = (input?["query"] ?? input?["pattern"]) as? String {
+        detail = query
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .first.map(String.init) ?? ""
     }
     detail = detail.trimmingCharacters(in: .whitespaces)
     if tool.isEmpty { return detail }
-    return detail.isEmpty ? tool : "\(tool): \(detail)"
+    // A bare tool name is not meaningful user-facing progress. Returning
+    // empty lets the monitor keep showing the last agent message.
+    return detail.isEmpty ? "" : "\(tool): \(detail)"
 }
 
 /// Shared field hygiene: strips C0 controls (and DEL) and caps length. The

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import SQLite3
 import XCTest
 
 @testable import PedalsHookKit
@@ -9,11 +10,12 @@ import XCTest
 final class AgentHookMapperTests: XCTestCase {
     private func map(
         _ slug: String, _ event: String, _ object: [String: Any]? = nil,
-        fallback: String = "fb-1"
+        fallback: String = "fb-1", codexHome: URL? = nil
     ) -> HookReport? {
         let data = object.map { try! JSONSerialization.data(withJSONObject: $0) } ?? Data()
         return AgentHookMapper.report(
-            slug: slug, event: event, stdinData: data, fallbackSessionId: fallback
+            slug: slug, event: event, stdinData: data, fallbackSessionId: fallback,
+            codexHome: codexHome
         )
     }
 
@@ -73,7 +75,7 @@ final class AgentHookMapperTests: XCTestCase {
         XCTAssertEqual(map("grok", "tool", file)?.action, "Edit: Daemon.swift")
 
         let bare = flatBase(["tool_name": "Glob"])
-        XCTAssertEqual(map("kiro", "tool", bare)?.action, "Glob")
+        XCTAssertNil(map("kiro", "tool", bare)?.action)
 
         let capped = flatBase([
             "tool_name": "Bash",
@@ -164,6 +166,67 @@ final class AgentHookMapperTests: XCTestCase {
             map("codex", "notify", flatBase(["title": "Agent completed"]))?.sessionName,
             "event titles are not persistent session names"
         )
+    }
+
+    func testCodexExplicitThreadNameComesFromSessionIndex() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pedals-codex-index-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try Data("""
+        {"id":"s-1","thread_name":"Original name","updated_at":"1"}
+        {"id":"s-1","thread_name":"Release monitoring","updated_at":"2"}
+
+        """.utf8).write(to: home.appendingPathComponent("session_index.jsonl"))
+
+        XCTAssertEqual(
+            map("codex", "prompt", flatBase(["prompt": "ship it"]), codexHome: home)?
+                .sessionName,
+            "Release monitoring"
+        )
+    }
+
+    func testCodexGeneratedThreadTitleComesFromReadOnlyStateDatabase() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pedals-codex-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let path = home.appendingPathComponent("state_5.sqlite").path
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &database), SQLITE_OK)
+        let sql = """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY, rollout_path TEXT, name TEXT, title TEXT,
+            first_user_message TEXT, preview TEXT
+        );
+        INSERT INTO threads VALUES (
+            's-1', '/tmp/codex/s-1.jsonl', NULL, 'Improve agent titles',
+            'Longer first message', 'Preview'
+        );
+        """
+        XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(database)
+
+        let report = map("codex", "session-start", flatBase(), codexHome: home)
+        XCTAssertEqual(report?.sessionName, "Improve agent titles")
+        XCTAssertEqual(report?.transcriptPath, "/tmp/codex/s-1.jsonl")
+    }
+
+    func testCodexThreadSpawnedSubagentEventsAreDropped() {
+        let subagent = flatBase([
+            "agent_id": "child-1",
+            "agent_type": "explorer",
+            "prompt": "Inspect the repository",
+            "tool_name": "Bash",
+            "tool_input": ["command": "rg TODO"],
+            "last_assistant_message": #"{"suggestions":[]}"#,
+        ])
+        for event in ["prompt", "tool", "ask", "stop"] {
+            XCTAssertNil(map("codex", event, subagent), event)
+        }
+
+        let root = flatBase(["prompt": "Inspect the repository"])
+        XCTAssertNotNil(map("codex", "prompt", root))
     }
 
     func testMalformedStdinStillReports() {

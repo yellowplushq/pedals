@@ -1,5 +1,4 @@
 import ActivityKit
-import CryptoKit
 import Foundation
 import PedalsKit
 import SwiftUI
@@ -18,28 +17,16 @@ struct TTYLiveActivityWidget: Widget {
             let state = context.state
             let presentation = ActivityPresentation(state: state)
             return DynamicIsland {
-                DynamicIslandExpandedRegion(.leading) {
-                    Group {
-                        if presentation.showsAgent {
-                            AgentIdentity(presentation: presentation)
-                        } else {
-                            TerminalIdentity()
-                        }
-                    }
-                    .padding(.leading, 4)
-                    .padding(.top, 2)
-                }
-                DynamicIslandExpandedRegion(.trailing) {
-                    ActivityStateLabel(presentation: presentation)
-                        .padding(.trailing, 4)
-                        .padding(.top, 2)
-                }
                 DynamicIslandExpandedRegion(.bottom) {
-                    ActivityBody(
-                        state: state, presentation: presentation, stale: context.isStale
-                    )
-                        .padding(.horizontal, 6)
-                        .padding(.bottom, 7)
+                    // Reuse the Lock Screen/Home-row composition as one
+                    // full-width unit. Splitting its identity and state into
+                    // separate expanded regions lets the bottom region choose
+                    // an intrinsic centered width, which is what caused the
+                    // conspicuous empty margins in the old island.
+                    ActivityCard(state: state, stale: context.isStale)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
                         .privacySensitive()
                 }
             } compactLeading: {
@@ -78,7 +65,7 @@ private struct ActivityPresentation {
 
     init(state: TTYActivityAttributes.ContentState) {
         let fallbackState = state.displayedAgentState
-        let decodedAgent = fallbackState == nil ? nil : state.recentAgent
+        let decodedAgent = fallbackState == nil ? nil : state.resolvedRecentAgent
         agent = decodedAgent
         agentState = decodedAgent?.state ?? fallbackState
     }
@@ -273,36 +260,16 @@ private struct ActivityMetrics: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if state.totalAgents > 0 {
-                MetricChip(
-                    text: state.totalAgents == 1 ? "1 agent" : "\(state.totalAgents) agents"
-                )
-            }
-            MetricChip(text: "\(state.totalRunning) TTY")
-            if state.offlineComputerCount > 0 {
-                MetricChip(text: "\(state.offlineComputerCount) offline")
+            if let summary = state.activityCountSummary {
+                Text(summary)
             }
             if stale {
-                MetricChip(text: "stale")
+                Text("Updating…")
             }
         }
+        .font(.caption2)
+        .foregroundStyle(PedalsTheme.secondaryContent)
         .lineLimit(1)
-    }
-}
-
-/// Home uses one-pixel outline chips rather than filled metric pills.
-private struct MetricChip: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.caption2)
-            .foregroundStyle(PedalsTheme.secondaryContent)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .overlay {
-                Capsule().stroke(PedalsTheme.separator, lineWidth: 1)
-            }
     }
 }
 
@@ -380,8 +347,16 @@ private enum ActivityStyle {
         state: TTYActivityAttributes.ContentState
     ) -> String {
         guard let agent = presentation.agent else {
-            return state.totalAgents == 1
-                ? "1 agent active" : "\(state.totalAgents) agents active"
+            if state.totalAgents > 1 {
+                return "\(state.totalAgents) agents"
+            }
+            return switch presentation.agentState {
+            case .waiting: "Agent needs you"
+            case .error: "Agent error"
+            case .done: "Agent finished"
+            case .running: "Agent working"
+            case nil: "Agent"
+            }
         }
         return presentation.agentContent?.title
             ?? AgentActivity.displayName(forAgent: agent.agent)
@@ -420,35 +395,4 @@ private enum ActivityStyle {
         default: nil
         }
     }
-}
-
-private extension TTYActivityAttributes.ContentState {
-    var recentAgent: AgentActivity.Content? {
-        #if DEBUG
-        if recentAgentComputerID == "fixture", recentAgentSealed == "fixture",
-           let state = recentAgentState.flatMap(AgentState.init(rawValue:))
-        {
-            return .init(
-                id: "fixture", agent: "codex", state: state,
-                sessionName: "Polish agent monitoring", project: "pedals",
-                prompt: "Review the Live Activity experience",
-                action: "Build: PedalsWidgets",
-                message: state == .done ? "Live Activity is ready" : "Choose how to continue",
-                sessionId: 1,
-                updatedAt: recentAgentUpdatedAt?.timeIntervalSince1970 ?? Date.now.timeIntervalSince1970
-            )
-        }
-        #endif
-        guard let computerID = recentAgentComputerID,
-              let sealedText = recentAgentSealed,
-              let sealed = Data(base64Encoded: sealedText),
-              let keyData = AgentActivityKeyStore.key(forComputer: computerID)
-        else { return nil }
-        return try? AgentActivity.open(
-            sealed,
-            key: SymmetricKey(data: keyData),
-            computerID: computerID
-        )
-    }
-
 }

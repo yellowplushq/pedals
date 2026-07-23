@@ -17,6 +17,9 @@ public enum HookWire {
         if let prompt = report.prompt { object["prompt"] = prompt }
         if let message = report.message { object["message"] = message }
         if let action = report.action { object["action"] = action }
+        if let transcriptPath = report.transcriptPath {
+            object["transcriptPath"] = transcriptPath
+        }
         if let agentError = report.agentError { object["agentError"] = agentError }
         object["lineage"] = lineage.map { entry -> [String: Any] in
             var encoded: [String: Any] = ["pid": Int(entry.pid), "name": entry.name]

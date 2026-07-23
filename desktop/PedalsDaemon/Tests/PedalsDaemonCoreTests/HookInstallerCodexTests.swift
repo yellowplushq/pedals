@@ -66,7 +66,10 @@ final class HookInstallerCodexTests: XCTestCase {
 
         let root = try readHooks()
         let managed = managedCommands(in: root)
-        XCTAssertEqual(Set(managed.keys), ["SessionStart", "UserPromptSubmit", "Stop"])
+        XCTAssertEqual(Set(managed.keys), [
+            "SessionStart", "UserPromptSubmit", "PreToolUse",
+            "PermissionRequest", "Stop", "SessionEnd",
+        ])
         XCTAssertEqual(
             managed["SessionStart"],
             ["\(reporter) codex --event session-start \(HookInstaller.sentinel)"]
@@ -76,8 +79,20 @@ final class HookInstallerCodexTests: XCTestCase {
             ["\(reporter) codex --event prompt \(HookInstaller.sentinel)"]
         )
         XCTAssertEqual(
+            managed["PreToolUse"],
+            ["\(reporter) codex --event tool \(HookInstaller.sentinel)"]
+        )
+        XCTAssertEqual(
+            managed["PermissionRequest"],
+            ["\(reporter) codex --event ask \(HookInstaller.sentinel)"]
+        )
+        XCTAssertEqual(
             managed["Stop"],
             ["\(reporter) codex --event stop \(HookInstaller.sentinel)"]
+        )
+        XCTAssertEqual(
+            managed["SessionEnd"],
+            ["\(reporter) codex --event session-end \(HookInstaller.sentinel)"]
         )
         // Timeouts and matcherless groups.
         let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])

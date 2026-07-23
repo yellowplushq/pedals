@@ -19,6 +19,7 @@ public struct ControlRequest: Decodable, Sendable {
     public var prompt: String?
     public var message: String?
     public var action: String?
+    public var transcriptPath: String?
     public var agentError: Bool?
     public var lineage: [AgentLineageEntry]?
 }

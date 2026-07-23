@@ -240,7 +240,8 @@ public final class Daemon: @unchecked Sendable {
                 agent: agent, event: event, agentSessionId: agentSessionId,
                 sessionName: request.sessionName, cwd: request.cwd,
                 prompt: request.prompt, message: request.message,
-                action: request.action, agentError: request.agentError,
+                action: request.action, transcriptPath: request.transcriptPath,
+                agentError: request.agentError,
                 lineage: request.lineage ?? []
             ))
             return .ok([:])

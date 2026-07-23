@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PedalsHookKit
 import PedalsKit
 
 /// One ancestor of the reporting hook process, as carried in the local-socket
@@ -32,6 +33,7 @@ public struct AgentEvent: Sendable {
     public var prompt: String?
     public var message: String?
     public var action: String?
+    public var transcriptPath: String?
     /// `stop` only: the turn ended on an agent-side failure (API error).
     public var agentError: Bool?
     public var lineage: [AgentLineageEntry]
@@ -40,6 +42,7 @@ public struct AgentEvent: Sendable {
         agent: String, event: String, agentSessionId: String,
         sessionName: String? = nil, cwd: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
+        transcriptPath: String? = nil,
         agentError: Bool? = nil, lineage: [AgentLineageEntry] = []
     ) {
         self.agent = agent
@@ -50,6 +53,7 @@ public struct AgentEvent: Sendable {
         self.prompt = prompt
         self.message = message
         self.action = action
+        self.transcriptPath = transcriptPath
         self.agentError = agentError
         self.lineage = lineage
     }
@@ -67,6 +71,9 @@ public final class AgentMonitor: @unchecked Sendable {
         /// the relay (and downstream APNs budgets).
         public var debounce: TimeInterval = 0.4
         public var sweepInterval: TimeInterval = 2
+        /// Claude/Codex transcript tails are sampled no more frequently than
+        /// this while running. State still comes exclusively from hooks.
+        public var transcriptSampleInterval: TimeInterval = 5
         /// Records with no resolvable agent pid cannot be liveness-checked;
         /// they expire this long after their last event.
         public var idleExpiry: TimeInterval = 30 * 60
@@ -91,6 +98,7 @@ public final class AgentMonitor: @unchecked Sendable {
     static let messageCap = 300
     static let sessionNameCap = 120
     static let cwdCap = 1024
+    static let transcriptPathCap = 4096
     static let idCap = 128
     static let lineageCap = 15
 
@@ -107,6 +115,9 @@ public final class AgentMonitor: @unchecked Sendable {
         var prompt: String?
         var action: String?
         var message: String?
+        var transcriptPath: String?
+        var lastTranscriptActivity: AgentTranscriptActivity?
+        var lastTranscriptSampleAt = Date.distantPast
         var updatedAt = Date()
         let firstSeenAt = Date()
         /// First non-shell ancestor in the reported lineage: the agent
@@ -140,6 +151,8 @@ public final class AgentMonitor: @unchecked Sendable {
     private let queue = DispatchQueue(label: "air.build.pedals.agents")
     private let tuning: Tuning
     private let matchTargets: @Sendable () -> [SessionManager.AgentMatchTarget]
+    private let transcriptSampler:
+        @Sendable (_ agent: String, _ path: String) -> AgentTranscriptActivity?
     private var records: [String: Record] = [:]
     /// Held-back done attention events by agent id (see Tuning.doneAttentionDelay).
     private var pendingDoneAttention: [String: DispatchWorkItem] = [:]
@@ -166,9 +179,15 @@ public final class AgentMonitor: @unchecked Sendable {
 
     public init(
         tuning: Tuning = Tuning(),
+        transcriptSampler: @escaping @Sendable (
+            _ agent: String, _ path: String
+        ) -> AgentTranscriptActivity? = {
+            AgentTranscriptSampler.latestActivity(agent: $0, path: $1)
+        },
         matchTargets: @escaping @Sendable () -> [SessionManager.AgentMatchTarget]
     ) {
         self.tuning = tuning
+        self.transcriptSampler = transcriptSampler
         self.matchTargets = matchTargets
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
@@ -285,6 +304,16 @@ public final class AgentMonitor: @unchecked Sendable {
             let cleaned = Self.sanitize(cwd, cap: Self.cwdCap)
             if !cleaned.isEmpty { record.cwd = cleaned }
         }
+        if let transcriptPath = event.transcriptPath {
+            let cleaned = Self.sanitize(
+                transcriptPath, cap: Self.transcriptPathCap
+            )
+            if !cleaned.isEmpty, cleaned != record.transcriptPath {
+                record.transcriptPath = cleaned
+                record.lastTranscriptActivity = nil
+                record.lastTranscriptSampleAt = .distantPast
+            }
+        }
         // `.error` is sticky: only a turn start (`prompt` or `busy`), a
         // session start, or another stop may move the agent out of it — a
         // mid-error `notify` (e.g. the idle notification) must not mask the
@@ -299,6 +328,12 @@ public final class AgentMonitor: @unchecked Sendable {
         case "prompt":
             record.state = .running
             record.prompt = event.prompt.map { Self.sanitize($0, cap: Self.promptCap) }
+            if event.agent == "codex", record.reportedSessionName == nil,
+               let prompt = record.prompt,
+               let title = Self.sessionTitle(from: prompt)
+            {
+                record.reportedSessionName = title
+            }
             record.action = nil
             record.message = nil
         case "busy":
@@ -308,9 +343,12 @@ public final class AgentMonitor: @unchecked Sendable {
             record.state = .running
         case "tool":
             if !sticky { record.state = .running }
-            // nil action (agents without tool detail) keeps the last one.
+            // A tool without a meaningful command/path/query must not replace
+            // the last agent message with a bare implementation label.
+            record.action = nil
             if let action = event.action {
-                record.action = Self.sanitize(action, cap: Self.actionCap)
+                let cleaned = Self.sanitize(action, cap: Self.actionCap)
+                if !cleaned.isEmpty { record.action = cleaned }
             }
         case "ask":
             if !sticky { record.state = .waiting }
@@ -342,6 +380,19 @@ public final class AgentMonitor: @unchecked Sendable {
         default:
             break
         }
+    }
+
+    /// Older Codex builds and short-lived subagents may not have persisted
+    /// thread metadata yet. Use the first prompt once as a stable fallback;
+    /// later turns must not rename a session out from under the user.
+    private static func sessionTitle(from prompt: String) -> String? {
+        let normalized = prompt
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+        return sanitize(normalized, cap: sessionNameCap)
     }
 
     private func applyLineage(_ lineage: [AgentLineageEntry], to record: Record) {
@@ -412,6 +463,24 @@ public final class AgentMonitor: @unchecked Sendable {
             if resolveOwnershipLocked(record, targets: targets) {
                 record.updatedAt = now
                 changed = true
+            }
+            if record.state == .running,
+               let path = record.transcriptPath,
+               now.timeIntervalSince(record.lastTranscriptSampleAt)
+                    >= tuning.transcriptSampleInterval
+            {
+                record.lastTranscriptSampleAt = now
+                if let activity = transcriptSampler(record.agent, path),
+                   activity != record.lastTranscriptActivity
+                {
+                    record.lastTranscriptActivity = activity
+                    record.message = Self.sanitize(
+                        activity.detail, cap: Self.messageCap
+                    )
+                    record.action = nil
+                    record.updatedAt = now
+                    changed = true
+                }
             }
         }
         if changed { schedulePublishLocked() }

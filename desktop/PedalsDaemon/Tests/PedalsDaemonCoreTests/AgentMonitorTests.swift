@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PedalsHookKit
 import PedalsKit
 import XCTest
 
@@ -46,14 +47,17 @@ final class AgentMonitorTests: XCTestCase {
 
     private func event(
         _ event: String, id: String = "a-1", cwd: String? = "/tmp/p",
+        agent: String = "claude",
         sessionName: String? = nil,
         prompt: String? = nil, message: String? = nil, action: String? = nil,
+        transcriptPath: String? = nil,
         agentError: Bool? = nil, lineage: [AgentLineageEntry]? = nil
     ) -> AgentEvent {
         AgentEvent(
-            agent: "claude", event: event, agentSessionId: id,
+            agent: agent, event: event, agentSessionId: id,
             sessionName: sessionName, cwd: cwd,
             prompt: prompt, message: message, action: action,
+            transcriptPath: transcriptPath,
             agentError: agentError,
             lineage: lineage ?? [AgentLineageEntry(pid: livePid, name: "claude")]
         )
@@ -112,6 +116,34 @@ final class AgentMonitorTests: XCTestCase {
         let info = try only()
         XCTAssertNil(info.action)
         XCTAssertNil(info.message)
+    }
+
+    func testCodexFirstPromptBecomesStableFallbackSessionTitle() throws {
+        monitor.ingest(event(
+            "prompt", agent: "codex",
+            prompt: "  Fix the agent titles\nand useful descriptions  "
+        ))
+        XCTAssertEqual(
+            try only().sessionName,
+            "Fix the agent titles and useful descriptions"
+        )
+
+        monitor.ingest(event(
+            "prompt", agent: "codex", prompt: "Now publish TestFlight"
+        ))
+        XCTAssertEqual(
+            try only().sessionName,
+            "Fix the agent titles and useful descriptions",
+            "later turns do not silently rename a Codex session"
+        )
+    }
+
+    func testCodexReportedTitleWinsPromptFallback() throws {
+        monitor.ingest(event(
+            "prompt", agent: "codex", sessionName: "Agent monitoring",
+            prompt: "This prompt is not the title"
+        ))
+        XCTAssertEqual(try only().sessionName, "Agent monitoring")
     }
 
     func testStopWithAgentErrorAndStickiness() throws {
@@ -174,12 +206,15 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(try only().message, "All wrapped up")
     }
 
-    func testToolWithNilActionPreservesAction() throws {
+    func testToolWithNilActionFallsBackToLastAgentMessage() throws {
+        monitor.ingest(event("notify", message: "I found the relevant files"))
+        monitor.ingest(event("busy"))
         monitor.ingest(event("tool", action: "Bash: swift build"))
         monitor.ingest(event("tool"))
         let info = try only()
         XCTAssertEqual(info.state, .running)
-        XCTAssertEqual(info.action, "Bash: swift build")
+        XCTAssertNil(info.action)
+        XCTAssertEqual(info.message, "I found the relevant files")
     }
 
     func testUnknownEventIgnored() {
@@ -325,6 +360,61 @@ final class AgentMonitorTests: XCTestCase {
         monitor.ingest(event("prompt"))
         monitor.sweepNow()
         XCTAssertEqual(monitor.list().count, 1)
+    }
+
+    func testRunningTranscriptSamplingRefreshesAgentMessage() throws {
+        final class SampleBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = AgentTranscriptActivity(
+                detail: "Inspecting the release workflow"
+            )
+            func get() -> AgentTranscriptActivity { lock.withLock { value } }
+            func set(_ next: AgentTranscriptActivity) { lock.withLock { value = next } }
+        }
+        let samples = SampleBox()
+        var tuning = AgentMonitor.Tuning()
+        tuning.debounce = 0
+        tuning.sweepInterval = 3600
+        tuning.transcriptSampleInterval = 0
+        let samplingMonitor = AgentMonitor(
+            tuning: tuning,
+            transcriptSampler: { _, _ in samples.get() },
+            matchTargets: { [] }
+        )
+
+        samplingMonitor.ingest(event(
+            "prompt", prompt: "Ship it", transcriptPath: "/safe/session.jsonl"
+        ))
+        samplingMonitor.sweepNow()
+        var info = try XCTUnwrap(samplingMonitor.list().first)
+        XCTAssertEqual(info.message, "Inspecting the release workflow")
+        XCTAssertNil(info.action)
+
+        samples.set(.init(detail: "Tests passed; validating the archive"))
+        samplingMonitor.sweepNow()
+        info = try XCTUnwrap(samplingMonitor.list().first)
+        XCTAssertEqual(info.message, "Tests passed; validating the archive")
+        XCTAssertNil(info.action)
+    }
+
+    func testTranscriptSamplingNeverChangesAttentionState() throws {
+        var tuning = AgentMonitor.Tuning()
+        tuning.sweepInterval = 3600
+        tuning.transcriptSampleInterval = 0
+        let samplingMonitor = AgentMonitor(
+            tuning: tuning,
+            transcriptSampler: { _, _ in
+                .init(detail: "This must not revive a waiting agent")
+            },
+            matchTargets: { [] }
+        )
+        samplingMonitor.ingest(event(
+            "ask", transcriptPath: "/safe/session.jsonl"
+        ))
+        samplingMonitor.sweepNow()
+        let info = try XCTUnwrap(samplingMonitor.list().first)
+        XCTAssertEqual(info.state, .waiting)
+        XCTAssertEqual(info.message, "Waiting for your answer")
     }
 
     // MARK: - Debounce

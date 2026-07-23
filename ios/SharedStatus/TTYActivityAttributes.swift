@@ -1,9 +1,42 @@
 import ActivityKit
+import CryptoKit
 import Foundation
 import PedalsKit
 
 public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Sendable {
     public struct ContentState: Codable, Hashable, Sendable {
+        /// A compact, on-device-only copy of the exact presentation Home
+        /// already resolved. It makes a foreground ActivityKit update
+        /// independent of a widget Keychain read while keeping remote agent
+        /// payloads end-to-end encrypted.
+        public struct RecentAgentDisplay: Codable, Hashable, Sendable {
+            public var agent: String
+            public var state: AgentState
+            public var title: String
+            public var detail: String
+            public var updatedAt: Date
+
+            public init(content: AgentActivity.Content) {
+                let presentation = AgentActivity.Presentation(content: content)
+                agent = content.agent
+                state = content.state
+                title = presentation.title
+                detail = presentation.detail
+                updatedAt = Date(timeIntervalSince1970: content.updatedAt)
+            }
+
+            var content: AgentActivity.Content {
+                .init(
+                    id: "local-presentation",
+                    agent: agent,
+                    state: state,
+                    sessionName: title,
+                    message: detail,
+                    updatedAt: updatedAt.timeIntervalSince1970
+                )
+            }
+        }
+
         public var totalRunning: Int
         /// Coding-agent aggregates. Optional-decoded so pushes from a relay
         /// that predates agent counts still parse (ActivityKit decodes
@@ -15,6 +48,7 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
         public var recentAgentState: String?
         public var recentAgentUpdatedAt: Date?
         public var recentAgentSealed: String?
+        public var recentAgentDisplay: RecentAgentDisplay?
         public var onlineComputerCount: Int
         public var offlineComputerCount: Int
         public var updatedAt: Date
@@ -29,6 +63,7 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
             recentAgentState: String? = nil,
             recentAgentUpdatedAt: Date? = nil,
             recentAgentSealed: String? = nil,
+            recentAgentDisplay: RecentAgentDisplay? = nil,
             onlineComputerCount: Int,
             offlineComputerCount: Int,
             updatedAt: Date,
@@ -42,6 +77,7 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
             self.recentAgentState = recentAgentState
             self.recentAgentUpdatedAt = recentAgentUpdatedAt
             self.recentAgentSealed = recentAgentSealed
+            self.recentAgentDisplay = recentAgentDisplay
             self.onlineComputerCount = max(0, onlineComputerCount)
             self.offlineComputerCount = max(0, offlineComputerCount)
             self.updatedAt = updatedAt
@@ -59,6 +95,9 @@ public struct TTYActivityAttributes: ActivityAttributes, Codable, Hashable, Send
                 recentAgentState: try container.decodeIfPresent(String.self, forKey: .recentAgentState),
                 recentAgentUpdatedAt: try container.decodeIfPresent(Date.self, forKey: .recentAgentUpdatedAt),
                 recentAgentSealed: try container.decodeIfPresent(String.self, forKey: .recentAgentSealed),
+                recentAgentDisplay: try container.decodeIfPresent(
+                    RecentAgentDisplay.self, forKey: .recentAgentDisplay
+                ),
                 onlineComputerCount: try container.decode(Int.self, forKey: .onlineComputerCount),
                 offlineComputerCount: try container.decode(Int.self, forKey: .offlineComputerCount),
                 updatedAt: try container.decode(Date.self, forKey: .updatedAt),
@@ -96,16 +135,55 @@ extension TTYActivityAttributes.ContentState {
         agentsRunning + agentsWaiting + agentsDone
     }
 
+    /// Counts shown beneath the concrete agent. The visible agent is already
+    /// represented by its row, so only additional agents are counted. Offline
+    /// computers are intentionally absent from this presentation.
+    var activityCountSummary: String? {
+        var parts: [String] = []
+        let moreAgents = max(0, totalAgents - 1)
+        if moreAgents > 0 {
+            let noun = moreAgents == 1 ? "agent" : "agents"
+            parts.append("and \(moreAgents) more \(noun)")
+        }
+        if totalRunning > 0 {
+            let noun = totalRunning == 1 ? "terminal" : "terminals"
+            parts.append("\(totalRunning) \(noun)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
     /// Prefer the state attached to the most recent encrypted agent envelope.
     /// If that envelope is temporarily absent or unreadable, keep the island
     /// in agent mode and fall back to the most attention-worthy aggregate.
     var displayedAgentState: AgentState? {
         guard totalAgents > 0 else { return nil }
+        if let recentAgentDisplay {
+            return recentAgentDisplay.state
+        }
         if let recentAgentState, let state = AgentState(rawValue: recentAgentState) {
             return state
         }
         if agentsWaiting > 0 { return .waiting }
         if agentsDone > 0 { return .done }
         return .running
+    }
+
+    /// Home-originated foreground updates resolve from the compact display
+    /// snapshot first. APNs updates do not contain it and continue through the
+    /// per-computer E2EE envelope shared with the widget extension.
+    var resolvedRecentAgent: AgentActivity.Content? {
+        if let recentAgentDisplay {
+            return recentAgentDisplay.content
+        }
+        guard let computerID = recentAgentComputerID,
+              let sealedText = recentAgentSealed,
+              let sealed = Data(base64Encoded: sealedText),
+              let keyData = AgentActivityKeyStore.key(forComputer: computerID)
+        else { return nil }
+        return try? AgentActivity.open(
+            sealed,
+            key: SymmetricKey(data: keyData),
+            computerID: computerID
+        )
     }
 }

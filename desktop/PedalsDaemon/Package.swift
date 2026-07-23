@@ -27,14 +27,16 @@ let package = Package(
             name: "PedalsDaemonCore",
             dependencies: [
                 "CPedalsPTY",
+                "PedalsHookKit",
                 .product(name: "PedalsKit", package: "PedalsKit")
             ]
         ),
-        // Foundation-only logic for the hook reporter (stdin mapping,
-        // transcript scan, lineage walk, wire encoding). No PedalsKit, no
-        // AppKit: the reporter binary must stay lean and dependency-free.
+        // Foundation + system SQLite logic for the hook reporter (stdin
+        // mapping, Codex thread metadata, transcript scan, lineage walk,
+        // wire encoding). No PedalsKit or AppKit: keep the reporter lean.
         .target(
-            name: "PedalsHookKit"
+            name: "PedalsHookKit",
+            linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .executableTarget(
             name: "pedals",

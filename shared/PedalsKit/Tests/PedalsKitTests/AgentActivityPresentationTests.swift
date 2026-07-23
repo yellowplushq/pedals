@@ -19,7 +19,7 @@ final class AgentActivityPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.detail, "The new client is ready.")
     }
 
-    func testRunningLatestOutputWinsCurrentAction() {
+    func testRunningAlwaysPrefersLastAgentMessageOverToolAction() {
         let info = AgentInfo(
             id: "a-1",
             agent: "claude",
@@ -34,6 +34,20 @@ final class AgentActivityPresentationTests: XCTestCase {
         XCTAssertEqual(
             AgentActivity.Presentation(info: info).detail,
             "Previous turn completed"
+        )
+    }
+
+    func testRunningFallsBackToLatestUserPrompt() {
+        let info = AgentInfo(
+            id: "a-1", agent: "codex", state: .running,
+            sessionName: "Agent monitoring", cwd: "/tmp/pedals",
+            prompt: "Make the Dynamic Island show the latest agent",
+            updatedAt: 1
+        )
+
+        XCTAssertEqual(
+            AgentActivity.Presentation(info: info).detail,
+            "Make the Dynamic Island show the latest agent"
         )
     }
 
