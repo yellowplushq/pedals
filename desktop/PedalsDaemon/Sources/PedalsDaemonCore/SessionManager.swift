@@ -6,7 +6,8 @@ import PedalsKit
 /// so a consumer can splice a replay snapshot and the live stream without
 /// duplicating bytes (see `RelayHostClient`).
 public enum SessionEvent: Sendable {
-    /// The session list changed (create / close / exit / title).
+    /// The session list changed (create / close / exit / cwd / size).
+    /// Titles have their own sampled event and do not rebroadcast the list.
     case sessionsChanged([SessionInfo])
     /// The PTY accepted a new grid size. Emitted before any output produced by
     /// the resulting SIGWINCH, so remote renderers can resize before parsing
@@ -54,6 +55,10 @@ public final class SessionManager: @unchecked Sendable {
         /// Called (on the manager's queue) with each allocated id, so the
         /// caller can persist the high-water mark.
         public var onIdAllocated: (@Sendable (Int) throws -> Void)?
+        /// Sampling floor for volatile terminal metadata. Codex and similar
+        /// TUIs animate OSC titles several times per second; only the newest
+        /// title in each interval is published.
+        public var metadataSampleInterval: TimeInterval = 2
 
         public init(
             shell: String? = nil,
@@ -82,6 +87,9 @@ public final class SessionManager: @unchecked Sendable {
         var title: String
         /// Once an OSC 0/2 title arrives it wins over the process-name fallback.
         var titleFromOSC = false
+        /// Latest uncommitted OSC title. Animated spinners overwrite this
+        /// value instead of flooding the control channel.
+        var pendingOSCTitle: String?
         var alive = true
         var exitCode: Int?
 
@@ -126,10 +134,12 @@ public final class SessionManager: @unchecked Sendable {
         self.options = options
         nextId = max(options.firstSessionId, 1)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 2, repeating: 2)
+        let sampleInterval = max(options.metadataSampleInterval, 0.05)
+        timer.schedule(deadline: .now() + sampleInterval, repeating: sampleInterval)
         timer.setEventHandler { [weak self] in
             self?.pollLiveCwds()
             self?.pollFallbackTitles()
+            self?.flushPendingOSCTitles()
         }
         timer.resume()
         titleTimer = timer
@@ -310,7 +320,7 @@ public final class SessionManager: @unchecked Sendable {
 
         if let title = session.oscParser.consume(data).last {
             session.titleFromOSC = true
-            setTitleLocked(session: session, title: title)
+            session.pendingOSCTitle = title
         }
     }
 
@@ -338,6 +348,14 @@ public final class SessionManager: @unchecked Sendable {
 
     // MARK: - Titles
 
+    private func flushPendingOSCTitles() {
+        for session in sessions.values where session.alive {
+            guard let title = session.pendingOSCTitle else { continue }
+            session.pendingOSCTitle = nil
+            setTitleLocked(session: session, title: title)
+        }
+    }
+
     private func pollFallbackTitles() {
         for session in sessions.values where session.alive && !session.titleFromOSC {
             // Title fallback: prefer a foreground process that isn't the shell
@@ -358,7 +376,6 @@ public final class SessionManager: @unchecked Sendable {
         guard !trimmed.isEmpty, trimmed != session.title else { return }
         session.title = trimmed
         _onEvent?(.title(id: session.id, title: trimmed))
-        emitSessionsChangedLocked()
     }
 
     private func emitSessionsChangedLocked() {

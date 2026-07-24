@@ -396,11 +396,13 @@ public final class RelayHostClient: @unchecked Sendable {
         guard started else { return }
         switch event {
         case .sessionsChanged(let list):
-            reportDirectoryLocked(force: false, sessions: list)
+            let directoryChanged = reportDirectoryLocked(force: false, sessions: list)
             // A terminal-count ContentState is a full replacement. Re-attach
             // the latest encrypted agent card after that projection so a TTY
-            // lifecycle change cannot erase it from the island.
-            if let recent = lastAgents.first {
+            // lifecycle change cannot erase it from the island. Cwd/resize
+            // list refreshes do not change the server-visible directory and
+            // must not generate another activity push.
+            if directoryChanged, let recent = lastAgents.first {
                 sendAgentActivityLocked(recent, alert: false)
             }
             control?.send(.sessions(list: list))
@@ -436,7 +438,10 @@ public final class RelayHostClient: @unchecked Sendable {
         heartbeatTimer = timer
     }
 
-    private func reportDirectoryLocked(force: Bool, sessions list: [SessionInfo]? = nil) {
+    @discardableResult
+    private func reportDirectoryLocked(
+        force: Bool, sessions list: [SessionInfo]? = nil
+    ) -> Bool {
         let directory = (list ?? sessions.list()).map {
             RelayMetadata.DirectoryEntry(id: $0.id, alive: $0.alive)
         }
@@ -444,12 +449,13 @@ public final class RelayHostClient: @unchecked Sendable {
         guard force
             || directory != lastReportedDirectory
             || counts != lastReportedAgentCounts
-        else { return }
+        else { return false }
         control?.sendMetadata(.hostSnapshot(
             hostName: hostName, sessions: directory, agents: counts
         ))
         lastReportedDirectory = directory
         lastReportedAgentCounts = counts
+        return true
     }
 
     private func reportOfflineLocked() {

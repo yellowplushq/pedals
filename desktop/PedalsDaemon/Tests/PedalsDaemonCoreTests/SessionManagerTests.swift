@@ -296,6 +296,47 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(title.value, "pedals-title")
         XCTAssertEqual(manager.list().first?.title, "pedals-title")
     }
+
+    func testOSCTitleSamplingCoalescesAnimationWithoutRebroadcastingSessions() throws {
+        var options = testOptions()
+        options.metadataSampleInterval = 0.25
+        let manager = SessionManager(options: options)
+        defer { manager.closeAll() }
+
+        let sampled = expectation(description: "sampled final title")
+        let titles = LockedArray<String>()
+        let listBroadcasts = LockedCounter()
+        manager.onEvent = { event in
+            switch event {
+            case .title(_, let value):
+                titles.append(value)
+                if value == "final-title" { sampled.fulfill() }
+            case .sessionsChanged:
+                listBroadcasts.increment()
+            default:
+                break
+            }
+        }
+
+        let id = try manager.create(cwd: nil, cols: 80, rows: 24)
+        let baselineLists = listBroadcasts.value
+        let animatedTitles =
+            "printf '\\033]2;spin-1\\007'; sleep 0.03; "
+            + "printf '\\033]2;spin-2\\007'; sleep 0.03; "
+            + "printf '\\033]2;final-title\\007'\n"
+        manager.write(
+            id: id,
+            data: Data(animatedTitles.utf8)
+        )
+        wait(for: [sampled], timeout: 5)
+
+        XCTAssertEqual(titles.values, ["final-title"])
+        XCTAssertEqual(
+            listBroadcasts.value, baselineLists,
+            "a title has its own compact event and must not rebroadcast sessions"
+        )
+        XCTAssertEqual(manager.list().first?.title, "final-title")
+    }
 }
 
 // MARK: - helpers
@@ -344,6 +385,40 @@ final class LockedBox<Value>: @unchecked Sendable {
             stored = newValue
             lock.unlock()
         }
+    }
+}
+
+final class LockedArray<Element>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Element] = []
+
+    func append(_ value: Element) {
+        lock.lock()
+        stored.append(value)
+        lock.unlock()
+    }
+
+    var values: [Element] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = 0
+
+    func increment() {
+        lock.lock()
+        stored += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
     }
 }
 
