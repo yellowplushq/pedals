@@ -186,8 +186,9 @@ export class PushCoordinator extends DurableObject {
   }
 
   /// Direct, non-persistent agent content for the aggregate Live Activity.
-  /// Silent events only update an existing activity. Attention events may
-  /// consume a push-to-start token and visibly introduce the island.
+  /// A working edge may consume a push-to-start token so an agent appears even
+  /// while the phone app is backgrounded. Later working refreshes are silent;
+  /// waiting/error/done retain their attention alerts.
   async handleActivity(request) {
     let body;
     try {
@@ -237,10 +238,11 @@ export class PushCoordinator extends DurableObject {
       + state.agentsWaiting + (state.agentsDone ?? 0);
     // An update token proves that an activity already exists for this client.
     // Keep the global push-to-start token for a future lifecycle, but never
-    // consume it for the same attention event and create a duplicate island.
+    // consume it for another agent event and create a duplicate island.
     const hasUpdateEndpoint = endpoints.some(
       (endpoint) => endpoint.surface === "liveactivity-update",
     );
+    const mayStartActivity = activity.state === "running" || activity.alert;
 
     for (const endpoint of endpoints) {
       const retryNotBefore = Number(endpoint.retryNotBefore);
@@ -250,7 +252,7 @@ export class PushCoordinator extends DurableObject {
       if (
         endpoint.surface === "liveactivity-start" &&
         (
-          !activity.alert || totalActive === 0 || hasUpdateEndpoint ||
+          !mayStartActivity || totalActive === 0 || hasUpdateEndpoint ||
           Number(endpoint.lastTotalRunning ?? 0) > 0
         )
       ) {
@@ -286,6 +288,7 @@ export class PushCoordinator extends DurableObject {
       if (outcome.outcome === "success") {
         if (event === "end") {
           await this.deleteEndpoint(endpoint.id);
+          await this.resetStartBaseline(clientId);
         } else {
           await this.markDelivered(endpoint.id, state, totalActive);
         }
@@ -352,8 +355,9 @@ export class PushCoordinator extends DurableObject {
 
       if (surface === "liveactivity-start") {
         // APNs requires a visible alert for push-to-start. Ordinary count
-        // invalidations must never create one; only /activity attention events
-        // use this token. The foreground app starts the normal activity.
+        // invalidations must never create one; only a rich /activity agent
+        // event uses this token. The foreground app starts terminal-only
+        // activity locally.
         continue;
       } else if (surface === "liveactivity-update") {
         // ActivityKit ContentState updates are full replacements. Aggregate
@@ -407,6 +411,7 @@ export class PushCoordinator extends DurableObject {
         const endActivity = surface === "liveactivity-update" && totalActive === 0;
         if (endActivity) {
           await this.deleteEndpoint(endpoint.id);
+          await this.resetStartBaseline(clientId);
         } else {
           await this.markDelivered(endpoint.id, state, totalActive);
         }
@@ -469,6 +474,27 @@ export class PushCoordinator extends DurableObject {
     await this.env.DB
       .prepare(`DELETE FROM push_endpoints WHERE id = ?1`)
       .bind(endpointId)
+      .run();
+  }
+
+  async resetStartBaseline(clientId) {
+    await this.env.DB
+      .prepare(
+        `UPDATE push_endpoints
+            SET last_total_running = 0,
+                updated_at = ?2
+          WHERE client_id = ?1
+            AND surface = 'liveactivity-start'
+            AND invalidated_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1
+                FROM push_endpoints AS active
+               WHERE active.client_id = ?1
+                 AND active.surface = 'liveactivity-update'
+                 AND active.invalidated_at IS NULL
+            )`,
+      )
+      .bind(clientId, Math.floor(Date.now() / 1000))
       .run();
   }
 

@@ -231,7 +231,7 @@ test("builds only allow-listed widget and Live Activity payloads", () => {
   );
 });
 
-test("embeds opaque agent content and alerts only for attention events", () => {
+test("embeds opaque agent content and alerts attention updates plus starts", () => {
   const sealed = Buffer.from("ciphertext").toString("base64");
   const base = {
     state: {
@@ -278,13 +278,19 @@ test("embeds opaque agent content and alerts only for attention events", () => {
     }),
     /base64/,
   );
-  assert.throws(
-    () => buildApnsPayload("liveactivity-start", {
-      state: base.state, event: "start",
-      activity: { ...base.activity, state: "running", alert: false },
-    }),
-    /requires an attention alert/,
-  );
+  const workingStart = buildApnsPayload("liveactivity-start", {
+    state: {
+      ...base.state,
+      agentsRunning: 1,
+      agentsWaiting: 0,
+    },
+    event: "start",
+    activity: { ...base.activity, state: "running", alert: false },
+  });
+  assert.deepEqual(workingStart.aps.alert, {
+    title: "Pedals", body: "An agent started working",
+  });
+  assert.equal(workingStart.aps.sound, undefined);
 });
 
 test("sends sandbox widget pushes with fixed topic, type and body", async () => {

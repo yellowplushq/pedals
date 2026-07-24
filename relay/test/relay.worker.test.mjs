@@ -1176,6 +1176,21 @@ describe("Pedals v2 Worker API", () => {
       })).status,
     ).toBe(204);
 
+    expect(
+      (await api("/v2/clients/me/push-endpoints/liveactivity-start", {
+        method: "PUT",
+        token: replacement.statusToken,
+        body: { token: "12".repeat(32), environment: "sandbox" },
+      })).status,
+    ).toBe(200);
+    await env.DB
+      .prepare(
+        `UPDATE push_endpoints SET last_total_running = 1
+          WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+      )
+      .bind(replacement.clientId)
+      .run();
+
     for (const [token, activityId] of [
       ["cd".repeat(32), "activity-one"],
       ["ef".repeat(32), "activity-two"],
@@ -1203,6 +1218,31 @@ describe("Pedals v2 Worker API", () => {
       .bind(replacement.clientId)
       .first();
     expect(remainingActivity.activityId).toBe("activity-two");
+    let startBaseline = await env.DB
+      .prepare(
+        `SELECT last_total_running AS lastTotal
+           FROM push_endpoints
+          WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+      )
+      .bind(replacement.clientId)
+      .first();
+    expect(Number(startBaseline.lastTotal)).toBe(1);
+
+    expect(
+      (await api(
+        "/v2/clients/me/push-endpoints/liveactivity-update?activityId=activity-two",
+        { method: "DELETE", token: replacement.statusToken },
+      )).status,
+    ).toBe(204);
+    startBaseline = await env.DB
+      .prepare(
+        `SELECT last_total_running AS lastTotal
+           FROM push_endpoints
+          WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+      )
+      .bind(replacement.clientId)
+      .first();
+    expect(Number(startBaseline.lastTotal)).toBe(0);
   });
 
   test("push endpoint count is bounded in D1", async () => {
@@ -2705,11 +2745,12 @@ describe("agent counts and alerts", () => {
     }
   });
 
-  test("silent agent activity never starts the island; attention activity may start it", async () => {
+  test("working agent starts the island and attention does not duplicate it", async () => {
     const computer = await createComputer();
     const client = await createClient();
     expect((await bind(client, computer)).status).toBe(201);
     const host = (await connect(computer.computerId, computer.hostToken)).peer;
+    const coordinator = env.PUSH_COORDINATOR.getByName(client.clientId);
     try {
       expect(
         (await api("/v2/clients/me/push-endpoints/liveactivity-start", {
@@ -2733,17 +2774,19 @@ describe("agent counts and alerts", () => {
           sealed: btoa("silent-ciphertext"),
         },
       }));
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      let endpoint = await env.DB
-        .prepare(
-          `SELECT last_sequence AS lastSequence, last_total_running AS lastTotal
-             FROM push_endpoints
-            WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
-        )
-        .bind(client.clientId)
-        .first();
-      expect(Number(endpoint.lastSequence)).toBe(-1);
-      expect(Number(endpoint.lastTotal)).toBe(0);
+      let endpoint = await waitFor(async () => {
+        const row = await env.DB
+          .prepare(
+            `SELECT last_sequence AS lastSequence, last_total_running AS lastTotal
+               FROM push_endpoints
+              WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+          )
+          .bind(client.clientId)
+          .first();
+        return Number(row?.lastTotal) === 1 ? row : null;
+      });
+      const workingSequence = Number(endpoint.lastSequence);
+      expect(workingSequence).toBeGreaterThanOrEqual(0);
 
       host.ws.send(
         snapshotWithAgents("Island Mac", [], { running: 0, waiting: 1, done: 0 }),
@@ -2759,18 +2802,56 @@ describe("agent counts and alerts", () => {
           sealed: btoa("attention-ciphertext"),
         },
       }));
-      endpoint = await waitFor(async () => {
-        const row = await env.DB
-          .prepare(
-            `SELECT last_sequence AS lastSequence, last_total_running AS lastTotal
-               FROM push_endpoints
-              WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
-          )
-          .bind(client.clientId)
-          .first();
-        return Number(row?.lastTotal) === 1 ? row : null;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      endpoint = await env.DB
+        .prepare(
+          `SELECT last_sequence AS lastSequence, last_total_running AS lastTotal
+             FROM push_endpoints
+            WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+        )
+        .bind(client.clientId)
+        .first();
+      expect(Number(endpoint.lastSequence)).toBe(workingSequence);
+      expect(Number(endpoint.lastTotal)).toBe(1);
+
+      expect(
+        (await api("/v2/clients/me/push-endpoints/liveactivity-update", {
+          method: "PUT",
+          token: client.statusToken,
+          body: {
+            token: "ac".repeat(32),
+            environment: "sandbox",
+            activityId: "working-agent",
+          },
+        })).status,
+      ).toBe(200);
+      host.ws.send(
+        snapshotWithAgents("Island Mac", [], { running: 0, waiting: 0, done: 0 }),
+      );
+      await waitFor(async () => {
+        const snapshot = await state(client);
+        return snapshot.agentsRunning === 0 && snapshot.agentsWaiting === 0
+          ? true
+          : null;
       });
-      expect(Number(endpoint.lastSequence)).toBeGreaterThanOrEqual(0);
+      await waitFor(async () => (await runDurableObjectAlarm(coordinator)) || null);
+      const endedUpdate = await env.DB
+        .prepare(
+          `SELECT id FROM push_endpoints
+            WHERE client_id = ?1 AND surface = 'liveactivity-update'`,
+        )
+        .bind(client.clientId)
+        .first();
+      expect(endedUpdate).toBeNull();
+      const resetStart = await env.DB
+        .prepare(
+          `SELECT last_total_running AS lastTotal
+             FROM push_endpoints
+            WHERE client_id = ?1 AND surface = 'liveactivity-start'`,
+        )
+        .bind(client.clientId)
+        .first();
+      expect(Number(resetStart.lastTotal)).toBe(0);
     } finally {
       closeAll(host);
     }

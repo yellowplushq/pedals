@@ -814,9 +814,10 @@ async function putPushEndpoint(request, env, surface, url) {
   const hash = await tokenHash(normalizedToken);
   const endpointId = randomId();
   const now = nowSeconds();
-  // A push-to-start token remains untouched by ordinary state sync. Its zero
-  // baseline is consumed only when an agent attention event arrives; token
-  // rotation preserves a previously consumed baseline.
+  // A push-to-start token remains untouched by ordinary count sync. Its zero
+  // baseline is consumed by a rich working/attention agent event; token
+  // rotation preserves a previously consumed baseline until that activity
+  // ends.
   const initialSequence = -1;
   const initialTotal = surface === "liveactivity-start" ? 0 : null;
 
@@ -916,13 +917,36 @@ async function deletePushEndpoint(request, env, surface, url) {
       "activityId is supported only for liveactivity-update",
     );
   }
-  await env.DB
+  const deletion = env.DB
     .prepare(
       `DELETE FROM push_endpoints
         WHERE client_id = ?1 AND surface = ?2 AND activity_key = ?3`,
     )
-    .bind(client.id, surface, activityKey)
-    .run();
+    .bind(client.id, surface, activityKey);
+  if (surface === "liveactivity-update") {
+    await env.DB.batch([
+      deletion,
+      env.DB
+        .prepare(
+          `UPDATE push_endpoints
+              SET last_total_running = 0,
+                  updated_at = ?2
+            WHERE client_id = ?1
+              AND surface = 'liveactivity-start'
+              AND invalidated_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM push_endpoints AS active
+                 WHERE active.client_id = ?1
+                   AND active.surface = 'liveactivity-update'
+                   AND active.invalidated_at IS NULL
+              )`,
+        )
+        .bind(client.id, nowSeconds()),
+    ]);
+  } else {
+    await deletion.run();
+  }
   return new Response(null, { status: 204 });
 }
 

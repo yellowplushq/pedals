@@ -41,6 +41,7 @@ export const APNS_SURFACES = Object.freeze({
 });
 
 const AGENT_ACTIVITY_ALERTS = Object.freeze({
+  running: "An agent started working",
   waiting: "An agent needs your input",
   error: "An agent hit an error",
   done: "An agent finished its task",
@@ -308,9 +309,12 @@ function liveActivityPayload(surface, value, now) {
         activity.updatedAt / 1000 - APPLE_REFERENCE_DATE_UNIX_SECONDS,
       recentAgentSealed: sealed,
     });
-    if (activity.alert) {
+    // Apple requires every remote Live Activity start to include an alert.
+    // A running agent uses that alert only for its first push-to-start; later
+    // running updates remain silent because `activity.alert` stays false.
+    if (activity.alert || surface === "liveactivity-start") {
       const body = AGENT_ACTIVITY_ALERTS[activity.state];
-      if (!body) throw new TypeError("running activity cannot alert");
+      if (!body) throw new TypeError("agent activity state cannot alert");
       aps.alert = { title: "Pedals", body };
     }
   }
@@ -320,7 +324,7 @@ function liveActivityPayload(surface, value, now) {
     aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
     aps.attributes = { scope: "all" };
     if (!aps.alert) {
-      throw new TypeError("liveactivity-start requires an attention alert");
+      throw new TypeError("liveactivity-start requires an alert");
     }
   }
   if (payload.event === "end") {
