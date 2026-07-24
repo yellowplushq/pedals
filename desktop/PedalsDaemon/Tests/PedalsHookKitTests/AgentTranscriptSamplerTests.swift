@@ -95,6 +95,22 @@ final class AgentTranscriptSamplerTests: XCTestCase {
             ),
             .init(detail: "I found the relevant files.")
         )
+
+        let multipartURL = try write([
+            [
+                "type": "assistant",
+                "message": ["content": [
+                    ["type": "text", "text": "Found the issue. "],
+                    ["type": "text", "text": "Applying the fix now."],
+                ]],
+            ],
+        ], agentDirectory: ".claude")
+        XCTAssertEqual(
+            AgentTranscriptSampler.latestActivity(
+                agent: "claude", path: multipartURL.path, environment: [:], home: home
+            ),
+            .init(detail: "Found the issue. Applying the fix now.")
+        )
     }
 
     func testCodexLatestAgentMessageIgnoresTools() throws {
@@ -142,6 +158,25 @@ final class AgentTranscriptSamplerTests: XCTestCase {
                 agent: "codex", path: actionURL.path, environment: [:], home: home
             ),
             .init(detail: "Checking the project.")
+        )
+
+        let multipartURL = try write([
+            [
+                "type": "response_item",
+                "payload": [
+                    "type": "message", "role": "assistant",
+                    "content": [
+                        ["type": "output_text", "text": "Tests passed. "],
+                        ["type": "output_text", "text": "Preparing the release."],
+                    ],
+                ],
+            ],
+        ], agentDirectory: ".codex")
+        XCTAssertEqual(
+            AgentTranscriptSampler.latestActivity(
+                agent: "codex", path: multipartURL.path, environment: [:], home: home
+            ),
+            .init(detail: "Tests passed. Preparing the release.")
         )
     }
 

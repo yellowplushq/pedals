@@ -47,7 +47,7 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
     private var debugSettingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        refreshManagedCodexHooks()
+        refreshManagedAgentHooks()
         statusItemController = StatusItemController(
             model: model,
             updater: updater,
@@ -89,23 +89,40 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Managed Codex hooks outlive the app bundle in ~/.pedals/bin. Refresh
-    /// them on launch so a Sparkle update cannot leave an older reporter (or
-    /// an older partial event set) behind. This only runs when Codex already
-    /// contains a Pedals ownership marker.
-    private func refreshManagedCodexHooks() {
+    /// Managed hooks outlive the app bundle in ~/.pedals/bin. Refresh the
+    /// shared reporter and any generated plugin source on launch so a Sparkle
+    /// update delivers new parsing/event mappings without opting users into
+    /// agents they never enabled.
+    private func refreshManagedAgentHooks() {
         guard let executable = Bundle.main.executableURL else { return }
         let bundledReporter = executable.deletingLastPathComponent()
             .appendingPathComponent("pedals-hook")
         guard FileManager.default.isExecutableFile(atPath: bundledReporter.path)
         else { return }
+        let reporterDestination = PedalsHome().hookReporterURL
+        if FileManager.default.fileExists(atPath: reporterDestination.path) {
+            do {
+                try HookInstaller.installReporterBinary(
+                    from: bundledReporter, to: reporterDestination
+                )
+            } catch {
+                NSLog("Pedals could not refresh the agent reporter: %@", "\(error)")
+            }
+        }
         do {
             try HookInstaller.refreshManagedCodexInstallation(
                 reporterSource: bundledReporter,
-                reporterDestination: PedalsHome().hookReporterURL
+                reporterDestination: reporterDestination
             )
         } catch {
             NSLog("Pedals could not refresh managed Codex hooks: %@", "\(error)")
+        }
+        do {
+            try HookInstaller.refreshManagedGeneratedPluginInstallations(
+                reporterPath: reporterDestination.path
+            )
+        } catch {
+            NSLog("Pedals could not refresh generated agent plugins: %@", "\(error)")
         }
     }
 

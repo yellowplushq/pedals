@@ -84,18 +84,14 @@ public enum AgentTranscriptSampler {
                 let content = message["content"] as? [Any]
             else { continue }
 
-            for item in content {
+            let text = content.compactMap { item -> String? in
                 guard let part = item as? [String: Any],
-                      let type = part["type"] as? String
-                else { continue }
-                switch type {
-                case "text":
-                    if let text = cleaned(part["text"] as? String, cap: HookFieldCaps.message) {
-                        latest = AgentTranscriptActivity(detail: text)
-                    }
-                default:
-                    break
-                }
+                      part["type"] as? String == "text"
+                else { return nil }
+                return part["text"] as? String
+            }.joined()
+            if let text = cleaned(text, cap: HookFieldCaps.message) {
+                latest = AgentTranscriptActivity(detail: text)
             }
         }
         return latest
@@ -127,13 +123,13 @@ public enum AgentTranscriptSampler {
                 guard payload["role"] as? String == "assistant",
                       let content = payload["content"] as? [Any]
                 else { continue }
-                for item in content {
+                let text = content.compactMap { item -> String? in
                     guard let part = item as? [String: Any],
-                          part["type"] as? String == "output_text",
-                          let text = cleaned(
-                              part["text"] as? String, cap: HookFieldCaps.message
-                          )
-                    else { continue }
+                          part["type"] as? String == "output_text"
+                    else { return nil }
+                    return part["text"] as? String
+                }.joined()
+                if let text = cleaned(text, cap: HookFieldCaps.message) {
                     latest = AgentTranscriptActivity(detail: text)
                 }
             default:

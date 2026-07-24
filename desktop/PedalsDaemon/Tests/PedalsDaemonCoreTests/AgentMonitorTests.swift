@@ -109,13 +109,14 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertTrue(monitor.list().isEmpty)
     }
 
-    func testPromptClearsActionAndMessage() throws {
+    func testPromptClearsActionAndPreservesLastAgentMessage() throws {
         monitor.ingest(event("tool", action: "Bash: ls"))
         monitor.ingest(event("notify", message: "hello"))
         monitor.ingest(event("prompt", prompt: "next"))
         let info = try only()
         XCTAssertNil(info.action)
-        XCTAssertNil(info.message)
+        XCTAssertEqual(info.message, "hello")
+        XCTAssertEqual(info.prompt, "next")
     }
 
     func testCodexFirstPromptBecomesStableFallbackSessionTitle() throws {
@@ -219,8 +220,22 @@ final class AgentMonitorTests: XCTestCase {
         monitor.ingest(event("busy"))
         info = try only()
         XCTAssertEqual(info.state, .running)
-        // …but leaves the last message in place (unlike prompt).
+        // …and leaves the last agent message in place.
         XCTAssertEqual(info.message, "API Error: 500")
+    }
+
+    func testBusyAndToolCanRefreshLastAgentMessage() throws {
+        monitor.ingest(event("prompt", prompt: "ship it"))
+        monitor.ingest(event("busy", message: "Inspecting the implementation."))
+        var info = try only()
+        XCTAssertEqual(info.message, "Inspecting the implementation.")
+
+        monitor.ingest(event(
+            "tool", message: "Found the source of the stale status.",
+            action: "Read: AgentMonitor.swift"
+        ))
+        info = try only()
+        XCTAssertEqual(info.message, "Found the source of the stale status.")
     }
 
     func testBusyCreatesRecord() throws {

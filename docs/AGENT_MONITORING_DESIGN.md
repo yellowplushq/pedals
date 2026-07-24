@@ -99,7 +99,8 @@ Home has two sections:
    agent running it shows the tty title and info; while an agent runs in it,
    the row morphs to the shared agent presentation: agent icon + state,
    session name as the title, and the latest assistant message/output (falling
-   back to the current action) as the description. Tapping the row always
+   back to the latest user message only when no assistant message exists) as
+   the description. Tapping the row always
    opens the terminal; the morph changes information density, never the
    interaction model.
 2. **Agents** — agents detected outside any Pedals-hosted tty, shown as
@@ -122,9 +123,8 @@ merged across all bound computers. Each row carries a short hostname chip
 (thin outline, consistent with the black/white style); when exactly one
 computer is bound the chip is hidden entirely. Users with many computers get
 an optional filter chip row at the top (All · host1 · host2), defaulting to
-All. Rows from an offline computer grey out and are labelled offline rather
-than disappearing, consistent with the existing offline/stale visual-smoke
-requirements.
+All. Offline computers do not contribute rows or counts; the status surfaces
+describe only computers that are currently alive.
 
 **Sorting:** within each section, attention first —
 waiting-for-you > running > done > idle tty. Because section order is fixed
@@ -153,9 +153,10 @@ the existing pairing / new-session guidance.
   black/white rule.
 - Home, Watch, Lock Screen, and the expanded Dynamic Island share the same
   agent text model: title = session name; description = latest assistant
-  message/output, then current action, then a short state fallback. Compact
-  and minimal islands keep only the agent glyph and state because those
-  families do not have room for readable session text.
+  message/output, falling back to the latest user message only when no
+  assistant message exists. Tool names/actions are never used as the visible
+  description. Compact and minimal islands keep only the agent glyph and
+  state because those families do not have room for readable session text.
 - Foreground status starts the island locally and silently. A first remote
   appearance occurs only for waiting/error/done and carries the required
   ActivityKit alert; ordinary running/count updates never alert.

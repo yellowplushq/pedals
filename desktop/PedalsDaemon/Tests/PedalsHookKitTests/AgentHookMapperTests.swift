@@ -96,7 +96,7 @@ final class AgentHookMapperTests: XCTestCase {
         )
     }
 
-    func testBusyCarriesNoText() {
+    func testBusyCarriesOnlyAssistantMessage() {
         let report = map("codex", "busy", flatBase([
             "prompt": "p", "tool_name": "Bash",
             "tool_input": ["command": "ls"], "message": "m",
@@ -104,7 +104,7 @@ final class AgentHookMapperTests: XCTestCase {
         XCTAssertEqual(report?.event, "busy")
         XCTAssertNil(report?.prompt)
         XCTAssertNil(report?.action)
-        XCTAssertNil(report?.message)
+        XCTAssertEqual(report?.message, "m")
     }
 
     func testMessagePrecedence() {
@@ -131,8 +131,9 @@ final class AgentHookMapperTests: XCTestCase {
         let capped = flatBase(["message": String(repeating: "m", count: 400)])
         XCTAssertEqual(map("codex", "stop", capped)?.message?.count, 300)
 
-        // Message only rides notify/stop.
-        XCTAssertNil(map("codex", "tool", all)?.message)
+        // Live-capable busy/tool events may carry the newest assistant text.
+        XCTAssertEqual(map("codex", "tool", all)?.message, "primary")
+        XCTAssertEqual(map("codex", "busy", all)?.message, "primary")
         XCTAssertNil(map("codex", "session-start", all)?.message)
     }
 
@@ -317,6 +318,17 @@ final class AgentHookMapperTests: XCTestCase {
             XCTAssertEqual(tool?.action, "Bash: ls")
             XCTAssertNil(tool?.message)
 
+            let busy = map(slug, "busy", [
+                "sessionId": "n-1", "message": "Applying the fix.",
+            ])
+            XCTAssertEqual(busy?.message, "Applying the fix.")
+
+            let liveTool = map(slug, "tool", [
+                "sessionId": "n-1", "action": "Read: App.swift",
+                "message": "Found the relevant implementation.",
+            ])
+            XCTAssertEqual(liveTool?.message, "Found the relevant implementation.")
+
             let stop = map(slug, "stop", ["sessionId": "n-1", "message": "Done."])
             XCTAssertEqual(stop?.message, "Done.")
             XCTAssertNil(stop?.agentError)
@@ -332,12 +344,12 @@ final class AgentHookMapperTests: XCTestCase {
         XCTAssertNil(map("omp", "compact", ["sessionId": "n-1"]))
     }
 
-    func testNormalizedBusyCarriesNoText() {
+    func testNormalizedBusyCarriesOnlyAssistantMessage() {
         let report = map("omp", "busy", [
             "sessionId": "n-1", "message": "m", "action": "a",
         ])
         XCTAssertEqual(report?.event, "busy")
-        XCTAssertNil(report?.message)
+        XCTAssertEqual(report?.message, "m")
         XCTAssertNil(report?.action)
     }
 

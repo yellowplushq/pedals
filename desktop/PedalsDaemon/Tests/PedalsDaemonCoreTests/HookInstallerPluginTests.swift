@@ -113,10 +113,66 @@ final class HookInstallerPluginTests: XCTestCase {
         XCTAssertTrue(text.contains("[\"opencode\", \"--event\", event]"))
         XCTAssertTrue(text.contains("\"tool.execute.before\""))
         XCTAssertTrue(text.contains("\"permission.ask\""))
+        XCTAssertTrue(text.contains("message.updated"))
+        XCTAssertTrue(text.contains("message.part.updated"))
+        XCTAssertTrue(text.contains("STREAM_INTERVAL_MS = 5000"))
+        XCTAssertTrue(text.contains("latestMessages.get(id)"))
+        XCTAssertTrue(text.contains("report(\"busy\", { sessionId: id, message })"))
+        XCTAssertTrue(text.contains("permission.asked"))
         XCTAssertTrue(text.contains("session.idle"))
         XCTAssertTrue(text.contains("permission.replied"))
+        XCTAssertTrue(text.contains("session.deleted"))
         XCTAssertTrue(text.contains("dispose"))
         XCTAssertFalse(text.contains("tool.execute.after"), "deliberately unmapped")
+    }
+
+    func testOpenCodeGeneratedJavaScriptParses() throws {
+        let url = home.appendingPathComponent("pedals-presence.mjs")
+        try HookInstaller.OpenCode.canonicalData(reporterPath: reporter).write(to: url)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", "--check", url.path]
+        let diagnostics = Pipe()
+        process.standardError = diagnostics
+        do {
+            try process.run()
+        } catch {
+            throw XCTSkip("Node.js is unavailable: \(error)")
+        }
+        process.waitUntilExit()
+        let output = String(
+            decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        XCTAssertEqual(process.terminationStatus, 0, output)
+    }
+
+    func testRefreshManagedGeneratedPluginsNeverOptsIn() throws {
+        XCTAssertEqual(
+            try HookInstaller.refreshManagedGeneratedPluginInstallations(
+                reporterPath: reporter, home: home
+            ),
+            []
+        )
+        XCTAssertEqual(try state(.opencode), .notInstalled)
+        XCTAssertEqual(try state(.omp), .notInstalled)
+        XCTAssertEqual(try state(.pi), .notInstalled)
+    }
+
+    func testRefreshManagedGeneratedPluginsUpdatesOnlyOwnedFiles() throws {
+        try HookInstaller.install(
+            for: .opencode, reporterPath: "/old/pedals-hook", home: home
+        )
+        try HookInstaller.install(
+            for: .pi, reporterPath: "/old/pedals-hook", home: home
+        )
+        let refreshed = try HookInstaller.refreshManagedGeneratedPluginInstallations(
+            reporterPath: reporter, home: home
+        )
+        XCTAssertEqual(Set(refreshed), Set([.opencode, .pi]))
+        XCTAssertEqual(try state(.opencode), .installed)
+        XCTAssertEqual(try state(.pi), .installed)
+        XCTAssertEqual(try state(.omp), .notInstalled)
     }
 
     // MARK: - omp / pi
@@ -136,8 +192,10 @@ final class HookInstallerPluginTests: XCTestCase {
         XCTAssertTrue(text.contains("@oh-my-pi/pi-coding-agent"))
         XCTAssertTrue(text.contains("[\"omp\", \"--event\", event]"))
         XCTAssertTrue(text.contains("agent_start"))
+        XCTAssertTrue(text.contains("message_update"))
         XCTAssertTrue(text.contains("agent_end"))
         XCTAssertTrue(text.contains("lastAssistantText"))
+        XCTAssertTrue(text.contains("STREAM_INTERVAL_MS = 5000"))
         XCTAssertFalse(
             text.contains("report(\"session-end\")"),
             "omp subagent shutdown must not end the top-level record"
@@ -150,6 +208,8 @@ final class HookInstallerPluginTests: XCTestCase {
         let text = try content(.pi)
         XCTAssertTrue(text.contains("@mariozechner/pi-coding-agent"))
         XCTAssertTrue(text.contains("[\"pi\", \"--event\", event]"))
+        XCTAssertTrue(text.contains("message_update"))
+        XCTAssertTrue(text.contains("STREAM_INTERVAL_MS = 5000"))
         XCTAssertTrue(text.contains("session_shutdown"))
         XCTAssertTrue(text.contains("report(\"session-end\")"))
     }

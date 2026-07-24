@@ -184,11 +184,11 @@ public enum AgentHookMapper {
             } else {
                 report.action = stdin.action
             }
-        case "notify", "stop":
+            report.message = stdin.message
+        case "busy", "notify", "stop":
             report.message = stdin.message
         default:
-            // session-start, busy, ask, session-end carry no text; `busy`
-            // in particular must not clear or set prompt/action downstream.
+            // session-start, ask, and session-end carry no text.
             break
         }
         return report
@@ -223,10 +223,11 @@ public enum AgentHookMapper {
         switch event {
         case "tool":
             report.action = stdin.action
-        case "ask", "notify", "stop":
+            report.message = stdin.message
+        case "busy", "ask", "notify", "stop":
             report.message = stdin.message
         default:
-            break // session-start, busy, session-end carry no text
+            break // session-start and session-end carry no text
         }
         return report
     }

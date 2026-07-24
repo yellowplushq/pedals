@@ -7,13 +7,39 @@ import Foundation
 /// stdin, and swallows every error so it can never crash or block the host
 /// agent. No env guard is needed: Pedals is system-wide.
 extension HookInstaller {
+    /// Rewrites only generated plugin files that already carry a Pedals
+    /// ownership marker. App updates use this to deliver new event mappings
+    /// without opting users into agents they never enabled.
+    @discardableResult
+    public static func refreshManagedGeneratedPluginInstallations(
+        reporterPath: String,
+        home explicitHome: URL? = nil
+    ) throws -> [HookedAgent] {
+        let home = explicitHome ?? defaultHome
+        let candidates: [(HookedAgent, String, String)] = [
+            (.opencode, OpenCode.path(home: home), OpenCode.marker),
+            (.omp, PiFamily.path(home: home, agent: .omp), PiFamily.marker),
+            (.pi, PiFamily.path(home: home, agent: .pi), PiFamily.marker),
+        ]
+        let managed = candidates.compactMap { agent, path, marker -> HookedAgent? in
+            guard let data = FileManager.default.contents(atPath: path),
+                  let text = String(data: data, encoding: .utf8),
+                  text.contains(marker)
+            else { return nil }
+            return agent
+        }
+        for agent in managed {
+            try install(for: agent, reporterPath: reporterPath, home: home)
+        }
+        return managed
+    }
+
     // MARK: - opencode
 
-    /// `~/.config/opencode/plugins/pedals-presence.js`. Mapping: plugin load →
-    /// session-start, tool.execute.before → busy, permission.ask → ask,
-    /// session.idle → stop (opencode has no final message), permission.replied
-    /// → busy, dispose → session-end. tool.execute.after is deliberately
-    /// unmapped in our per-turn model.
+    /// `~/.config/opencode/plugins/pedals-presence.js`. OpenCode exposes
+    /// assistant message/part events, so the plugin keeps the newest
+    /// assistant text and sends a throttled working update plus the complete
+    /// text on session.idle.
     enum OpenCode {
         static let marker = "// pedals-managed-hook"
 
@@ -33,11 +59,19 @@ extension HookInstaller {
             import { spawn } from "node:child_process";
 
             const REPORTER = "\(reporter)";
+            const FALLBACK_SESSION = "opencode-" + process.pid;
+            const STREAM_INTERVAL_MS = 5000;
+            const sessions = new Set();
+            const assistantMessageSessions = new Map();
+            const latestMessages = new Map();
+            const lastStreamAt = new Map();
 
             function report(event, extra) {
               try {
+                const sessionId = extra?.sessionId || FALLBACK_SESSION;
+                sessions.add(sessionId);
                 const payload = JSON.stringify({
-                  sessionId: "opencode-" + process.pid,
+                  sessionId,
                   cwd: process.cwd(),
                   ...(extra || {}),
                 });
@@ -52,24 +86,84 @@ extension HookInstaller {
               } catch (_) {}
             }
 
+            function sessionId(value) {
+              return value?.sessionID
+                || value?.sessionId
+                || value?.properties?.sessionID
+                || value?.properties?.sessionId;
+            }
+
+            function rememberAssistantPart(event) {
+              const part = event?.properties?.part;
+              if (part?.type !== "text") return;
+              const knownSession = assistantMessageSessions.get(part.messageID);
+              if (!knownSession) return;
+              const id = part.sessionID || knownSession;
+              const message = String(part.text || "").trim();
+              if (!message) return;
+              latestMessages.set(id, message);
+              const now = Date.now();
+              if (now - (lastStreamAt.get(id) || 0) >= STREAM_INTERVAL_MS) {
+                lastStreamAt.set(id, now);
+                report("busy", { sessionId: id, message });
+              }
+            }
+
             export const PedalsPresence = async () => {
-              report("session-start");
               return {
-                "tool.execute.before": async () => {
-                  report("busy");
+                "tool.execute.before": async (input) => {
+                  report("busy", { sessionId: sessionId(input) || FALLBACK_SESSION });
                 },
-                "permission.ask": async () => {
-                  report("ask");
+                "permission.ask": async (input) => {
+                  report("ask", { sessionId: sessionId(input) || FALLBACK_SESSION });
                 },
                 event: async ({ event }) => {
                   try {
                     if (!event) return;
-                    if (event.type === "session.idle") report("stop");
-                    if (event.type === "permission.replied") report("busy");
+                    if (event.type === "session.created") {
+                      const id = event.properties?.info?.id || sessionId(event);
+                      if (id) report("session-start", { sessionId: id });
+                    }
+                    if (event.type === "message.updated") {
+                      const info = event.properties?.info;
+                      if (info?.role === "assistant" && info?.id && info?.sessionID) {
+                        assistantMessageSessions.set(info.id, info.sessionID);
+                        sessions.add(info.sessionID);
+                      }
+                    }
+                    if (event.type === "message.part.updated") {
+                      rememberAssistantPart(event);
+                    }
+                    if (event.type === "session.idle") {
+                      const id = sessionId(event) || FALLBACK_SESSION;
+                      const message = latestMessages.get(id);
+                      report("stop", { sessionId: id, ...(message ? { message } : {}) });
+                    }
+                    if (event.type === "permission.asked") {
+                      report("ask", {
+                        sessionId: sessionId(event) || FALLBACK_SESSION,
+                      });
+                    }
+                    if (event.type === "permission.replied") {
+                      report("busy", {
+                        sessionId: sessionId(event) || FALLBACK_SESSION,
+                      });
+                    }
+                    if (event.type === "session.deleted") {
+                      const id = event.properties?.info?.id || sessionId(event);
+                      if (id) {
+                        report("session-end", { sessionId: id });
+                        sessions.delete(id);
+                        latestMessages.delete(id);
+                        lastStreamAt.delete(id);
+                      }
+                    }
                   } catch (_) {}
                 },
                 dispose: async () => {
-                  report("session-end");
+                  for (const id of sessions) {
+                    report("session-end", { sessionId: id });
+                  }
                 },
               };
             };
@@ -155,6 +249,8 @@ extension HookInstaller {
             import type { ExtensionAPI } from "\(agent.importPath)";
 
             const REPORTER = "\(reporter)";
+            const STREAM_INTERVAL_MS = 5000;
+            let lastStreamAt = 0;
 
             function report(event: string, extra?: Record<string, unknown>): void {
               try {
@@ -174,6 +270,20 @@ extension HookInstaller {
               } catch {}
             }
 
+            function assistantText(message: any): string | undefined {
+              try {
+                if (message?.role !== "assistant") return undefined;
+                if (!Array.isArray(message.content)) return undefined;
+                const text = message.content
+                  .filter((part: any) => part?.type === "text")
+                  .map((part: any) => String(part.text ?? ""))
+                  .join("")
+                  .trim();
+                return text ? text.slice(0, 1000) : undefined;
+              } catch {}
+              return undefined;
+            }
+
             // Last assistant text of the session, capped at ~1000 bytes.
             function lastAssistantText(ctx: any): string | undefined {
               try {
@@ -183,14 +293,8 @@ extension HookInstaller {
                   const entry = entries[i];
                   const message = entry?.message;
                   if (entry?.type !== "message") continue;
-                  if (message?.role !== "assistant") continue;
-                  if (!Array.isArray(message.content)) continue;
-                  const text = message.content
-                    .filter((part: any) => part?.type === "text")
-                    .map((part: any) => String(part.text ?? ""))
-                    .join("")
-                    .trim();
-                  return text ? text.slice(0, 1000) : undefined;
+                  const text = assistantText(message);
+                  if (text) return text;
                 }
               } catch {}
               return undefined;
@@ -200,6 +304,14 @@ extension HookInstaller {
               report("session-start");
               \(slug).on("agent_start", () => {
                 report("busy");
+              });
+              \(slug).on("message_update", (event: any) => {
+                const message = assistantText(event?.message);
+                const now = Date.now();
+                if (message && now - lastStreamAt >= STREAM_INTERVAL_MS) {
+                  lastStreamAt = now;
+                  report("busy", { message });
+                }
               });
               \(slug).on("agent_end", (_event: unknown, ctx: unknown) => {
                 const message = lastAssistantText(ctx);

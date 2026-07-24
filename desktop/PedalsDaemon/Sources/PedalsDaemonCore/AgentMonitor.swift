@@ -357,12 +357,23 @@ public final class AgentMonitor: @unchecked Sendable {
                 record.reportedSessionName = title
             }
             record.action = nil
-            record.message = nil
+            // The row detail is the newest agent-authored message, even
+            // across turns. Until this turn produces a newer assistant
+            // message, keep the previous one instead of falling back to the
+            // new user prompt.
         case "busy":
             // Turn-start signal from agents that carry no prompt text: back
-            // to running (clearing error stickiness) but leave
-            // prompt/action/message untouched.
+            // to running (clearing error stickiness). Agents with a live
+            // message source (for example OpenCode/Pi stream events) can also
+            // refresh the row through this event.
             record.state = .running
+            if let message = event.message {
+                let cleaned = Self.sanitize(message, cap: Self.messageCap)
+                if !cleaned.isEmpty {
+                    record.message = cleaned
+                    record.action = nil
+                }
+            }
         case "tool":
             if !sticky { record.state = .running }
             // A tool without a meaningful command/path/query must not replace
@@ -371,6 +382,12 @@ public final class AgentMonitor: @unchecked Sendable {
             if let action = event.action {
                 let cleaned = Self.sanitize(action, cap: Self.actionCap)
                 if !cleaned.isEmpty { record.action = cleaned }
+            }
+            if let message = event.message {
+                let cleaned = Self.sanitize(message, cap: Self.messageCap)
+                if !cleaned.isEmpty {
+                    record.message = cleaned
+                }
             }
         case "ask":
             if !sticky { record.state = .waiting }
