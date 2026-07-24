@@ -146,6 +146,40 @@ final class AgentMonitorTests: XCTestCase {
         XCTAssertEqual(try only().sessionName, "Agent monitoring")
     }
 
+    func testCodexMetadataBackfillsTranscriptForRunningOutput() throws {
+        var tuning = AgentMonitor.Tuning()
+        tuning.sweepInterval = 3600
+        tuning.transcriptSampleInterval = 0
+        let samplingMonitor = AgentMonitor(
+            tuning: tuning,
+            transcriptSampler: { agent, path in
+                guard agent == "codex", path == "/safe/codex-session.jsonl"
+                else { return nil }
+                return .init(detail: "Found the issue and applying the fix.")
+            },
+            codexMetadataResolver: { sessionID in
+                guard sessionID == "codex-session" else { return .init() }
+                return .init(
+                    title: "Fix working output",
+                    transcriptPath: "/safe/codex-session.jsonl"
+                )
+            },
+            matchTargets: { [] }
+        )
+
+        samplingMonitor.ingest(event(
+            "prompt", id: "codex-session", agent: "codex",
+            sessionName: "⠹ project", prompt: "Please investigate"
+        ))
+        samplingMonitor.sweepNow()
+
+        let info = try XCTUnwrap(samplingMonitor.list().first)
+        XCTAssertEqual(info.sessionName, "Fix working output")
+        XCTAssertEqual(info.state, .running)
+        XCTAssertEqual(info.message, "Found the issue and applying the fix.")
+        XCTAssertEqual(info.prompt, "Please investigate")
+    }
+
     func testStopWithAgentErrorAndStickiness() throws {
         monitor.ingest(event("prompt", prompt: "run"))
         monitor.ingest(event("stop", message: "API Error: 500", agentError: true))

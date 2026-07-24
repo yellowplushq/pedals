@@ -212,6 +212,24 @@ final class AgentHookMapperTests: XCTestCase {
         XCTAssertEqual(report?.transcriptPath, "/tmp/codex/s-1.jsonl")
     }
 
+    func testCodexPersistentTitleWinsAnimatedHookTitle() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pedals-codex-title-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try Data("""
+        {"id":"s-1","thread_name":"Persistent session name","updated_at":"1"}
+
+        """.utf8).write(to: home.appendingPathComponent("session_index.jsonl"))
+
+        let report = map(
+            "codex", "prompt",
+            flatBase(["session_title": "⠹ project", "prompt": "continue"]),
+            codexHome: home
+        )
+        XCTAssertEqual(report?.sessionName, "Persistent session name")
+    }
+
     func testCodexThreadSpawnedSubagentEventsAreDropped() {
         let subagent = flatBase([
             "agent_id": "child-1",

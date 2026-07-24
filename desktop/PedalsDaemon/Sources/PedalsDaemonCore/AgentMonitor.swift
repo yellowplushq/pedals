@@ -153,6 +153,8 @@ public final class AgentMonitor: @unchecked Sendable {
     private let matchTargets: @Sendable () -> [SessionManager.AgentMatchTarget]
     private let transcriptSampler:
         @Sendable (_ agent: String, _ path: String) -> AgentTranscriptActivity?
+    private let codexMetadataResolver:
+        @Sendable (_ sessionID: String) -> CodexSessionMetadata.Snapshot
     private var records: [String: Record] = [:]
     /// Held-back done attention events by agent id (see Tuning.doneAttentionDelay).
     private var pendingDoneAttention: [String: DispatchWorkItem] = [:]
@@ -184,10 +186,16 @@ public final class AgentMonitor: @unchecked Sendable {
         ) -> AgentTranscriptActivity? = {
             AgentTranscriptSampler.latestActivity(agent: $0, path: $1)
         },
+        codexMetadataResolver: @escaping @Sendable (
+            _ sessionID: String
+        ) -> CodexSessionMetadata.Snapshot = {
+            CodexSessionMetadata.resolve(sessionID: $0)
+        },
         matchTargets: @escaping @Sendable () -> [SessionManager.AgentMatchTarget]
     ) {
         self.tuning = tuning
         self.transcriptSampler = transcriptSampler
+        self.codexMetadataResolver = codexMetadataResolver
         self.matchTargets = matchTargets
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
@@ -225,9 +233,23 @@ public final class AgentMonitor: @unchecked Sendable {
                 record = Record(id: id, agent: agent)
                 records[id] = record
             }
+            var enrichedEvent = event
+            if agent == "codex" {
+                let metadata = codexMetadataResolver(id)
+                // The reporter installed by an older Pedals build may not
+                // know Codex's state database yet. Resolve again in the
+                // daemon so an app update fixes existing managed hooks
+                // without requiring the user to reinstall them.
+                if let title = metadata.title {
+                    enrichedEvent.sessionName = title
+                }
+                if enrichedEvent.transcriptPath == nil {
+                    enrichedEvent.transcriptPath = metadata.transcriptPath
+                }
+            }
             let oldState = record.state
-            apply(event, to: record)
-            applyLineage(event.lineage, to: record)
+            apply(enrichedEvent, to: record)
+            applyLineage(enrichedEvent.lineage, to: record)
             _ = resolveOwnershipLocked(record, targets: matchTargets())
             record.updatedAt = Date()
             if record.state != oldState {

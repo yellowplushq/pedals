@@ -4,19 +4,28 @@ import SQLite3
 /// Resolves the user-facing title of a Codex thread from Codex's own local
 /// metadata. Reads are short, best-effort, and strictly read-only: hook
 /// reporting must never delay or mutate the Codex session.
-enum CodexSessionMetadata {
-    struct Snapshot: Equatable {
-        var title: String? = nil
-        var transcriptPath: String? = nil
+public enum CodexSessionMetadata {
+    public struct Snapshot: Equatable, Sendable {
+        public var title: String? = nil
+        public var transcriptPath: String? = nil
+
+        public init(title: String? = nil, transcriptPath: String? = nil) {
+            self.title = title
+            self.transcriptPath = transcriptPath
+        }
     }
 
     private static let indexReadLimit: UInt64 = 1_048_576
 
-    static func title(sessionID: String, home explicitHome: URL? = nil) -> String? {
+    public static func title(
+        sessionID: String, home explicitHome: URL? = nil
+    ) -> String? {
         resolve(sessionID: sessionID, home: explicitHome).title
     }
 
-    static func resolve(sessionID: String, home explicitHome: URL? = nil) -> Snapshot {
+    public static func resolve(
+        sessionID: String, home explicitHome: URL? = nil
+    ) -> Snapshot {
         guard !sessionID.isEmpty else { return Snapshot() }
         let home = explicitHome ?? defaultHome
         return Snapshot(

@@ -142,7 +142,10 @@ public enum AgentHookMapper {
             let codexMetadata = slug == "codex"
                 ? CodexSessionMetadata.resolve(sessionID: sessionID, home: codexHome)
                 : nil
-            let sessionName = stdin.sessionName ?? codexMetadata?.title
+            // Codex's hook `session_title` is often the animated terminal
+            // title ("⠹ project"), not the persistent thread name. Prefer
+            // Codex's own session index/state database whenever available.
+            let sessionName = codexMetadata?.title ?? stdin.sessionName
             return genericReport(
                 event: event, stdin: stdin,
                 fallbackSessionId: fallback, sessionName: sessionName,

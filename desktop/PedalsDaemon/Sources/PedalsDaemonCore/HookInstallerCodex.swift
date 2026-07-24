@@ -8,6 +8,25 @@ import Foundation
 /// `hooks = true` / legacy `codex_hooks = true` lines inside `[features]` are
 /// ever touched; every other line is preserved byte-for-byte.
 extension HookInstaller {
+    /// Refreshes an existing Pedals-managed Codex installation after the app
+    /// updates. It never opts a user into hooks: at least one sentinel-marked
+    /// Codex hook must already exist. User-authored hook groups and unrelated
+    /// config.toml lines retain the same merge guarantees as a manual
+    /// reinstall.
+    @discardableResult
+    public static func refreshManagedCodexInstallation(
+        reporterSource: URL,
+        reporterDestination: URL,
+        home explicitHome: URL? = nil
+    ) throws -> Bool {
+        let home = explicitHome ?? defaultHome
+        guard try !managedGroupedPairs(path: Codex.hooksPath(home: home)).isEmpty
+        else { return false }
+        try installReporterBinary(from: reporterSource, to: reporterDestination)
+        try Codex.install(reporterPath: reporterDestination.path, home: home)
+        return true
+    }
+
     enum Codex {
         static func hooksPath(home: URL) -> String {
             home.appendingPathComponent(".codex", isDirectory: true)

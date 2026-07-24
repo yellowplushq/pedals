@@ -1,4 +1,5 @@
 import AppKit
+import PedalsDaemonCore
 import SwiftUI
 
 /// Settings uses a value-backed `WindowGroup`, not the `Settings` scene: the
@@ -46,6 +47,7 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
     private var debugSettingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        refreshManagedCodexHooks()
         statusItemController = StatusItemController(
             model: model,
             updater: updater,
@@ -84,6 +86,26 @@ final class PedalsAppDelegate: NSObject, NSApplicationDelegate {
                         .write(to: URL(fileURLWithPath: path))
                 }
             }
+        }
+    }
+
+    /// Managed Codex hooks outlive the app bundle in ~/.pedals/bin. Refresh
+    /// them on launch so a Sparkle update cannot leave an older reporter (or
+    /// an older partial event set) behind. This only runs when Codex already
+    /// contains a Pedals ownership marker.
+    private func refreshManagedCodexHooks() {
+        guard let executable = Bundle.main.executableURL else { return }
+        let bundledReporter = executable.deletingLastPathComponent()
+            .appendingPathComponent("pedals-hook")
+        guard FileManager.default.isExecutableFile(atPath: bundledReporter.path)
+        else { return }
+        do {
+            try HookInstaller.refreshManagedCodexInstallation(
+                reporterSource: bundledReporter,
+                reporterDestination: PedalsHome().hookReporterURL
+            )
+        } catch {
+            NSLog("Pedals could not refresh managed Codex hooks: %@", "\(error)")
         }
     }
 

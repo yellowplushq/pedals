@@ -252,4 +252,55 @@ final class HookInstallerCodexTests: XCTestCase {
         try install()
         XCTAssertEqual(try state(), .installed)
     }
+
+    func testRefreshManagedInstallationUpdatesReporterAndEntries() throws {
+        let source = home.appendingPathComponent("app/pedals-hook")
+        let destination = home.appendingPathComponent(".pedals/bin/pedals-hook")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("new reporter".utf8).write(to: source)
+        try Data("old reporter".utf8).write(to: destination)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: source.path
+        )
+        try install(reporter: destination.path)
+
+        XCTAssertTrue(try HookInstaller.refreshManagedCodexInstallation(
+            reporterSource: source,
+            reporterDestination: destination,
+            home: home
+        ))
+        XCTAssertEqual(try Data(contentsOf: destination), Data("new reporter".utf8))
+        XCTAssertEqual(
+            try HookInstaller.state(
+                for: .codex, reporterPath: destination.path, home: home
+            ),
+            .installed
+        )
+        XCTAssertEqual(Set(managedCommands(in: try readHooks()).keys), [
+            "SessionStart", "UserPromptSubmit", "PreToolUse",
+            "PermissionRequest", "Stop", "SessionEnd",
+        ])
+    }
+
+    func testRefreshManagedInstallationNeverOptsIn() throws {
+        let source = home.appendingPathComponent("app/pedals-hook")
+        let destination = home.appendingPathComponent(".pedals/bin/pedals-hook")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("new reporter".utf8).write(to: source)
+
+        XCTAssertFalse(try HookInstaller.refreshManagedCodexInstallation(
+            reporterSource: source,
+            reporterDestination: destination,
+            home: home
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: hooksURL.path))
+    }
 }
