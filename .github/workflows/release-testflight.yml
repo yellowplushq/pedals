@@ -33,11 +33,12 @@ jobs:
   release:
     name: Validate, sign, and publish
     runs-on: macos-26
-    timeout-minutes: 75
+    timeout-minutes: 150
     env:
       ASC_APP_ID: "6792312114"
       ASC_BYPASS_KEYCHAIN: "true"
       ASC_STRICT_AUTH: "true"
+      ASC_TIMEOUT: "120s"
       ASC_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
       ASC_PRIVATE_KEY_B64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
@@ -409,32 +410,68 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asc publish testflight \
+          asc builds upload \
             --app "$ASC_APP_ID" \
             --ipa "$PEDALS_RELEASE_DIR/Pedals.ipa" \
             --version "$PEDALS_RELEASE_VERSION" \
             --build-number "$PEDALS_RELEASE_BUILD" \
-            --group "$PEDALS_INTERNAL_GROUP_ID" \
-            --test-notes "$PEDALS_TEST_NOTES" \
-            --locale en-US \
-            --wait \
-            --timeout 45m \
-            --poll-interval 30s \
-            --notify \
             --output json \
-            --pretty | tee "$PEDALS_RELEASE_DIR/internal-publish.json"
+            --pretty | tee "$PEDALS_RELEASE_DIR/upload.json"
 
-          jq -e '.processingState == "VALID" and .uploaded == true' \
-            "$PEDALS_RELEASE_DIR/internal-publish.json" >/dev/null
-          build_id="$(jq -er '.buildId' "$PEDALS_RELEASE_DIR/internal-publish.json")"
+          asc builds wait \
+            --app "$ASC_APP_ID" \
+            --build-number "$PEDALS_RELEASE_BUILD" \
+            --version "$PEDALS_RELEASE_VERSION" \
+            --platform IOS \
+            --timeout 90m \
+            --poll-interval 30s \
+            --fail-on-invalid \
+            --output json \
+            --pretty | tee "$PEDALS_RELEASE_DIR/build-wait.json"
+
+          jq -e '.data.attributes.processingState == "VALID"' \
+            "$PEDALS_RELEASE_DIR/build-wait.json" >/dev/null
+          build_id="$(jq -er '.data.id' "$PEDALS_RELEASE_DIR/build-wait.json")"
           echo "PEDALS_BUILD_ID=$build_id" >> "$GITHUB_ENV"
+
+          asc builds test-notes list \
+            --build-id "$build_id" \
+            --output json > "$PEDALS_RELEASE_DIR/test-notes.json"
+          if jq -e 'any(.data[]; .attributes.locale == "en-US")' \
+            "$PEDALS_RELEASE_DIR/test-notes.json" >/dev/null; then
+            asc builds test-notes update \
+              --build-id "$build_id" \
+              --locale en-US \
+              --whats-new "$PEDALS_TEST_NOTES"
+          else
+            asc builds test-notes create \
+              --build-id "$build_id" \
+              --locale en-US \
+              --whats-new "$PEDALS_TEST_NOTES"
+          fi
+
           asc testflight groups links view \
             --group-id "$PEDALS_INTERNAL_GROUP_ID" \
             --type builds \
             --paginate \
             --output json > "$PEDALS_RELEASE_DIR/internal-group-builds.json"
+          if ! jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
+            "$PEDALS_RELEASE_DIR/internal-group-builds.json" >/dev/null; then
+            asc builds add-groups \
+              --build-id "$build_id" \
+              --group "$PEDALS_INTERNAL_GROUP_ID"
+            asc testflight groups links view \
+              --group-id "$PEDALS_INTERNAL_GROUP_ID" \
+              --type builds \
+              --paginate \
+              --output json > "$PEDALS_RELEASE_DIR/internal-group-builds.json"
+          fi
           jq -e --arg build "$build_id" 'any(.data[]; .id == $build)' \
             "$PEDALS_RELEASE_DIR/internal-group-builds.json" >/dev/null
+          asc testflight notifications send \
+            --build-id "$build_id" \
+            --output json \
+            --pretty
 
       - name: Publish to external TestFlight
         if: inputs.distribute_external
